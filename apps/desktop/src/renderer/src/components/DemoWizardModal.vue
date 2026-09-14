@@ -96,7 +96,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="wizard">
+  <div class="wizard" role="dialog" aria-modal="true" aria-label="设定 Demo 审核">
     <div class="wizard-head">
       <span class="wizard-title">设定 Demo 审核</span>
       <span class="muted">先审后入库：AI 产出的世界观与人物，经你逐字段确认后才会写入资料库</span>
@@ -201,6 +201,18 @@ onUnmounted(() => {
   height: 100%;
   padding: 16px;
   gap: 12px;
+  /* 面板底色必须由本组件自绘。
+     宿主 NModal 没有 preset，而 naive-ui 只在 preset="card"/"dialog" 时才渲染
+     NCard / NDialog 来提供面板背景（见 BodyWrapper.mjs 的 preset 分支）；
+     .n-modal 自身样式只有 position / align-self / margin / box-shadow，没有 background。
+     若此处不给背景，整块面板就是全透明的 —— 屏幕上只剩 40% 黑遮罩加一圈
+     box-shadow，"屏幕变灰、只有内容框是亮的" 正是由此而来。
+     scoped 编译后选择器为 .wizard[data-v-*]，特异性高于 .n-modal，
+     可一并覆盖它自带的 box-shadow。 */
+  background: #ffffff;
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+  overflow: hidden;
 }
 .wizard-head {
   display: flex;

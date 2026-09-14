@@ -122,6 +122,21 @@ cd apps/desktop && npm run typecheck && npm run build
 | `docs/SMOKE_TEST_REPORT.md` | 本批次测试报告（84/84 + 248/248 + 6 个已修缺陷 + 假故障排查记录 + 性能） |
 | `docs/reports/04-冒烟测试报告-20260913.md` | 上一版报告归档 |
 
+### 3.5 UI 回归探针（开发期脚手架）
+
+| 文件 | 用途 |
+|---|---|
+| `apps/desktop/ui-probe/main.ts` | 挂载**真实**渲染层组件（只把 `window.inkforge` 换成内存桩） |
+| `apps/desktop/ui-probe/index.html` / `vite.config.ts` | 独立构建入口，产物落 `apps/desktop/out/ui-probe`（已 gitignore） |
+| `apps/desktop/ui-probe/ui_probe_check.py` | 起静态服务 + 真实 Chromium 走查 + **像素采样断言**，截图落 `out/ui-probe-shots` |
+| `apps/desktop/ui-probe/README.md` | 跑法与 naive-ui 对话框坑位清单 |
+
+**为什么存在**：Electron 渲染层没有端到端 UI 测试，而 naive-ui 对话框有一类只在运行时暴露的问题
+（面板有没有背景、遮罩叠几层、某个 prop 是否真被识别）。这套探针把「肉眼观感」变成可断言的数字。
+上线首日就抓出了本文档作者自己的两个错误（见 §9 第 10–11 条）。
+依赖 Python `playwright` + `Pillow`（不在项目依赖内，按需自装）。已纳入 `tsconfig.web.json` 的 include，
+因此 `npm run typecheck` 会一并校验，不会静默腐烂。
+
 ---
 
 ## §4 修改文件清单（改了什么 / 为什么）
@@ -345,6 +360,10 @@ def test_memory_rule(make_memory):       # (MdStore, MemoryManager)，用 FakeIn
 | 7 | 误以为 `length_deviation` 带符号 | 它返回**绝对值**；方向信息在 `length_revision_note` 里 | 见 `test_length_deviation_is_absolute` |
 | 8 | 误以为小语料上 BM25 有效 | `BM25Okapi` 在小语料上 IDF=0（术语出现在过半文档时 `log(1)=0`），`scores>0` 过滤后稀疏召回为空 | 测试语料至少 10 篇且目标词只出现一次（见 `test_bm25_only_result_survives`） |
 | 9 | 在 `engine/tests` 里直接 import 未安装的可选依赖 | `ebooklib` / `pymilvus` / `FlagEmbedding` 在本机**未安装** | 它们是惰性 import 的可选依赖，不要在模块顶层引用 |
+| 10 | **凭记忆写 naive-ui 的遮罩 prop** | 写 `:mask="false"` **不报错但完全不生效**：naive-ui 2.44.1 的 `modalProps` 只有 `showMask` / `maskClosable`（旧名 `unstable-show-mask` 已废弃），`mask` 会静默落入 `$attrs` 变成无效 DOM 属性，遮罩照旧显示 | 正确写法是 **`:show-mask`**；且 `showMask=false` 时 naive-ui 会**转而挂载 `clickoutside` 指令**，必须同步把 `maskClosable` 也关掉，否则点外部会关掉底层对话框 |
+| 11 | 把 `role` 写在 `NModal` 上期望透传到面板 | `role` 是 `NModal` **自己声明的 prop**，会被消费掉，不会到子元素（`aria-modal` 不是 prop，才会透传） | 可访问性属性直接写在自绘面板的根元素上 |
+| 12 | 用**无 `preset`** 的 `NModal` 装自绘面板 | 面板**全透明**：`.n-modal` 默认样式只有 `position/align-self/margin/box-shadow`，没有 `background`（背景由 `NCard`/`NDialog` 预设提供）→ 屏幕全灰、只有自带背景的输入框可见 | 自绘面板必须自己给 `background`；`content-style` 也只在 `preset="card"` 时生效，无 preset 时被静默忽略 |
+| 13 | 把需要独立存活的弹窗嵌套在另一个 `NModal` 的 slot 里 | `displayDirective` 默认 `'if'`：**外层一关闭就卸载整个 slot，内层弹窗跟着被销毁** | 长时间运行的向导/流程弹窗应提到顶层（或至少清楚这条耦合，别让外层被意外关闭） |
 
 ---
 
@@ -421,3 +440,5 @@ rm -rf .git .gitattributes        # 会丢失全部历史，慎用
 | 改引擎监督 | `apps/desktop/src/main/engine-supervisor.ts` |
 | 加测试 | `engine/tests/`（夹具见 `conftest.py`） |
 | 加冒烟用例 | `engine/smoke_test.py` |
+| 改对话框 / 排查 UI 观感问题 | `apps/desktop/ui-probe/`（真实浏览器 + 像素断言，见其 README 的坑位清单） |
+| 查全部提示词位置 | `engine/src/agents/prompts/`、`engine/src/distillation/prompts/`、`engine/src/web/inkforge_api.py`（`AGENT_PRESETS` / `SUB_AGENTS`）、`inkforge_windows.py` |

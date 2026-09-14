@@ -162,7 +162,27 @@ watch(show, (opened) => {
 </script>
 
 <template>
-  <NModal v-model:show="show" preset="card" title="书架" class="dw-dialog" style="width: 780px">
+  <!-- ⚠ 向导打开时隐藏书架自身的遮罩，避免两层 rgba(0,0,0,.4) 叠加（实测 0.36×255 ≈ 92 灰）。
+       两个坑（已由真实浏览器探针验证，勿凭记忆改）：
+       1) 属性名是 show-mask，不是 mask。naive-ui 2.44.1 的 modalProps 里只有
+          showMask / maskClosable（旧版 unstable-show-mask 已废弃），写 :mask 不会被识别，
+          会静默落入 $attrs 变成无效 DOM 属性 —— 遮罩照旧显示。
+       2) 必须同时把 mask-closable 一起关掉：naive-ui 在 showMask=false 时会**转而挂载
+          clickoutside 指令**（Modal.mjs: onClickoutside: showMask ? undefined : handleClickoutside），
+          此时点击向导周围的区域会关掉书架；而书架用 displayDirective='if'（Modal 默认值），
+          一旦关闭就会连带卸载嵌套在它内部的向导弹窗 —— 向导只能在书架槽位里存活，
+          所以这里绝不能让书架被意外关掉。
+          向导自身带遮罩（z-index 更高、mask-closable=false），本就拦截了这些点击，
+          这里是把安全性做成显式约束，而不是依赖 z-index 的隐式顺序。 -->
+  <NModal
+    v-model:show="show"
+    preset="card"
+    title="书架"
+    class="dw-dialog"
+    style="width: 780px"
+    :show-mask="wizardBook === ''"
+    :mask-closable="wizardBook === ''"
+  >
     <div class="shelf-head">
       <span class="muted">全部作品以本地 Markdown 文件夹为唯一事实源，可 Git 管理</span>
       <button class="primary-btn" @click="openCreate">新建作品</button>
@@ -237,13 +257,21 @@ watch(show, (opened) => {
       </div>
     </NModal>
 
-    <!-- 设定 Demo 审核向导 -->
+    <!-- 设定 Demo 审核向导。
+         注意：这里**故意不写 preset** —— 面板外观由 DemoWizardModal 自绘
+         （它自带标题栏与"先审后入库"副标题）。因此：
+         · 不能写 content-style：它属于 presetProps（cardBaseProps ∪ dialogProps），
+           只在 preset="card" 时由 NCard 消费，无 preset 时会被静默忽略；
+         · style 会经 BodyWrapper 的 mergeProps 直接落到向导根元素 .wizard 上，
+           所以宽高写在这里是生效的；
+         · 不要在 NModal 上写 role —— role 是 NModal 自己声明的 prop，会被它消费掉，
+           不会透传到面板元素（aria-modal 不是 prop 才会透传）。
+           可访问性属性统一写在 DemoWizardModal 的根元素上，语义明确且不依赖透传行为。 -->
     <NModal
       :show="wizardBook !== ''"
       :mask-closable="false"
       :close-on-esc="false"
       style="width: 860px; height: 86vh"
-      content-style="height:calc(86vh - 62px); padding:0"
     >
       <DemoWizardModal
         :novel-id="wizardBook"
