@@ -28,7 +28,9 @@ Inkforge 既有**全自动生产线**（大纲 → 写作 → 四维审校 → �
 
 - 继承自 **DeepWrite**：三栏产品形态、安全边界（Renderer 无 Node/文件系统/密钥，Main 校验一切跨边界请求）、系统对话框授权模式、引擎子进程监督与自动重启。
 - 继承自 **novel_agent2.1**：生成流水线与提示词资产、Editor 四维评分 + 分级打回 + 磋稿协商、三层记忆、NDS 蒸馏、书架多书管理、按角色绑定模型。
-- 详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 与 [docs/STATUS.md](docs/STATUS.md)（逐里程碑的真实完成度）。
+- 详见 `docs/ARCHITECTURE.md` 与 `docs/STATUS.md`（逐里程碑的真实完成度）。
+
+> **接手开发请先读 [HANDOVER.md](HANDOVER.md)**：修改交接清单，含验证命令、行为契约变更（必须遵守）、环境变量总表、CI 门禁、已知坑与待办优先级。
 
 ## 目录结构
 

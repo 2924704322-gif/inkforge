@@ -35,6 +35,9 @@ PATH_EXTENSIONS = (
 # 形如 `xxx/yyy.ext` 或 `xxx.yyy` 的引用
 PATH_RE = re.compile(r"`([A-Za-z0-9_./@\-]+\.[A-Za-z0-9]{1,6})`")
 
+# Markdown 链接 [text](target)：只校验指向仓库内文件的相对链接
+MD_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
+
 # 明确不作为仓库路径校验的（示例、依赖包内的文件名）
 IGNORE_SUBSTRINGS = (
     "node_modules",
@@ -64,6 +67,15 @@ def _candidates(text: str) -> list[str]:
         if raw.startswith(("http://", "https://")):
             continue
         if not raw.endswith(PATH_EXTENSIONS):
+            continue
+        out.append(raw)
+    # Markdown 相对链接也要校验（防止 [x](docs/xxx.md) 这类链接腐烂）
+    for match in MD_LINK_RE.finditer(text):
+        raw = match.group(1).strip()
+        if raw.startswith(("http://", "https://", "#", "mailto:")):
+            continue
+        raw = raw.split("#", 1)[0]  # 去掉锚点
+        if not raw or not raw.endswith(PATH_EXTENSIONS):
             continue
         out.append(raw)
     return out
