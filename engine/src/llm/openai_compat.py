@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from typing import Optional
 
 from openai import APIError, OpenAI
 
@@ -21,14 +20,14 @@ class OpenAICompatProvider(ModelProvider):
     def __init__(self, name: str, base_url: str, api_key: str = "none"):
         super().__init__(name)
         self._client = OpenAI(base_url=base_url, api_key=api_key or "none", max_retries=0)
-        self._json_mode_ok: Optional[bool] = None  # None=未探测
+        self._json_mode_ok: bool | None = None  # None=未探测
 
     def chat(
         self,
         messages: list[ChatMessage],
         model: str,
         temperature: float = 0.7,
-        max_tokens: Optional[int] = None,
+        max_tokens: int | None = None,
         json_mode: bool = False,
     ) -> ChatResult:
         kwargs: dict = {
@@ -41,7 +40,7 @@ class OpenAICompatProvider(ModelProvider):
         if json_mode and self._json_mode_ok is not False:
             kwargs["response_format"] = {"type": "json_object"}
 
-        last_err: Optional[Exception] = None
+        last_err: Exception | None = None
         for attempt in range(3):  # 指数退避重试（R7）
             try:
                 resp = self._client.chat.completions.create(**kwargs)

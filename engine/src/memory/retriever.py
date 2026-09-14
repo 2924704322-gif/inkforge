@@ -6,7 +6,6 @@ import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import chromadb
 
@@ -121,9 +120,9 @@ class VectorIndex:
         self,
         text: str,
         top_k: int = 5,
-        kind: Optional[str] = None,
-        character: Optional[str] = None,
-        max_chapter: Optional[int] = None,
+        kind: str | None = None,
+        character: str | None = None,
+        max_chapter: int | None = None,
     ) -> list[RetrievedChunk]:
         """向量检索。kind/character/max_chapter 为元数据过滤条件。
 
@@ -134,7 +133,7 @@ class VectorIndex:
             conditions.append({"kind": kind})
         if max_chapter is not None:
             conditions.append({"chapter": {"$lte": max_chapter}})
-        where: Optional[dict] = None
+        where: dict | None = None
         if len(conditions) == 1:
             where = conditions[0]
         elif conditions:
@@ -162,7 +161,7 @@ class VectorIndex:
         return hits
 
     def get_corpus(
-        self, kind: Optional[str] = None, max_chapter: Optional[int] = None
+        self, kind: str | None = None, max_chapter: int | None = None
     ) -> list[RetrievedChunk]:
         """导出（过滤后的）全部块，供 BM25 等稀疏检索建库（M2 混合检索）。"""
         conditions: list[dict] = []
@@ -170,7 +169,7 @@ class VectorIndex:
             conditions.append({"kind": kind})
         if max_chapter is not None:
             conditions.append({"chapter": {"$lte": max_chapter}})
-        where: Optional[dict] = None
+        where: dict | None = None
         if len(conditions) == 1:
             where = conditions[0]
         elif conditions:

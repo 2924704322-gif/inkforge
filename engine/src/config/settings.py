@@ -11,7 +11,7 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
@@ -56,11 +56,11 @@ class ProviderConfig(BaseModel):
     """接入点定义。"""
 
     type: Literal["openai_compat", "anthropic"]
-    base_url: Optional[str] = None
+    base_url: str | None = None
     api_key: str = "none"
 
     @model_validator(mode="after")
-    def _check_base_url(self) -> "ProviderConfig":
+    def _check_base_url(self) -> ProviderConfig:
         if self.type == "openai_compat" and not self.base_url:
             raise ValueError("openai_compat 接入点必须提供 base_url")
         return self
@@ -75,8 +75,8 @@ class FallbackBinding(BaseModel):
 
     provider: str
     model: str
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
+    temperature: float | None = None
+    max_tokens: int | None = None
 
 
 class RoleBinding(BaseModel):
@@ -85,17 +85,17 @@ class RoleBinding(BaseModel):
     provider: str
     model: str
     temperature: float = 0.7
-    max_tokens: Optional[int] = None
-    fallback: Optional[FallbackBinding] = None  # 降级接入点（主接入点失败时切换）
+    max_tokens: int | None = None
+    fallback: FallbackBinding | None = None  # 降级接入点（主接入点失败时切换）
 
 
 class EmbeddingConfig(BaseModel):
     """Embedding 配置。"""
 
     type: Literal["chroma_default", "openai_compat", "local_bge"] = "chroma_default"
-    base_url: Optional[str] = None
+    base_url: str | None = None
     api_key: str = "none"
-    model: Optional[str] = None
+    model: str | None = None
 
 
 class ModelsConfig(BaseModel):
@@ -108,7 +108,7 @@ class ModelsConfig(BaseModel):
     REQUIRED_ROLES: tuple = ("architect", "writer", "editor")
 
     @model_validator(mode="after")
-    def _validate_bindings(self) -> "ModelsConfig":
+    def _validate_bindings(self) -> ModelsConfig:
         for role in self.REQUIRED_ROLES:
             if role not in self.roles:
                 raise ValueError(f"models.yaml 缺少必需角色绑定: {role}")
@@ -141,7 +141,7 @@ def _resolve_env_placeholders(raw: object) -> object:
     return raw
 
 
-def load_models_config(path: Optional[Path] = None) -> ModelsConfig:
+def load_models_config(path: Path | None = None) -> ModelsConfig:
     """加载并校验 models.yaml，Fail-Fast。"""
     settings = get_settings()
     yaml_path = path or settings.models_yaml

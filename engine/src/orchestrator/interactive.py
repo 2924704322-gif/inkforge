@@ -12,8 +12,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from src.agents.plotter import Plotter
 from src.agents.writer import chapter_length, human_revision_notes, length_deviation
 from src.memory.memory_manager import ChapterContext
@@ -47,7 +45,7 @@ def is_interactive_book(store) -> bool:
 class InteractiveRunner:
     """单章循环的纯逻辑封装（无线程/会话状态，便于单测）。"""
 
-    def __init__(self, pipe, plotter: Optional[Plotter] = None):
+    def __init__(self, pipe, plotter: Plotter | None = None):
         self.pipe = pipe
         self.plotter = plotter or Plotter(pipe.registry, pipe.store)
 
@@ -68,7 +66,7 @@ class InteractiveRunner:
             if c.metadata.get("status") == "approved"
         )
 
-    def load_cards(self, chapter: int) -> Optional[dict]:
+    def load_cards(self, chapter: int) -> dict | None:
         """回读某章剧情卡记录：{cards, chosen, custom_text}；无卡返回 None。"""
         rel = cards_rel_path(chapter)
         if not self.pipe.store.exists(rel):
@@ -80,7 +78,7 @@ class InteractiveRunner:
             "custom_text": meta.get("custom_text", ""),
         }
 
-    def draft_snapshot(self, chapter: int) -> Optional[dict]:
+    def draft_snapshot(self, chapter: int) -> dict | None:
         """回读某章未定稿草稿（断点恢复到审核阶段用）。"""
         rel = self.pipe.store.chapter_rel_path(VOLUME, chapter)
         if not self.pipe.store.exists(rel):
@@ -100,7 +98,7 @@ class InteractiveRunner:
             "target_words": doc.metadata.get("target_words"),
         }
 
-    def load_review(self, chapter: int) -> Optional[dict]:
+    def load_review(self, chapter: int) -> dict | None:
         """从审查报告 frontmatter 重建评分 dict（服务重启后恢复展示/定稿用）。"""
         rel = self.pipe.store.review_rel_path(chapter)
         if not self.pipe.store.exists(rel):
@@ -147,7 +145,7 @@ class InteractiveRunner:
         return names
 
     def _save_cards(self, chapter: int, cards: list[dict],
-                    chosen: Optional[str] = None, custom_text: str = "") -> None:
+                    chosen: str | None = None, custom_text: str = "") -> None:
         lines = [f"# 第 {chapter} 章剧情卡\n"]
         for c in cards:
             lines.append(
@@ -200,7 +198,7 @@ class InteractiveRunner:
         self._save_cards(chapter, cards, chosen=card_id, custom_text=custom_text)
         return plan
 
-    def chosen_plan(self, chapter: int) -> Optional[dict]:
+    def chosen_plan(self, chapter: int) -> dict | None:
         """回读已选卡对应的本章计划（断点恢复/定稿用）。"""
         record = self.load_cards(chapter)
         if record is None or not record["chosen"]:
@@ -227,7 +225,7 @@ class InteractiveRunner:
         plan: dict,
         feedback: str = "",
         revision_mode: str = "targeted",
-        target_words: Optional[int] = None,
+        target_words: int | None = None,
     ) -> dict:
         """选中卡 → ChapterContext → Writer 落盘草稿 → Editor 审查报告（仅供参考）。
 

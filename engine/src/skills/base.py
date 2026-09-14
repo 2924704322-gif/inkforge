@@ -34,9 +34,9 @@ class SkillContext:
     """Skill 运行时依赖，由装配层注入。"""
 
     novel_id: str
-    store: "MdStore"
-    memory: "MemoryManager"
-    registry: "ModelRegistry"
+    store: MdStore
+    memory: MemoryManager
+    registry: ModelRegistry
 
 
 class Skill(ABC):
@@ -50,7 +50,7 @@ class Skill(ABC):
         self.context = context
 
     @classmethod
-    def build(cls, raw_settings: dict, context: SkillContext) -> "Skill":
+    def build(cls, raw_settings: dict, context: SkillContext) -> Skill:
         """由原始配置字典构造：pydantic 校验（Fail-Fast），再实例化。"""
         if not cls.name:
             raise ValueError(f"{cls.__name__} 未声明 name")

@@ -12,7 +12,6 @@ from typing import Any
 
 from src.distillation.schemas import (
     ChunkExtraction,
-    DimensionIncrements,
     FullReport,
 )
 from src.utils.logger import get_logger

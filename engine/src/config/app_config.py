@@ -15,7 +15,6 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
 
 import yaml
 from pydantic import BaseModel
@@ -30,9 +29,9 @@ DEFAULT_ENV = "dev"
 
 class VectorStoreConfig(BaseModel):
     type: str
-    path: Optional[str] = None
-    host: Optional[str] = None
-    port: Optional[str] = None
+    path: str | None = None
+    host: str | None = None
+    port: str | None = None
 
 
 class RetrievalConfig(BaseModel):
@@ -89,7 +88,7 @@ def _configs_dir() -> Path:
     return PROJECT_ROOT / "configs"
 
 
-def load_app_config(env: Optional[str] = None, configs_dir: Optional[Path] = None) -> AppConfig:
+def load_app_config(env: str | None = None, configs_dir: Path | None = None) -> AppConfig:
     """加载分层配置并校验（Fail-Fast）。
 
     env 为空时取 APP_ENV，仍为空取 DEFAULT_ENV。非法 env 立即抛 ValueError。

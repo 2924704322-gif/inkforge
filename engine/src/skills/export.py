@@ -19,9 +19,9 @@ import uuid
 import zipfile
 from datetime import date
 from pathlib import Path
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
-from src.skills.base import Skill, SkillContext, SkillSettings
+from src.skills.base import Skill, SkillSettings
 from src.skills.registry import register
 from src.utils.logger import get_logger
 
@@ -33,9 +33,9 @@ _LEADING_HEADING_RE = re.compile(r"^\s*#{1,6}\s+.*(?:\n|$)")
 class ExportSettings(SkillSettings):
     enabled: bool = True                 # 纯本地零成本，基线默认启用
     format: str = "txt"                  # 默认导出格式：txt / epub
-    output_dir: Optional[str] = None     # 缺省为小说根目录下 exports/
+    output_dir: str | None = None     # 缺省为小说根目录下 exports/
     include_unapproved: bool = False     # 是否纳入未定稿章节
-    cover_path: Optional[str] = None     # 封面图路径；缺省自动探测 settings/cover.jpg|.png
+    cover_path: str | None = None     # 封面图路径；缺省自动探测 settings/cover.jpg|.png
     auto_export_on_finale: bool = False  # 订阅记忆总线：末章定稿时自动全书导出
 
 
@@ -80,7 +80,7 @@ class ExportSkill(Skill):
                 titles[vid] = name
         return titles
 
-    def _find_cover(self) -> Optional[Path]:
+    def _find_cover(self) -> Path | None:
         """封面探测：显式 cover_path 优先，否则 settings/cover.jpg|.png；无则 None。"""
         if self.settings.cover_path:
             p = Path(self.settings.cover_path)
@@ -306,9 +306,9 @@ class ExportSkill(Skill):
 
     def run(
         self,
-        format: Optional[str] = None,
-        output_path: Optional[str] = None,
-        include_unapproved: Optional[bool] = None,
+        format: str | None = None,
+        output_path: str | None = None,
+        include_unapproved: bool | None = None,
         **kwargs: Any,
     ) -> dict:
         fmt = (format or self.settings.format).lower()

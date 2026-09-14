@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -29,20 +28,20 @@ class ModelTestBody(BaseModel):
 def register_inkforge_extra(app: Any, hub: Any, default_novel: str) -> None:
     from fastapi import HTTPException
 
-    def _store(novel: str = "") -> MdStore:
+    def _store(novel: str = "", writable: bool = False) -> MdStore:
         nid = novel or default_novel
         if not _NOVEL_RE.match(nid):
             raise HTTPException(400, f"非法书名标识：{nid!r}")
-        # 含章节追加/删除 → 启用写作历史
+        # 读路径不建仓库、写路径进写作历史（见 store_factory 语义说明）
         from src.memory.store_factory import open_store
 
-        return open_store(get_settings().novels_dir / nid, writable=True)
+        return open_store(get_settings().novels_dir / nid, writable=writable)
 
     # ── 章节追加（树行末「+」）──
 
     @app.post("/api/chapters")
     def chapter_create(body: ChapterCreateBody, novel: str = "") -> JSONResponse:
-        store = _store(novel)
+        store = _store(novel, writable=True)
         existing = store.list_chapters()
         next_no = (
             max((int(c.metadata.get("chapter", 0)) for c in existing), default=0) + 1
@@ -70,12 +69,11 @@ def register_inkforge_extra(app: Any, hub: Any, default_novel: str) -> None:
 
     @app.delete("/api/chapters/{chapter}")
     def chapter_delete(chapter: int, novel: str = "") -> JSONResponse:
-        store = _store(novel)
+        store = _store(novel, writable=True)
         for doc in store.list_chapters():
             if doc.metadata.get("chapter") == chapter:
-                path = store.root / doc.doc_id
-                if path.exists():
-                    path.unlink()
+                # 经 MdStore.delete 走「删文件 + 清哈希 + Git 提交」，保证历史可回滚
+                store.delete(doc.doc_id, commit_message=f"ch-{chapter:03d} 删除章节（Inkforge）")
                 return JSONResponse({"ok": True, "chapter": chapter})
         raise HTTPException(404, f"第 {chapter} 章不存在")
 

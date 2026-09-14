@@ -25,6 +25,13 @@ TARGETS = ["README.md", "docs/ARCHITECTURE.md"]
 # 文档里的相对路径可能相对于仓库根、engine/ 或 apps/desktop/
 RESOLVE_ROOTS = [Path("."), Path("engine"), Path("apps/desktop"), Path("apps/desktop/src")]
 
+# 只把「看起来确实是本仓库文件」的引用纳入校验：
+# 必须带下列后缀之一。否则 `conda env langchain1.2` 这类带点的词会被误判为路径。
+PATH_EXTENSIONS = (
+    ".py", ".ts", ".vue", ".js", ".md", ".json", ".yaml", ".yml",
+    ".txt", ".css", ".html", ".toml", ".sh", ".bat", ".lock", ".cfg", ".ini",
+)
+
 # 形如 `xxx/yyy.ext` 或 `xxx.yyy` 的引用
 PATH_RE = re.compile(r"`([A-Za-z0-9_./@\-]+\.[A-Za-z0-9]{1,6})`")
 
@@ -56,8 +63,9 @@ def _candidates(text: str) -> list[str]:
             continue
         if raw.startswith(("http://", "https://")):
             continue
-        if "/" in raw or raw.count(".") == 1:
-            out.append(raw)
+        if not raw.endswith(PATH_EXTENSIONS):
+            continue
+        out.append(raw)
     return out
 
 

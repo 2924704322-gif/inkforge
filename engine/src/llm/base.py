@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional
 
 
 @dataclass
@@ -38,7 +37,7 @@ class ModelProvider(ABC):
         messages: list[ChatMessage],
         model: str,
         temperature: float = 0.7,
-        max_tokens: Optional[int] = None,
+        max_tokens: int | None = None,
         json_mode: bool = False,
     ) -> ChatResult:
         """发起一次对话补全。json_mode=True 时尽力要求 JSON 输出（能力自适应）。"""

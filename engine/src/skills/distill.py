@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from src.distillation.chunker import Chunk, chunk_file
 from src.distillation.graph import DistillPipeline, run_distill
@@ -29,10 +29,9 @@ from src.distillation.skill_store import (
     load_manifest,
     load_report,
     save_report,
-    skill_dir,
 )
 from src.llm.registry import ModelRegistry
-from src.skills.base import Skill, SkillContext, SkillSettings
+from src.skills.base import Skill, SkillSettings
 from src.skills.registry import register
 from src.utils.logger import get_logger
 
@@ -53,7 +52,7 @@ class DistillSkill(Skill):
 
     # ── 蒸馏会话（后台线程驱动 LangGraph，与 ReviewSession 模式一致） ──
 
-    _sessions: dict[str, "_DistillSession"] = {}
+    _sessions: dict[str, _DistillSession] = {}
 
     def run(
         self,
@@ -268,12 +267,12 @@ class _DistillSession:
         self.book_title = book_title
         self.registry = registry
         self._lock = threading.Lock()
-        self._thread: Optional[threading.Thread] = None
-        self._error: Optional[str] = None
+        self._thread: threading.Thread | None = None
+        self._error: str | None = None
         self._done = False
         self._chunk_index = 0
         self._total_chunks = 0
-        self._result: Optional[FullReport] = None
+        self._result: FullReport | None = None
 
     @property
     def is_running(self) -> bool:

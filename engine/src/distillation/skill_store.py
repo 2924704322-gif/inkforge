@@ -19,9 +19,8 @@ from __future__ import annotations
 import json
 import shutil
 import zipfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional
 
 from src.distillation.chunker import Chunk
 from src.distillation.schemas import FullReport
@@ -44,7 +43,7 @@ def _skills_dir() -> Path:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ── 技能索引 ──
@@ -214,7 +213,7 @@ def delete_skill_package(skill_id: str) -> None:
     logger.info("技能包 %s 已删除", skill_id)
 
 
-def export_skill_package(skill_id: str, output_path: Optional[Path] = None) -> Path:
+def export_skill_package(skill_id: str, output_path: Path | None = None) -> Path:
     """打包技能包为 .zip。"""
     d = skill_dir(skill_id)
     if not d.exists():
@@ -245,9 +244,9 @@ def _report_to_markdown(report: FullReport) -> str:
 
     lines = [
         f"# 《{report.book_title}》蒸馏分析报告",
-        f"",
+        "",
         f"> 块数：{report.total_chunks} | 模型：{report.provider}/{report.model} | 维度：16",
-        f"",
+        "",
         "---",
     ]
 
@@ -349,7 +348,7 @@ def _format_plot(r: FullReport) -> str:
         parts.append(f"### 支线 ({len(r.plot.subplots)}条)\n")
         parts.append(_fmt_list(r.plot.subplots, "name"))
     if r.plot.suspense_techniques:
-        parts.append(f"### 悬念手法\n")
+        parts.append("### 悬念手法\n")
         parts.append(_fmt_list(r.plot.suspense_techniques))
     if r.plot.turning_points:
         parts.append(f"### 转折点 ({len(r.plot.turning_points)}个)\n")
@@ -370,7 +369,7 @@ def _format_theme(r: FullReport) -> str:
         parts.append(f"### 意象系统 ({len(r.theme.image_system)}个)\n")
         parts.append(_fmt_list(r.theme.image_system, "image"))
     if r.theme.value_conflicts:
-        parts.append(f"### 价值冲突\n")
+        parts.append("### 价值冲突\n")
         parts.append(_fmt_list(r.theme.value_conflicts))
     return "".join(parts)
 
@@ -382,7 +381,7 @@ def _format_narrative(r: FullReport) -> str:
     if r.narrative.focalization:
         parts.append(f"**聚焦方式**: {', '.join(r.narrative.focalization)}\n")
     if r.narrative.time_manipulation:
-        parts.append(f"**时间畸变手法**:\n")
+        parts.append("**时间畸变手法**:\n")
         parts.append(_fmt_list(r.narrative.time_manipulation))
     return "".join(parts)
 
@@ -396,7 +395,7 @@ def _format_characters(r: FullReport) -> str:
         parts.append(f"### 关系拓扑 ({len(r.characters.relations)}条)\n")
         parts.append(_fmt_list(r.characters.relations, "source"))
     if r.characters.group_dynamics:
-        parts.append(f"### 群体动力学\n")
+        parts.append("### 群体动力学\n")
         parts.append(_fmt_list(r.characters.group_dynamics))
     return "".join(parts)
 
@@ -410,7 +409,7 @@ def _format_environment(r: FullReport) -> str:
         parts.append(f"### 人造物 ({len(r.environment.artifacts)}件)\n")
         parts.append(_fmt_list(r.environment.artifacts, "name"))
     if r.environment.environmental_shifts:
-        parts.append(f"### 环境突变\n")
+        parts.append("### 环境突变\n")
         parts.append(_fmt_list(r.environment.environmental_shifts))
     return "".join(parts)
 
@@ -456,7 +455,7 @@ def _format_style(r: FullReport) -> str:
     if r.style.lexicon_fields:
         parts.append(f"**高频词汇域**: {', '.join(r.style.lexicon_fields)}\n")
     if r.style.sentence_patterns:
-        parts.append(f"**标志性句式**:\n")
+        parts.append("**标志性句式**:\n")
         parts.append(_fmt_list(r.style.sentence_patterns))
     return "".join(parts)
 
@@ -464,7 +463,7 @@ def _format_style(r: FullReport) -> str:
 def _format_rhythm(r: FullReport) -> str:
     parts = [f"**张力曲线**: {r.rhythm.tension_curve or '（暂无）'}\n"]
     if r.rhythm.syntactic_rhythm:
-        parts.append(f"**句法节奏**:\n")
+        parts.append("**句法节奏**:\n")
         parts.append(_fmt_list(r.rhythm.syntactic_rhythm))
     if r.rhythm.chapter_beats:
         parts.append(f"**章节节拍** ({len(r.rhythm.chapter_beats)}个)\n")
@@ -488,7 +487,7 @@ def _format_sensory(r: FullReport) -> str:
 def _format_time_memory(r: FullReport) -> str:
     parts = [f"**物理vs叙事时间**: {r.time_memory.physical_vs_narrative_time or '（暂无）'}\n"]
     if r.time_memory.memory_presence:
-        parts.append(f"**记忆在场**:\n")
+        parts.append("**记忆在场**:\n")
         parts.append(_fmt_list(r.time_memory.memory_presence))
     return "".join(parts)
 

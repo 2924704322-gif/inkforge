@@ -8,11 +8,11 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from src.llm.base import ChatMessage
 from src.memory.md_store import slugify
-from src.skills.base import Skill, SkillContext, SkillSettings
+from src.skills.base import Skill, SkillSettings
 from src.skills.memory_bus import EVENT_CHAPTER_COMMITTED
 from src.skills.registry import register
 from src.utils.logger import get_logger
@@ -34,9 +34,9 @@ class TranslateSkill(Skill):
     name: ClassVar[str] = "translate"
     SettingsModel: ClassVar[type[SkillSettings]] = TranslateSettings
 
-    def _collect(self, chapter: Optional[int], chapters: Optional[list[int]],
+    def _collect(self, chapter: int | None, chapters: list[int] | None,
                  include_unapproved: bool) -> list[dict]:
-        want: Optional[set[int]] = None
+        want: set[int] | None = None
         if chapter is not None:
             want = {int(chapter)}
         elif chapters:
@@ -76,10 +76,10 @@ class TranslateSkill(Skill):
 
     def run(
         self,
-        chapter: Optional[int] = None,
-        chapters: Optional[list[int]] = None,
-        target_lang: Optional[str] = None,
-        include_unapproved: Optional[bool] = None,
+        chapter: int | None = None,
+        chapters: list[int] | None = None,
+        target_lang: str | None = None,
+        include_unapproved: bool | None = None,
         **kwargs: Any,
     ) -> dict:
         lang = target_lang or self.settings.target_lang

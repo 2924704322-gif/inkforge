@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -139,22 +139,22 @@ class IdeologyMatrix(BaseModel):
 
 class DimensionIncrements(BaseModel):
     """单次增量提取。None = 该维度无增量。"""
-    world: Optional[WorldBuilding] = Field(default=None)
-    plot: Optional[PlotStructure] = Field(default=None)
-    theme: Optional[ThemeAnalysis] = Field(default=None)
-    narrative: Optional[NarrativeLayer] = Field(default=None)
-    characters: Optional[CharacterSystem] = Field(default=None)
-    environment: Optional[EnvironmentSpace] = Field(default=None)
-    env_description: Optional[EnvironmentDescription] = Field(default=None)
-    char_description: Optional[CharacterDescription] = Field(default=None)
-    dialogue: Optional[DialogueArt] = Field(default=None)
-    action: Optional[ActionChoreography] = Field(default=None)
-    style: Optional[StyleProfile] = Field(default=None)
-    rhythm: Optional[RhythmProfile] = Field(default=None)
-    sensory: Optional[SensoryEmotionMap] = Field(default=None)
-    time_memory: Optional[TimeMemoryEncoding] = Field(default=None)
-    meta_narrative: Optional[MetaNarrative] = Field(default=None)
-    ideology: Optional[IdeologyMatrix] = Field(default=None)
+    world: WorldBuilding | None = Field(default=None)
+    plot: PlotStructure | None = Field(default=None)
+    theme: ThemeAnalysis | None = Field(default=None)
+    narrative: NarrativeLayer | None = Field(default=None)
+    characters: CharacterSystem | None = Field(default=None)
+    environment: EnvironmentSpace | None = Field(default=None)
+    env_description: EnvironmentDescription | None = Field(default=None)
+    char_description: CharacterDescription | None = Field(default=None)
+    dialogue: DialogueArt | None = Field(default=None)
+    action: ActionChoreography | None = Field(default=None)
+    style: StyleProfile | None = Field(default=None)
+    rhythm: RhythmProfile | None = Field(default=None)
+    sensory: SensoryEmotionMap | None = Field(default=None)
+    time_memory: TimeMemoryEncoding | None = Field(default=None)
+    meta_narrative: MetaNarrative | None = Field(default=None)
+    ideology: IdeologyMatrix | None = Field(default=None)
 
 
 class ChunkExtraction(BaseModel):

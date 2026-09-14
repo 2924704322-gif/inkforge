@@ -16,7 +16,6 @@ from __future__ import annotations
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
-from typing import Optional
 
 from src.agents.editor import Editor, negotiate_revision, verdict_of
 from src.agents.writer import chapter_length, length_deviation, length_revision_note
@@ -85,8 +84,8 @@ def chapters_of_volume(outline: dict, volume: int) -> list[dict]:
 # ---------- 并行起草 ----------
 
 def draft_chapter(pipe, plan: dict, ctx: ChapterContext,
-                  store_lock: Optional[threading.Lock] = None,
-                  revision_notes: Optional[str] = None,
+                  store_lock: threading.Lock | None = None,
+                  revision_notes: str | None = None,
                   previous_text: str = "",
                   start_attempt: int = 0) -> dict:
     """对单章执行 writer→editor 自动分级重写循环，产出待人审草稿记录（不做人审、不回写记忆）。
@@ -209,8 +208,8 @@ def draft_chapter(pipe, plan: dict, ctx: ChapterContext,
 
 
 def draft_volume(pipe, state: NovelState, volume: int,
-                 store_lock: Optional[threading.Lock] = None,
-                 skip_chapters: Optional[set[int]] = None) -> list[dict]:
+                 store_lock: threading.Lock | None = None,
+                 skip_chapters: set[int] | None = None) -> list[dict]:
     """顺序起草某卷全部章节（卷内串行以保证连贯性），返回草稿记录列表。
 
     skip_chapters：已人审通过的章节号集合（断点续跑时跳过，不重复起草）。
@@ -234,7 +233,7 @@ def draft_volume(pipe, state: NovelState, volume: int,
 
 def parallel_draft_wave(pipe, state: NovelState, volume_ids: list[int],
                         max_workers: int = 0,
-                        skip_chapters: Optional[set[int]] = None) -> dict[int, list[dict]]:
+                        skip_chapters: set[int] | None = None) -> dict[int, list[dict]]:
     """并行起草同一波次内的多个独立卷。返回 {卷号: [草稿记录...]}。
 
     卷内串行、卷间并行；落盘用共享锁串行化以规避 Git 并发。

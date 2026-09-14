@@ -9,8 +9,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from src.agents.schemas import ReviewOutput
 from src.memory.memory_manager import ChapterContext
 from src.skills.memory_bus import EVENT_CHAPTER_COMMITTED, EVENT_CHARACTER_UPDATED
@@ -25,8 +23,8 @@ def finalize_chapter(
     volume: int,
     draft_text: str,
     ctx: ChapterContext,
-    review: Optional[dict],
-    first_review_passed: Optional[bool],
+    review: dict | None,
+    first_review_passed: bool | None,
     total_chapters: int,
 ) -> None:
     """人审通过后的完整定稿流程（摘要 / 回写 / 终态 / 事件）。"""

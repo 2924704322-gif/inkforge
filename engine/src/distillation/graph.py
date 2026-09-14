@@ -9,7 +9,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
@@ -49,7 +49,7 @@ class DistillState(TypedDict, total=False):
 class DistillPipeline:
     """蒸馏节点的共享运行时依赖（轻量，不需要 memory/md_store）。"""
 
-    registry: "ModelRegistry"
+    registry: ModelRegistry
 
 
 def _dump_chunks(chunks: list[Chunk]) -> str:

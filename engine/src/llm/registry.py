@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from src.config.settings import ModelsConfig, ProviderConfig
 from src.llm.anthropic_provider import AnthropicProvider
 from src.llm.base import ChatMessage, ChatResult, ModelProvider, ProviderError
@@ -97,8 +95,8 @@ class ModelRegistry:
         role: str,
         messages: list[ChatMessage],
         json_mode: bool = False,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> ChatResult:
         """以指定角色的绑定配置发起调用；主接入点失败时尝试 fallback。"""
         binding = self._binding(role)

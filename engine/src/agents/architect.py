@@ -115,7 +115,7 @@ class Architect:
 
     def _load_confirmed_settings(
         self,
-    ) -> "tuple[WorldviewOutput, CharactersOutput] | None":
+    ) -> tuple[WorldviewOutput, CharactersOutput] | None:
         """从资料库回读已确认的世界观/角色；无确认标记返回 None。"""
         if not self._store.exists(DEMO_OVERVIEW_REL):
             return None

@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Literal
 
 from pydantic import BaseModel, Field
-
 
 # ---------- Architect ----------
 
@@ -169,9 +168,9 @@ class CharacterUpdate(BaseModel):
 
 class ForeshadowOp(BaseModel):
     action: Literal["plant", "resolve"]
-    id: Optional[str] = Field(default=None, description="resolve 时必填已知伏笔 id")
+    id: str | None = Field(default=None, description="resolve 时必填已知伏笔 id")
     desc: str = Field(default="", description="plant 时必填伏笔内容")
-    resolve_ch: Optional[int] = Field(default=None, description="plant 时预期回收章")
+    resolve_ch: int | None = Field(default=None, description="plant 时预期回收章")
 
 
 class StateOp(BaseModel):

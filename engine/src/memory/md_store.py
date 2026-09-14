@@ -12,8 +12,8 @@ import hashlib
 import json
 import re
 import threading
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator, Optional
 
 import frontmatter
 from git import GitCommandError, InvalidGitRepositoryError, Repo
@@ -60,9 +60,12 @@ class MdStore:
         # 子目录惰性创建：读路径不再产生写副作用（书架列表/健康探针会构造大量 MdStore）。
         # 需要骨架目录的调用方（如建书向导）显式调 ensure_subdirs()。
         #
-        # create_repo=False 用于只读路径：只挂载**已存在**的书内仓库，绝不新建，
+        # create_repo=False 用于只读路径：只挂载**已存在**的仓库，绝不新建，
         # 避免「查一次写作历史就凭空创建 .git」这类写副作用。
-        self._repo = self._ensure_repo(create=create_repo) if auto_git else None
+        if auto_git:
+            self._repo, self._repo_scope = _resolve_repo(self.root, create=create_repo)
+        else:
+            self._repo, self._repo_scope = None, None
 
     def ensure_subdirs(self) -> None:
         """创建标准子目录骨架（建书/首次写入时调用）。"""
@@ -84,8 +87,8 @@ class MdStore:
         self,
         rel_path: str,
         content: str,
-        metadata: Optional[dict] = None,
-        commit_message: Optional[str] = None,
+        metadata: dict | None = None,
+        commit_message: str | None = None,
     ) -> Path:
         """写入 MD（覆盖），自动更新 hash 索引并 Git 提交。"""
         path = self.root / rel_path
@@ -97,17 +100,38 @@ class MdStore:
         path.write_text(text, encoding="utf-8", newline="\n")
         self._update_hash(rel_path, text)
         if self._repo is not None:
-            self._commit(commit_message or f"update {rel_path}")
+            self._commit(commit_message or f"update {rel_path}", [rel_path])
         return path
 
     def update_metadata(
-        self, rel_path: str, updates: dict, commit_message: Optional[str] = None
+        self, rel_path: str, updates: dict, commit_message: str | None = None
     ) -> None:
         """只更新 frontmatter 字段，正文不变。"""
         doc = self.read(rel_path)
         meta = {k: v for k, v in doc.metadata.items() if not k.startswith("_")}
         meta.update(updates)
         self.write(rel_path, doc.content, meta, commit_message)
+
+    def delete(self, rel_path: str, commit_message: str | None = None) -> bool:
+        """删除 MD 文档并同步提交（写作历史必须记录删除）。
+
+        背景：章节删除此前直接 `path.unlink()`，绕过了本层 → 删除不进 Git 历史、
+        `.file-hashes.json` 留下悬空条目。历史不完整会让「可回滚」的承诺落空。
+        返回是否真的删除了文件。
+        """
+        path = self.root / rel_path
+        if not path.exists():
+            return False
+        path.unlink()
+        hashes = self._load_hashes()
+        if rel_path in hashes:
+            hashes.pop(rel_path, None)
+            self._hash_index_path().write_text(
+                json.dumps(hashes, ensure_ascii=False, indent=1), encoding="utf-8"
+            )
+        if self._repo is not None:
+            self._commit(commit_message or f"delete {rel_path}", [rel_path], removed=True)
+        return True
 
     def exists(self, rel_path: str) -> bool:
         return (self.root / rel_path).exists()
@@ -183,76 +207,104 @@ class MdStore:
 
     # ---------- Git 自动提交 ----------
 
-    def _ensure_repo(self, create: bool = True) -> Optional[Repo]:
-        """小说目录独立 Git 仓库；若位于外层仓库内且未被忽略则复用外层。
+    def _commit(
+        self,
+        message: str,
+        rel_paths: list[str] | None = None,
+        removed: bool = False,
+    ) -> None:
+        """把指定文件（相对本书根目录）的变更提交到本书所属仓库。
 
-        外层仓库 .gitignore 排除 data/novels/ 时（用户创作数据不随仓库分发），
-        在小说目录内初始化独立仓库，保证自动提交/历史能力不受影响。
-
-        create=False（只读路径）：只返回**本就存在**的书内仓库；否则返回 None，
-        既不新建仓库，也不误挂外层项目仓库（那会让「本书历史」混入项目提交）。
+        性能与正确性（2026-09-14 两轮修复）：
+        1. 原实现用 `repo.git.add()` + `repo.is_dirty()`，每次提交都 spawn git 子进程，
+           且作用域是整棵目录树；改为纯 Python 的 IndexFile 操作后不再产生子进程。
+        2. **必须传入具体文件路径，绝不传 "."**：GitPython 的 `IndexFile.add()`
+           是纯 Python 实现，**不会**像 git porcelain 那样自动排除 `.git/`——
+           传 "." 会把仓库自身的 40 余个对象文件加进索引，导致每次提交重新遍历并
+           重新写入，开销呈 O(n²) 累积（实测 60 次提交从 12s 恶化到 >240s 不收敛，
+           同时污染索引）。此处按文件精确 add，并再做一道 `.git` 兜底过滤。
         """
-        try:
-            repo = Repo(self.root, search_parent_directories=True)
-        except InvalidGitRepositoryError:
-            if not create:
-                return None
-            logger.info("初始化小说数据 Git 仓库: %s", self.root)
-            return Repo.init(self.root)
-        work_tree = repo.working_tree_dir
-        if work_tree and Path(work_tree).resolve() == self.root.resolve():
-            return repo
-        if self._outer_repo_ignores(repo):
-            if not create:
-                return None
-            logger.info("外层仓库已忽略 %s，初始化独立 Git 仓库", self.root)
-            return Repo.init(self.root)
-        if not create:
-            # 未忽略：本书文件由外层仓库跟踪，其提交不属于「本书历史」
-            return None
-        return repo
-
-    def _outer_repo_ignores(self, repo: Repo) -> bool:
-        """外层仓库是否忽略本小说目录。
-
-        `git check-ignore` 退出码 0=被忽略，1=未忽略，其它=探测失败。
-        探测失败按「未忽略」处理（复用外层），并告警——因为误 init 嵌套仓库
-        会把外层仓库弄脏，而复用外层最坏只是提交被跳过。
-        """
-        try:
-            repo.git.check_ignore(str(self.root.resolve()))
-            return True
-        except GitCommandError as exc:
-            if exc.status not in (1, None):
-                logger.warning("check-ignore 探测失败（按未忽略处理）: %s", exc)
-            return False
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("check-ignore 探测异常（按未忽略处理）: %s", exc)
-            return False
-
-    def _commit(self, message: str) -> None:
+        if self._repo is None:
+            return
         try:
             with _GIT_LOCK:
                 repo = self._repo
-                # 按仓库根解析待 add 路径：独立仓库时为 "."，复用外层仓库时为小说子目录
-                rel = self.root.resolve().relative_to(
-                    Path(repo.working_tree_dir).resolve()
-                )
-                repo.git.add(str(rel))
-                if repo.is_dirty(index=True, working_tree=False, untracked_files=True):
-                    repo.index.commit(f"[novel] {message}")
-        except Exception as e:
+                work_tree = Path(repo.working_tree_dir).resolve()
+                items = self._to_repo_paths(rel_paths, work_tree)
+                if not items:
+                    return
+                index = repo.index
+                if removed:
+                    index.remove(items, working_tree=False)
+                else:
+                    # force=False：尊重 .gitignore，不把被忽略的文件塞进索引
+                    index.add(items, force=False)
+                if repo.head.is_valid():
+                    changed = bool(index.diff("HEAD"))
+                else:
+                    changed = True  # 空仓库（unborn HEAD）：首次提交
+                if changed:
+                    index.commit(f"[novel] {message}")
+        except Exception as e:  # noqa: BLE001 - 提交失败不影响事实源写入
             logger.warning("Git 自动提交失败（不影响写入）: %s", e)
+
+    def _to_repo_paths(self, rel_paths: list[str] | None, work_tree: Path) -> list[str]:
+        """把本书内相对路径换算为仓库相对路径，并剔除 `.git` 内部与越界项。"""
+        if not rel_paths:
+            # 无显式清单时退化为「本书根目录」；独立仓库下为 "."，但必须过滤 .git
+            candidates = [""]
+        else:
+            candidates = list(rel_paths)
+        out: list[str] = []
+        for rel in candidates:
+            target = (self.root / rel).resolve() if rel else self.root.resolve()
+            try:
+                repo_rel = target.relative_to(work_tree).as_posix()
+            except ValueError:
+                continue  # 不在本仓库内（异常布局）→ 跳过
+            if repo_rel == ".":
+                # 兜底：绝不把仓库根整体加入（会连带 .git）；改为逐项列出本书内容
+                out.extend(self._safe_tree_paths(work_tree))
+                continue
+            if repo_rel == ".git" or repo_rel.startswith(".git/") or "/.git/" in repo_rel:
+                continue
+            out.append(repo_rel)
+        # 去重保序
+        seen: set[str] = set()
+        return [p for p in out if not (p in seen or seen.add(p))]
+
+    def _safe_tree_paths(self, work_tree: Path) -> list[str]:
+        """列出本书目录下应纳入索引的文件（排除 .git 与忽略文件）。"""
+        out: list[str] = []
+        for path in sorted(self.root.rglob("*")):
+            if ".git" in path.parts:
+                continue
+            if not path.is_file():
+                continue
+            try:
+                repo_rel = path.resolve().relative_to(work_tree).as_posix()
+            except ValueError:
+                continue
+            if repo_rel == ".git" or repo_rel.startswith(".git/") or "/.git/" in repo_rel:
+                continue
+            out.append(repo_rel)
+        return out
 
     # ---------- 写作历史（git log 只读视图） ----------
 
     def history(self, limit: int = 30) -> list[dict]:
-        """返回最近 limit 条提交记录；无 Git 仓库或读取失败时返回空列表。"""
+        """返回本书最近 limit 条提交记录；无仓库或读取失败时返回空列表。
+
+        当本书由外层仓库跟踪（_repo_scope 非空）时，按路径过滤，只回本该书的提交。
+        """
         if self._repo is None:
             return []
         try:
+            kwargs: dict = {"max_count": max(1, min(limit, 200))}
+            if self._repo_scope:
+                kwargs["paths"] = self._repo_scope
             with _GIT_LOCK:
-                commits = list(self._repo.iter_commits(max_count=max(1, min(limit, 200))))
+                commits = list(self._repo.iter_commits(**kwargs))
             return [
                 {
                     "sha": c.hexsha[:10],
@@ -265,6 +317,84 @@ class MdStore:
         except Exception as e:  # noqa: BLE001 - 空仓库（无 HEAD）等情况
             logger.debug("读取写作历史失败: %s", e)
             return []
+
+
+# ---------- 仓库归属解析（进程级缓存，避免重复 spawn git） ----------
+
+# root(as_posix) -> (repo | None, scope | None)
+# scope 为 None 表示该仓库的根就是本书目录；否则为本书在外层仓库中的相对路径。
+_REPO_CACHE: dict[str, tuple[Repo | None, str | None]] = {}
+_REPO_CACHE_LOCK = threading.Lock()
+
+
+def _resolve_repo(root: Path, create: bool) -> tuple[Repo | None, str | None]:
+    """解析本书应归属的 Git 仓库，返回 (repo, scope)。
+
+    **进程级缓存**：`Repo(..., search_parent_directories=True)` 与
+    `git check-ignore` 都会 spawn 子进程，而 MdStore 在每次 HTTP 请求中会被构造多次。
+    不缓存时，几十次请求就会累积上百次 git 子进程，实测拖垮引擎。
+    """
+    root = Path(root).resolve()
+    key = root.as_posix()
+    with _REPO_CACHE_LOCK:
+        cached = _REPO_CACHE.get(key)
+    if cached is not None:
+        repo, scope = cached
+        # 缓存命中：已有仓库直接复用；判定为「无仓库」时仅读路径可返回，
+        # 写路径需要重新判定（可能此时才需要并允许新建仓库）。
+        if repo is not None or not create:
+            return repo, scope
+
+    result = _compute_repo(root, create)
+    with _REPO_CACHE_LOCK:
+        _REPO_CACHE[key] = result
+    return result
+
+
+def _compute_repo(root: Path, create: bool) -> tuple[Repo | None, str | None]:
+    try:
+        repo = Repo(root, search_parent_directories=True)
+    except InvalidGitRepositoryError:
+        if not create:
+            return None, None
+        logger.info("初始化小说数据 Git 仓库: %s", root)
+        return Repo.init(root), None
+
+    work_tree = repo.working_tree_dir
+    if work_tree and Path(work_tree).resolve() == root:
+        return repo, None
+
+    if _outer_repo_ignores(repo, root):
+        if not create:
+            return None, None
+        logger.info("外层仓库已忽略 %s，初始化独立 Git 仓库", root)
+        return Repo.init(root), None
+
+    # 外层仓库跟踪本书：复用外层，并把历史查询范围限定在本书子目录
+    try:
+        scope = str(root.relative_to(Path(repo.working_tree_dir).resolve())).replace("\\", "/")
+    except ValueError:
+        scope = None
+    return repo, scope
+
+
+def _outer_repo_ignores(repo: Repo, root: Path) -> bool:
+    """外层仓库是否忽略本小说目录。
+
+    `git check-ignore` 退出码 0=被忽略，1=未忽略，其它=探测失败。
+    探测失败按「未忽略」处理（复用外层），并告警——因为误 init 嵌套仓库
+    会把外层仓库弄脏，而复用外层最坏只是作用域变大。
+    """
+    try:
+        repo.git.check_ignore(str(root))
+        return True
+    except GitCommandError as exc:
+        if exc.status not in (1, None):
+            logger.warning("check-ignore 探测失败（按未忽略处理）: %s", exc)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("check-ignore 探测异常（按未忽略处理）: %s", exc)
+        return False
 
 
 def slugify(name: str) -> str:

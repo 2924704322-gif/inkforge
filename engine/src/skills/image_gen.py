@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from src.skills.base import Skill, SkillContext, SkillSettings
 from src.skills.memory_bus import EVENT_CHARACTER_UPDATED
@@ -26,7 +26,7 @@ _SECTION_RE = re.compile(r"(?m)^#{1,4}\s*(?:外貌|外观|appearance)\s*\n(.+?)(
 
 class ImageGenSettings(SkillSettings):
     enabled: bool = False           # 立绘为可选扩展，默认关闭
-    base_url: Optional[str] = None
+    base_url: str | None = None
     api_key: str = "none"
     model: str = "dall-e-3"
     size: str = "1024x1024"
@@ -79,7 +79,7 @@ class ImageGenSkill(Skill):
     def _char_rel(self, name: str) -> str:
         return f"settings/characters/{name}.md"
 
-    def _gen_for(self, name: str) -> Optional[str]:
+    def _gen_for(self, name: str) -> str | None:
         rel = self._char_rel(name)
         store = self.context.store
         if not store.exists(rel):
@@ -97,8 +97,8 @@ class ImageGenSkill(Skill):
         logger.info("立绘：%s → %s", name, url)
         return url
 
-    def run(self, character: Optional[str] = None,
-            characters: Optional[list[str]] = None, **kwargs: Any) -> dict:
+    def run(self, character: str | None = None,
+            characters: list[str] | None = None, **kwargs: Any) -> dict:
         """为指定角色（或全部角色）生成立绘并回写 URL。"""
         names: list[str]
         if character:

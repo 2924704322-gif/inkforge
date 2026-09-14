@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
@@ -46,7 +46,7 @@ MAX_PARTIAL_RETRIES = 2
 MAX_FULL_RETRIES = 2
 
 
-def _load_outline_md(store: MdStore) -> Optional[dict]:
+def _load_outline_md(store: MdStore) -> dict | None:
     """从 settings/outline.md 的 frontmatter 恢复大纲（MD 唯一事实源）；无有效大纲返回 None。
 
     与 parallel_runner.load_outline 语义一致：使人工在资料库页编辑保存的大纲
@@ -78,10 +78,10 @@ class Pipeline:
     editor: Editor
     summarizer: Summarizer
     # Skill 扩展（M3 / T3.3）：记忆总线 + 已启用 Skill 容器（可缺省，核心流程零依赖）
-    bus: Optional[MemoryBus] = None
-    skills: Optional["SkillRegistry"] = None
+    bus: MemoryBus | None = None
+    skills: SkillRegistry | None = None
     # 生成流程参数（P4-A）：缺省时 generation_config 回退全局分层配置
-    gen_config: Optional[GenerationConfig] = None
+    gen_config: GenerationConfig | None = None
 
 
 def build_graph(pipe: Pipeline, checkpoint_db: Path):

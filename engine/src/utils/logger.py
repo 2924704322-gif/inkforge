@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
 
 from rich.logging import RichHandler
 
 _CONFIGURED = False
 
 
-def setup_logging(level: str = "INFO", log_file: Optional[Path] = None) -> None:
+def setup_logging(level: str = "INFO", log_file: Path | None = None) -> None:
     """初始化根日志器（幂等）。"""
     global _CONFIGURED
     if _CONFIGURED:

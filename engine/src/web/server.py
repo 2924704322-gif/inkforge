@@ -22,18 +22,19 @@ import stat
 import sys
 import threading
 from pathlib import Path
-from typing import Optional
 
+import frontmatter
 import markdown as md
 import yaml
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-import frontmatter
-
-from src.config.settings import ModelsConfig, get_settings
-from src.config.settings import _resolve_env_placeholders  # noqa: PLC2701 - 校验前解析占位符
+from src.config.settings import (
+    ModelsConfig,
+    _resolve_env_placeholders,  # noqa: PLC2701 - 校验前解析占位符
+    get_settings,
+)
 from src.memory.md_store import MdStore
 from src.utils.logger import get_logger
 
@@ -250,7 +251,7 @@ class RoleBindingBody(BaseModel):
     provider: str
     model: str
     temperature: float = 0.7
-    max_tokens: Optional[int] = None
+    max_tokens: int | None = None
 
 
 class ProviderBody(BaseModel):
@@ -280,13 +281,13 @@ class OutlineSaveBody(BaseModel):
 
 
 class DemoConfirmBody(BaseModel):
-    demo: Optional[dict] = None   # 用户编辑后的完整 Demo（缺省沿用服务端缓存）
+    demo: dict | None = None   # 用户编辑后的完整 Demo（缺省沿用服务端缓存）
 
 
 class InteractiveChooseBody(BaseModel):
     card_id: str                  # c1/c2/c3/custom
     custom_text: str = ""         # card_id=custom 时的用户自拟剧情
-    target_words: Optional[int] = None  # 本章目标字数，None 使用服务默认值
+    target_words: int | None = None  # 本章目标字数，None 使用服务默认值
 
 
 class InteractiveRedrawBody(BaseModel):
@@ -322,31 +323,41 @@ class ReviewSession:
         self.target_words = target_words
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
-        self._pending: Optional[dict] = None      # 当前待人审 payload
-        self._resume: Optional[dict] = None        # 前端提交的决定
-        self._worker: Optional[threading.Thread] = None
+        self._pending: dict | None = None      # 当前待人审 payload
+        self._resume: dict | None = None        # 前端提交的决定
+        self._worker: threading.Thread | None = None
         self._done = False
-        self._error: Optional[str] = None
+        self._error: str | None = None
         self._started = False
         self._parallel = False       # 并行模式（卷级并行驱动器）
         self._workers = 0            # 并行工作线程数（0=自适应）
-        self._chapters: Optional[int] = None
-        self._last_wave: Optional[dict] = None  # 最近一次跨卷审查概要（展示用）
+        self._chapters: int | None = None
+        self._last_wave: dict | None = None  # 最近一次跨卷审查概要（展示用）
         # v2.0 P2：重稿 diff 与评分趋势（会话内存态，不落盘）
         self._draft_cache: dict[int, dict] = {}    # chapter -> {attempt, text}
         self._review_history: list[dict] = []      # [{chapter, attempt, overall}]
         # 设定 Demo（创作向导先审后入库）：独立于图执行的轻量后台任务
         self._demo_status = "idle"   # idle / running / done / confirmed / error
         self._demo_result = None                   # DemoOutput
-        self._demo_error: Optional[str] = None
-        self._demo_thread: Optional[threading.Thread] = None
+        self._demo_error: str | None = None
+        self._demo_thread: threading.Thread | None = None
 
     @property
     def novel_dir(self) -> Path:
         return get_settings().novels_dir / self.novel_id
 
     def store(self) -> MdStore:
-        # 生成/人审/回写路径会产生事实源写入 → 启用每本书独立 Git 仓库（写作历史）
+        """只读视图（状态 / 章节列表 / 概览）。
+
+        只读路径**绝不新建 Git 仓库**：`/api/status`、`/api/queue` 等每 2.5s 被轮询一次，
+        若在此处初始化仓库，用户只是打开一次软件就会凭空多出 `.git`。
+        """
+        from src.memory.store_factory import open_store
+
+        return open_store(self.novel_dir, writable=False)
+
+    def write_store(self) -> MdStore:
+        """写入视图（应用 Skill、写入设定 Demo）——启用写作历史。"""
         from src.memory.store_factory import open_store
 
         return open_store(self.novel_dir, writable=True)
@@ -354,14 +365,14 @@ class ReviewSession:
     # -- 后台驱动 --
 
     def start(self, brief: str, chapters: int, parallel: bool = False,
-              workers: int = 0, skill_ids: Optional[list[str]] = None) -> None:
+              workers: int = 0, skill_ids: list[str] | None = None) -> None:
         if self._started:
             raise RuntimeError(
                 "会话异常终止，请用「断点重新生成」从断点恢复" if self._error
                 else "会话已启动"
             )
         # 正式生成前把向导选定的自定义 Skill 写入该书设定（逐章注入 Writer/Editor）
-        titles = _apply_skills_to_novel(self.store(), skill_ids or [])
+        titles = _apply_skills_to_novel(self.write_store(), skill_ids or [])
         if titles:
             logger.info("书 %s 已应用自定义 Skill: %s", self.novel_id, "、".join(titles))
         self._started = True
@@ -418,7 +429,7 @@ class ReviewSession:
         )
         self._worker.start()
 
-    def _run(self, brief: Optional[str], chapters: Optional[int], mode: Optional[str]) -> None:
+    def _run(self, brief: str | None, chapters: int | None, mode: str | None) -> None:
         try:
             from src.orchestrator.bootstrap import build_app
 
@@ -459,8 +470,8 @@ class ReviewSession:
                 self._error = str(exc)
                 self._cond.notify_all()
 
-    def _run_parallel(self, pipe, brief: Optional[str], chapters: Optional[int],
-                      mode: Optional[str]) -> None:
+    def _run_parallel(self, pipe, brief: str | None, chapters: int | None,
+                      mode: str | None) -> None:
         """卷级并行驱动：人审回调复用 _await_decision（并行仅在起草阶段，人审仍串行）。"""
         from src.orchestrator.parallel_runner import load_outline, run_parallel
 
@@ -562,7 +573,7 @@ class ReviewSession:
     # -- 设定 Demo（创作向导先审后入库，不经 LangGraph） --
 
     def start_demo(self, brief: str, chapters: int, feedback: str = "",
-                   skill_ids: Optional[list[str]] = None) -> None:
+                   skill_ids: list[str] | None = None) -> None:
         """后台生成设定 Demo；正式生成已启动或 Demo 生成中则拒绝。"""
         # 自定义 Skill 约束附加进 brief，使 Demo 设定（世界观/人物/基调）也遵循
         if skill_ids:
@@ -600,7 +611,7 @@ class ReviewSession:
         from src.config.settings import load_models_config
         from src.llm.registry import ModelRegistry
 
-        return Architect(ModelRegistry(load_models_config()), self.store())
+        return Architect(ModelRegistry(load_models_config()), self.write_store())
 
     def confirm_demo(self, demo_override=None) -> dict:
         """人工同意后把 Demo 写入资料库 settings/。
@@ -649,9 +660,9 @@ class InteractiveSession:
         self._status = "idle"   # idle/generating_cards/awaiting_choice/writing/awaiting_review/committing/error
         self._chapter = 0
         self._cards: list[dict] = []
-        self._draft: Optional[dict] = None   # {draft_text, attempt, review, model?}
-        self._error: Optional[str] = None
-        self._worker: Optional[threading.Thread] = None
+        self._draft: dict | None = None   # {draft_text, attempt, review, model?}
+        self._error: str | None = None
+        self._worker: threading.Thread | None = None
         self._runner = None                  # InteractiveRunner（重型装配，会话内缓存）
 
     def _ensure_runner(self):
@@ -730,7 +741,7 @@ class InteractiveSession:
             self._status = "awaiting_choice"
 
     def choose(self, card_id: str, custom_text: str = "",
-               target_words: Optional[int] = None) -> None:
+               target_words: int | None = None) -> None:
         with self._lock:
             if self._status != "awaiting_choice":
                 raise RuntimeError(f"当前不在选卡阶段（{self._status}）")
@@ -739,7 +750,7 @@ class InteractiveSession:
         self._spawn(self._do_choose, chapter, card_id, custom_text, target_words)
 
     def _do_choose(self, chapter: int, card_id: str, custom_text: str,
-                   target_words: Optional[int] = None) -> None:
+                   target_words: int | None = None) -> None:
         runner = self._ensure_runner()
         try:
             plan = runner.choose_card(chapter, card_id, custom_text)
@@ -753,7 +764,7 @@ class InteractiveSession:
 
     def _write(self, runner, chapter: int, plan: dict,
                feedback: str = "", revision_mode: str = "targeted",
-               target_words: Optional[int] = None) -> None:
+               target_words: int | None = None) -> None:
         result = runner.write_chapter(chapter, plan, feedback, revision_mode,
                                       target_words=target_words)
         with self._lock:
@@ -1570,9 +1581,9 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
     @app.post("/api/distill/start")
     def distill_start(body: DistillStartBody) -> JSONResponse:
         """启动后台蒸馏（非阻塞）。"""
-        from src.skills.distill import DistillSkill, DistillSettings
         from src.config.settings import load_models_config
         from src.llm.registry import ModelRegistry
+        from src.skills.distill import DistillSettings, DistillSkill
 
         # 构建 SkillContext（DistillSkill 需要 registry）
         class _Ctx:
@@ -1595,7 +1606,7 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
     @app.get("/api/distill/status/{skill_id}")
     def distill_status(skill_id: str) -> JSONResponse:
         """蒸馏进度轮询。"""
-        from src.skills.distill import DistillSkill, DistillSettings
+        from src.skills.distill import DistillSettings, DistillSkill
         skill = DistillSkill(DistillSettings(enabled=True), None)
         try:
             result = skill.run(action="status", skill_id=skill_id)
@@ -1606,7 +1617,7 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
     @app.get("/api/distill/report/{skill_id}")
     def distill_report(skill_id: str) -> JSONResponse:
         """获取完整 16 维蒸馏报告。"""
-        from src.skills.distill import DistillSkill, DistillSettings
+        from src.skills.distill import DistillSettings, DistillSkill
         skill = DistillSkill(DistillSettings(enabled=True), None)
         try:
             result = skill.run(action="report", skill_id=skill_id)
@@ -1617,7 +1628,7 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
     @app.get("/api/skills/list")
     def skills_list() -> JSONResponse:
         """列出所有已蒸馏的技能包。"""
-        from src.skills.distill import DistillSkill, DistillSettings
+        from src.skills.distill import DistillSettings, DistillSkill
         skill = DistillSkill(DistillSettings(enabled=True), None)
         result = skill.run(action="list")
         return JSONResponse(result)
@@ -1625,7 +1636,7 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
     @app.get("/api/skills/load/{skill_id}")
     def skills_load(skill_id: str) -> JSONResponse:
         """按 ID 加载完整技能包。"""
-        from src.skills.distill import DistillSkill, DistillSettings
+        from src.skills.distill import DistillSettings, DistillSkill
         skill = DistillSkill(DistillSettings(enabled=True), None)
         try:
             result = skill.run(action="report", skill_id=skill_id)
@@ -1636,7 +1647,7 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
     @app.post("/api/skills/reprocess")
     def skills_reprocess(body: DistillReprocessBody) -> JSONResponse:
         """重新蒸馏（版本更新）。"""
-        from src.skills.distill import DistillSkill, DistillSettings
+        from src.skills.distill import DistillSettings, DistillSkill
         skill = DistillSkill(DistillSettings(enabled=True), None)
         try:
             result = skill.run(
@@ -1655,7 +1666,7 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
         """打包下载技能包 .zip。"""
         from fastapi.responses import FileResponse
 
-        from src.skills.distill import DistillSkill, DistillSettings
+        from src.skills.distill import DistillSettings, DistillSkill
         skill = DistillSkill(DistillSettings(enabled=True), None)
         try:
             result = skill.run(action="export", skill_id=skill_id)
@@ -1670,7 +1681,7 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
     @app.delete("/api/skills/{skill_id}")
     def skills_delete(skill_id: str) -> JSONResponse:
         """删除指定技能包。"""
-        from src.skills.distill import DistillSkill, DistillSettings
+        from src.skills.distill import DistillSettings, DistillSkill
         skill = DistillSkill(DistillSettings(enabled=True), None)
         try:
             result = skill.run(action="delete", skill_id=skill_id)

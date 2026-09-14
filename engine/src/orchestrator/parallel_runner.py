@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from collections.abc import Callable
 
 from src.agents.architect import maybe_generate_style
 from src.agents.writer import human_revision_notes
@@ -44,7 +44,7 @@ OUTLINE_REL = "settings/outline.md"
 
 # ---------- 大纲阶段 ----------
 
-def load_outline(store) -> Optional[dict]:
+def load_outline(store) -> dict | None:
     """从 MD 事实源恢复大纲（断点续跑）；无大纲返回 None。"""
     if not store.exists(OUTLINE_REL):
         return None
@@ -108,7 +108,7 @@ def _worldview_rules(store, per_doc: int = 600) -> list[str]:
 
 
 def cross_volume_check(pipe, outline: dict, wave_no: int, volumes: list[int],
-                       wave_report_cb: Optional[WaveReportCallback] = None) -> None:
+                       wave_report_cb: WaveReportCallback | None = None) -> None:
     """波次含多卷时执行跨卷一致性合并审查；报告已存在则跳过（断点续跑）。"""
     if len(volumes) < 2:
         return
@@ -152,7 +152,7 @@ def run_parallel(
     outline_cb: DecisionCallback,
     review_cb: DecisionCallback,
     max_workers: int = 0,
-    wave_report_cb: Optional[WaveReportCallback] = None,
+    wave_report_cb: WaveReportCallback | None = None,
 ) -> dict:
     """卷级并行全流程。返回 {"chapters_done": int, "waves": int}。"""
     outline = ensure_outline(pipe, brief, total_chapters, outline_cb, novel_id)
@@ -189,7 +189,7 @@ def run_parallel(
 def _review_until_approved(pipe, state: dict, rec: dict,
                            review_cb: DecisionCallback, approved: set[int]) -> None:
     """单章人审循环：打回则携人工意见重稿（重置自动重试计数），直至通过并定稿。"""
-    first_review_passed: Optional[bool] = None
+    first_review_passed: bool | None = None
     while True:
         decision = review_cb({
             "type": "chapter_review",

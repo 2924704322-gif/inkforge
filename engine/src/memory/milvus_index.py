@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Optional
 
 from src.memory.embedder import Embedder
 from src.memory.md_store import MdDocument
@@ -40,7 +39,7 @@ class MilvusIndex:
         port: str,
         novel_id: str,
         embedder: Embedder,
-        uri: Optional[str] = None,
+        uri: str | None = None,
     ):
         try:
             from pymilvus import MilvusClient
@@ -120,7 +119,7 @@ class MilvusIndex:
     # ---------- 过滤表达式 ----------
 
     @staticmethod
-    def _build_filter(kind: Optional[str], max_chapter: Optional[int]) -> str:
+    def _build_filter(kind: str | None, max_chapter: int | None) -> str:
         conds: list[str] = []
         if kind:
             conds.append(f"kind == {_quote(kind)}")
@@ -134,9 +133,9 @@ class MilvusIndex:
         self,
         text: str,
         top_k: int = 5,
-        kind: Optional[str] = None,
-        character: Optional[str] = None,
-        max_chapter: Optional[int] = None,
+        kind: str | None = None,
+        character: str | None = None,
+        max_chapter: int | None = None,
     ) -> list[RetrievedChunk]:
         expr = self._build_filter(kind, max_chapter)
         res = self._client.search(
@@ -161,7 +160,7 @@ class MilvusIndex:
         return hits
 
     def get_corpus(
-        self, kind: Optional[str] = None, max_chapter: Optional[int] = None
+        self, kind: str | None = None, max_chapter: int | None = None
     ) -> list[RetrievedChunk]:
         """导出（过滤后）全部块，供 BM25 稀疏检索建库（对齐 Chroma get_corpus）。"""
         expr = self._build_filter(kind, max_chapter)

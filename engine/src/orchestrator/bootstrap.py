@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from src.agents.architect import Architect
 from src.agents.editor import Editor
 from src.agents.summarizer import Summarizer
@@ -25,7 +23,7 @@ from src.utils.logger import get_logger, setup_logging
 logger = get_logger(__name__)
 
 
-def build_pipeline(novel_id: str, target_words: Optional[int] = None) -> Pipeline:
+def build_pipeline(novel_id: str, target_words: int | None = None) -> Pipeline:
     """按 novel_id 装配全套运行时依赖。"""
     settings = get_settings()
     setup_logging(settings.log_level, settings.runtime_dir / "logs" / f"{novel_id}.log")
@@ -69,7 +67,7 @@ def build_pipeline(novel_id: str, target_words: Optional[int] = None) -> Pipelin
     )
 
 
-def build_app(novel_id: str, target_words: Optional[int] = None):
+def build_app(novel_id: str, target_words: int | None = None):
     """返回 (pipeline, compiled_graph)。"""
     settings = get_settings()
     pipe = build_pipeline(novel_id, target_words)

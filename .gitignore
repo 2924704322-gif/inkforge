@@ -41,8 +41,9 @@ engine/data/config/
 # ─────────── 测试与临时产物 ───────────
 e2e-shots/
 smoke-output/
+engine/smoke-reports/
+engine/.smoke/
 engine/smoke-state.json
-engine/.smoke-*/
 docs/_*.png
 docs/step*.png
 

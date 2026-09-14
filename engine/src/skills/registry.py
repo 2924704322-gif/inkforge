@@ -10,8 +10,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from src.skills.base import Skill, SkillContext
 from src.skills.memory_bus import MemoryBus
 from src.utils.logger import get_logger
@@ -46,12 +44,12 @@ def get_skill_class(name: str) -> type[Skill]:
 class SkillRegistry:
     """运行时 Skill 容器：构造已启用实例 + 绑定记忆总线 + 路由分发。"""
 
-    def __init__(self, context: SkillContext, bus: Optional[MemoryBus] = None):
+    def __init__(self, context: SkillContext, bus: MemoryBus | None = None):
         self._context = context
         self.bus = bus or MemoryBus()
         self._instances: dict[str, Skill] = {}
 
-    def build_enabled(self, skills_config: dict) -> "SkillRegistry":
+    def build_enabled(self, skills_config: dict) -> SkillRegistry:
         """skills_config: {name: {enabled: bool, ...}}。仅构造已注册且 enabled 的。"""
         for name, cls in _REGISTRY.items():
             raw = (skills_config or {}).get(name, {})

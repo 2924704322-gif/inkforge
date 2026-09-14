@@ -56,6 +56,86 @@ class TestStoreFactoryGitSemantics:
         assert store.read("settings/outline.md").content.strip() == "# 大纲"
 
 
+class TestGitIndexHygiene:
+    """回归：纯 Python 的 IndexFile.add **不会**自动排除 .git/。
+
+    曾实测到把仓库自身的 38 个对象文件加进索引，导致每次提交重新遍历对象，
+    开销 O(n²) 累积（60 次提交从 12s 恶化到 240s 不收敛）。
+    """
+
+    def _tracked(self, repo_root: Path) -> list[str]:
+        import subprocess
+
+        return subprocess.run(
+            ["git", "ls-files"], cwd=repo_root, capture_output=True, text=True
+        ).stdout.splitlines()
+
+    def test_nested_repo_never_tracks_git_internals(self, sandbox):
+        book = sandbox.novels / "hygiene-nested"
+        store = open_store(book, writable=True)
+        for i in range(5):
+            store.write(f"settings/d{i}.md", f"内容{i}", metadata={"title": f"T{i}"})
+        tracked = self._tracked(book)
+        assert tracked, "应有文件被跟踪"
+        assert not [t for t in tracked if ".git/" in t], f"索引被 .git 污染: {tracked[:5]}"
+        assert len(tracked) == 5
+
+    def test_outer_repo_never_tracks_git_internals(self, sandbox, tmp_path):
+        import subprocess
+
+        outer = tmp_path / "hygiene-outer"
+        outer.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=outer, check=True)
+        store = open_store(outer / "novels" / "b", writable=True)
+        for i in range(5):
+            store.write(f"settings/d{i}.md", f"内容{i}", metadata={"title": f"T{i}"})
+        tracked = self._tracked(outer)
+        assert not [t for t in tracked if ".git/" in t], f"索引被 .git 污染: {tracked[:5]}"
+
+    def test_commit_throughput_does_not_degrade(self, sandbox):
+        """提交耗时不得随提交次数超线性增长（O(n²) 回归护栏）。"""
+        import time
+
+        store = open_store(sandbox.novels / "throughput", writable=True)
+        timings: list[float] = []
+        for i in range(24):
+            t0 = time.perf_counter()
+            store.write(f"settings/d{i:02d}.md", f"内容{i}" * 30, metadata={"title": f"T{i}"})
+            timings.append(time.perf_counter() - t0)
+        first_half = sum(timings[:8]) / 8
+        last_half = sum(timings[-8:]) / 8
+        # 允许 3 倍波动（CI 机器抖动），但不得出现数量级恶化
+        assert last_half < first_half * 3 + 0.05, (
+            f"提交耗时随次数恶化：前 8 次均值 {first_half:.3f}s，后 8 次均值 {last_half:.3f}s"
+        )
+
+    def test_delete_is_recorded_in_history(self, sandbox):
+        """回归：章节删除此前直接 unlink，绕过本层 → 不进历史、哈希索引留悬空条目。"""
+        store = open_store(sandbox.novels / "del-book", writable=True)
+        store.write("chapters/vol-01/ch-001.md", "正文", metadata={"chapter": 1, "volume": 1})
+        store.mark_synced(["chapters/vol-01/ch-001.md"])
+        before = len(store.history(200))
+        assert store.delete("chapters/vol-01/ch-001.md", commit_message="删除第一章") is True
+        after = store.history(200)
+        assert len(after) > before
+        assert any("删除第一章" in c["message"] for c in after)
+        assert not (store.root / "chapters" / "vol-01" / "ch-001.md").exists()
+        assert "chapters/vol-01/ch-001.md" not in store._load_hashes()
+
+    def test_delete_missing_file_returns_false(self, sandbox):
+        store = open_store(sandbox.novels / "del-missing", writable=True)
+        assert store.delete("settings/ghost.md") is False
+
+    def test_untracked_git_dir_is_excluded_from_tree_walk(self, sandbox):
+        """_safe_tree_paths 兜底：即便走「整树」分支也不得包含 .git。"""
+        book = sandbox.novels / "walk-book"
+        store = open_store(book, writable=True)
+        store.write("settings/a.md", "A", metadata={"title": "A"})
+        paths = store._safe_tree_paths(book.resolve())
+        assert paths
+        assert not [p for p in paths if ".git" in p.split("/")]
+
+
 class TestWritingHistory:
     def test_write_produces_commit(self, sandbox):
         store = open_store(sandbox.novels / "hist-book", writable=True)
@@ -249,3 +329,65 @@ class TestEnclosingRepoDetection:
         store = open_store(book, writable=True)
         assert (book / ".git").exists()
         assert Path(store._repo.working_tree_dir).resolve() == book.resolve()
+
+    def test_outer_repo_scope_is_book_subdir(self, sandbox, tmp_path):
+        """复用外层仓库时，必须把历史范围限定在本书子目录（scope 非空）。"""
+        import subprocess
+
+        outer = tmp_path / "outer3"
+        outer.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=outer, check=True)
+        book = outer / "novels" / "b3"
+        store = open_store(book, writable=True)
+        assert store._repo_scope == "novels/b3"
+
+    def test_history_filters_out_other_books(self, sandbox, tmp_path):
+        """核心回归：外层仓库场景下，本书历史不得混入其他书/其他项目的提交。"""
+        import subprocess
+
+        outer = tmp_path / "outer4"
+        outer.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=outer, check=True)
+        (outer / "unrelated.txt").write_text("项目文件", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=outer, check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=T", "-c", "user.email=t@e", "commit", "-q", "-m", "unrelated"],
+            cwd=outer,
+            check=True,
+        )
+
+        book_a = outer / "novels" / "a"
+        book_b = outer / "novels" / "b"
+        open_store(book_a, writable=True).write("settings/outline.md", "A", commit_message="book-a")
+        open_store(book_b, writable=True).write("settings/outline.md", "B", commit_message="book-b")
+
+        hist_a = [c["message"] for c in open_store(book_a, writable=True).history()]
+        assert any("book-a" in m for m in hist_a)
+        assert not any("book-b" in m for m in hist_a), "本书历史混入了另一本书的提交"
+        assert not any("unrelated" in m for m in hist_a), "本书历史混入了项目无关提交"
+
+    def test_history_works_in_read_mode_for_outer_repo(self, sandbox, tmp_path):
+        """此前只读路径在「外层仓库跟踪本书」时返回空历史 → 写作历史面板永久空白。"""
+        import subprocess
+
+        outer = tmp_path / "outer5"
+        outer.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=outer, check=True)
+        book = outer / "novels" / "readhist"
+        open_store(book, writable=True).write("settings/outline.md", "内容", commit_message="写入一次")
+        read_store = open_store(book, writable=False)
+        assert read_store._repo is not None
+        assert any("写入一次" in c["message"] for c in read_store.history())
+
+    def test_repo_resolution_is_cached(self, sandbox, tmp_path):
+        """性能回归：重复构造 MdStore 不得反复 spawn git 去解析仓库归属。"""
+        from src.memory import md_store as md
+
+        book = tmp_path / "cached-book"
+        open_store(book, writable=True)
+        key = book.resolve().as_posix()
+        assert key in md._REPO_CACHE
+        before = md._REPO_CACHE[key]
+        for _ in range(5):
+            open_store(book, writable=True)
+        assert md._REPO_CACHE[key] is before

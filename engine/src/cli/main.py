@@ -221,7 +221,7 @@ def create(
     from src.orchestrator.bootstrap import build_app
 
     pipe, graph = build_app(novel_id, target_words=words)
-    console.print(f"[bold]启动探活 ...[/bold]")
+    console.print("[bold]启动探活 ...[/bold]")
     pipe.registry.probe_all()
     console.print("[green]探活通过[/green]，开始生成\n")
     initial = {
@@ -468,7 +468,7 @@ def distill_init(
     try:
         result = skill.run(action="init", file_path=file_path,
                           skill_id=skill_id, version=version)
-        console.print(f"[green]技能包初始化完成[/green]")
+        console.print("[green]技能包初始化完成[/green]")
         console.print_json(data=result)
     except (FileNotFoundError, FileExistsError, ValueError) as exc:
         console.print(f"[red]{exc}[/red]")
@@ -514,7 +514,7 @@ def distill_run(
 
     # 同步模式：阻塞执行，实时显示进度（与 create/resume 命令一致）
     from src.distillation.chunker import Chunk
-    from src.distillation.graph import DistillPipeline, run_distill
+    from src.distillation.graph import DistillPipeline
     from src.distillation.skill_store import checkpoint_db_for, load_chunks, load_manifest, save_report
 
     try:
@@ -531,7 +531,7 @@ def distill_run(
     checkpoint_db = checkpoint_db_for(skill_id)
 
     # 检查是否有 checkpoint 可以续跑
-    import sqlite3
+
     from langgraph.types import Command
 
     graph_config = {"configurable": {"thread_id": skill_id}, "recursion_limit": 500}

@@ -17,7 +17,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -88,14 +88,14 @@ def _build_hunks(original: str, proposed: str) -> tuple[list[dict], int, int, bo
     return hunks, additions, deletions, truncated
 
 
-def _find_chapter(store: MdStore, chapter: int) -> Optional[Any]:
+def _find_chapter(store: MdStore, chapter: int) -> Any | None:
     for doc in store.list_chapters():
         if doc.metadata.get("chapter") == chapter:
             return doc
     return None
 
 
-def _read_target(novel: str, target: dict) -> tuple[Optional[Any], Optional[str]]:
+def _read_target(novel: str, target: dict) -> tuple[Any | None, str | None]:
     """返回 (chapter_doc_or_None, settings_rel_or_None)；失败返回 (None, None)。"""
     store = _store_of(novel)
     kind = target.get("kind")
@@ -113,11 +113,11 @@ def _read_target(novel: str, target: dict) -> tuple[Optional[Any], Optional[str]
     return None, None
 
 
-def _store_of(novel: str) -> MdStore:
-    # 提案接受会写事实源 → 启用写作历史
+def _store_of(novel: str, writable: bool = False) -> MdStore:
+    # 读路径（读取目标文稿）不建仓库；接受提案时 writable=True 进写作历史
     from src.memory.store_factory import open_store
 
-    return open_store(get_settings().novels_dir / novel, writable=True)
+    return open_store(get_settings().novels_dir / novel, writable=writable)
 
 
 def register_proposal_api(app: Any, hub: Any, default_novel: str) -> None:
@@ -141,7 +141,7 @@ def register_proposal_api(app: Any, hub: Any, default_novel: str) -> None:
 
     def _apply_proposal(novel: str, proposal: dict) -> dict:
         """把提案写入事实源；目标已变化时返回 conflict。"""
-        store = _store_of(novel)
+        store = _store_of(novel, writable=True)
         target = proposal["target"]
         if target["kind"] == "chapter":
             doc = _find_chapter(store, int(str(target["key"]).removeprefix("ch-")))
@@ -186,9 +186,9 @@ def register_proposal_api(app: Any, hub: Any, default_novel: str) -> None:
         )
 
         # LLM 生成提案全文（对话 + 全书上下文 + 目标原文 + 指令）
+        from src.config.settings import load_models_config
         from src.llm.base import ChatMessage
         from src.llm.registry import ModelRegistry
-        from src.config.settings import load_models_config
         from src.web.inkforge_windows import agent_prompt
 
         # 复用会话历史，保持多轮语境

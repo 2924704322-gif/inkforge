@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, TypedDict
+from typing import TypedDict
 
 
 class NovelState(TypedDict, total=False):
@@ -30,8 +30,8 @@ class NovelState(TypedDict, total=False):
     review: dict                    # 最近一次 Editor 审查结果
     verdict: str                    # pass / partial_rewrite / full_rewrite
     retry_exceeded: bool            # 重试超限强制送人审标记
-    revision_notes: Optional[str]   # 下一稿重写指令（Editor 问题清单或人工意见）
-    first_review_passed: Optional[bool]  # 本章首次送人审是否通过（验收指标③）
+    revision_notes: str | None   # 下一稿重写指令（Editor 问题清单或人工意见）
+    first_review_passed: bool | None  # 本章首次送人审是否通过（验收指标③）
     model: str                      # 当前稿实际生成使用的 provider/model
     used_fallback: bool             # 当前稿是否触发降级备用接入点（可追溯）
 
@@ -49,7 +49,7 @@ def chapter_plans(state: NovelState) -> list[dict]:
     return plans
 
 
-def plan_for_chapter(state: NovelState, chapter: int) -> Optional[dict]:
+def plan_for_chapter(state: NovelState, chapter: int) -> dict | None:
     for plan in chapter_plans(state):
         if plan["chapter"] == chapter:
             return plan

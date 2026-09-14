@@ -60,6 +60,21 @@ ignore = [
     "E501",    # 行长由 formatter 处理
     "B008",    # FastAPI Depends() 默认参数是惯用写法
     "SIM108",  # 三元表达式不强制
+
+    # ── 存量基线（2026-09-14 首次接入 ruff 时的既有告警，刻意暂缓）──
+    # 这些规则本身合理，但涉及对「已验收的生成代码」做大规模无行为变更改写，
+    # 收益（可读性）低于风险（改动面 40+ 处、diff 淹没真实变更）。
+    # 策略：新代码不再引入；存量在后续按模块重构时顺带收敛。
+    "B904",    # 41 处 raise-without-from：逐处补 `from e` 会改动异常链语义
+    "SIM102",  # 3 处可折叠 if
+    "C408",    # 2 处 dict() 调用字面量
+    "B905",    # 2 处 zip() 未显式 strict
+    "B027",    # 1 处空方法未加 abstractmethod（Skill.handle_event 的默认 no-op 是有意的）
+    "UP007",   # 1 处 Union 注解
+    "UP047",   # 1 处泛型函数写法
+    "UP036",   # 1 处版本分支
+    "SIM105",  # 1 处 contextlib.suppress
+    "B007",    # 1 处未使用循环变量
 ]
 
 [tool.ruff.lint.per-file-ignores]

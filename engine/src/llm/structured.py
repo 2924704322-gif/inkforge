@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Optional, Type, TypeVar
+from typing import TypeVar
 
 from pydantic import BaseModel, ValidationError
 
@@ -104,7 +104,7 @@ def extract_json(text: str) -> dict:
     start, end = text.find("{"), text.rfind("}")
     if start != -1:
         candidates.append(text[start: end + 1] if end > start else text[start:])
-    last_error: Optional[json.JSONDecodeError] = None
+    last_error: json.JSONDecodeError | None = None
     for cand in candidates:
         try:
             return json.loads(cand)
@@ -125,9 +125,9 @@ def chat_structured(
     registry: ModelRegistry,
     role: str,
     messages: list[ChatMessage],
-    schema: Type[T],
+    schema: type[T],
     max_parse_retries: int = 2,
-    temperature: Optional[float] = None,
+    temperature: float | None = None,
 ) -> T:
     """以指定角色调用模型并解析为 pydantic 模型。
 

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from src.agents.prompt_loader import render_prompt
 from src.agents.schemas import (
     ArbitrationOutput,
@@ -86,7 +84,7 @@ class Editor:
 
     def review_chapter(
         self, ctx: ChapterContext, chapter_text: str, attempt: int,
-        target_words: Optional[int] = None,
+        target_words: int | None = None,
     ) -> ReviewOutput:
         logger.info("Editor: 审查第 %d 章（第 %d 稿）...", ctx.chapter, attempt)
         actual = chapter_length(chapter_text)
@@ -126,7 +124,7 @@ class Editor:
         lines = [
             f"# 第 {chapter} 章审查报告（第 {attempt} 稿）\n",
             f"**总分：{review.overall}** → {verdict_of(review.overall)}\n",
-            f"| 维度 | 得分 |\n|------|------|",
+            "| 维度 | 得分 |\n|------|------|",
             f"| 设定一致性 | {review.consistency} |",
             f"| 大纲符合度 | {review.plot} |",
             f"| 衔接连贯性 | {review.continuity} |",

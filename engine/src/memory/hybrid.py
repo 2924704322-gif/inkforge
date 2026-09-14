@@ -8,8 +8,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 import jieba
 from rank_bm25 import BM25Okapi
 
@@ -47,8 +45,8 @@ class HybridRetriever:
         self._bm25_cache.clear()
 
     def _bm25_for(
-        self, kind: Optional[str], max_chapter: Optional[int]
-    ) -> Optional[tuple[BM25Okapi, list[RetrievedChunk]]]:
+        self, kind: str | None, max_chapter: int | None
+    ) -> tuple[BM25Okapi, list[RetrievedChunk]] | None:
         key = (kind, max_chapter)
         if key not in self._bm25_cache:
             corpus = self._index.get_corpus(kind=kind, max_chapter=max_chapter)
@@ -62,9 +60,9 @@ class HybridRetriever:
         self,
         text: str,
         top_k: int = 5,
-        kind: Optional[str] = None,
-        max_chapter: Optional[int] = None,
-        current_chapter: Optional[int] = None,
+        kind: str | None = None,
+        max_chapter: int | None = None,
+        current_chapter: int | None = None,
     ) -> list[RetrievedChunk]:
         """混合检索。current_chapter 非空时启用时间衰减重排。"""
         # 1) 向量召回（超采样）

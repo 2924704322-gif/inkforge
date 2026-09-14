@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from src.agents.prompt_loader import render_prompt
 from src.agents.schemas import NegotiationOutput, ReviewOutput
 from src.llm.base import ChatMessage, ChatResult
@@ -129,9 +127,9 @@ class Writer:
     def write_chapter(
         self,
         ctx: ChapterContext,
-        revision_notes: Optional[str] = None,
-        previous_text: Optional[str] = None,
-        target_words_override: Optional[int] = None,
+        revision_notes: str | None = None,
+        previous_text: str | None = None,
+        target_words_override: int | None = None,
     ) -> ChatResult:
         """生成/重写章节。revision_notes 非空时为重写模式。
         target_words_override 非空时覆盖实例默认 target_words，用于互动模式按章自定义字数。"""

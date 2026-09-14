@@ -16,7 +16,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import frontmatter
 from fastapi.responses import JSONResponse
@@ -50,7 +50,7 @@ class ChatCreateBody(BaseModel):
 
 class ChatSendBody(BaseModel):
     message: str
-    target: Optional[dict] = None  # {kind, key}：右侧选中文档作为本轮主上下文
+    target: dict | None = None  # {kind, key}：右侧选中文档作为本轮主上下文
 
 
 class BindingsBody(BaseModel):
@@ -191,14 +191,20 @@ def _parse_json_object(raw: str) -> dict:
 def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
     """把 Inkforge 桌面端扩展端点挂到既有 FastAPI app 上。"""
 
-    def _store(novel: str = "") -> MdStore:
+    def _store(novel: str = "", writable: bool = False) -> MdStore:
+        """打开本书事实源。
+
+        writable 语义（避免读路径产生写副作用）：
+        - GET 处理器（资料库树 / 读文档 / 读章节）一律 writable=False，
+          否则「打开一次工作台」就会为每本书凭空创建 .git 仓库；
+        - PUT/POST 处理器 writable=True，写入进 Git 写作历史。
+        """
         nid = novel or default_novel
         if not _NOVEL_ID_RE.match(nid):
             raise ValueError(f"非法书名标识：{nid!r}")
-        # 含设定/章节写入路径 → 启用写作历史
         from src.memory.store_factory import open_store
 
-        return open_store(get_settings().novels_dir / nid, writable=True)
+        return open_store(get_settings().novels_dir / nid, writable=writable)
 
     def _sess(novel: str = "") -> Any:
         try:
@@ -249,7 +255,7 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
             from fastapi import HTTPException
 
             raise HTTPException(400, f"非法路径：{body.rel!r}")
-        store = _store(novel)
+        store = _store(novel, writable=True)
         meta: dict = {}
         if store.exists(body.rel):
             meta = store.read(body.rel).metadata
@@ -278,7 +284,7 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
 
     @app.put("/api/chapters/{chapter}")
     def chapter_save(chapter: int, body: ChapterSaveBody, novel: str = "") -> JSONResponse:
-        store = _store(novel)
+        store = _store(novel, writable=True)
         for doc in store.list_chapters():
             if doc.metadata.get("chapter") == chapter:
                 store.write(
@@ -379,7 +385,6 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
         from src.config.settings import load_models_config
         from src.llm.base import ChatMessage
         from src.llm.registry import ModelRegistry
-
         from src.web.inkforge_windows import agent_prompt
 
         preset_prompt = agent_prompt(agent)
@@ -603,7 +608,7 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
     @app.post("/api/bindings")
     def bindings_set(body: BindingsBody, novel: str = "") -> JSONResponse:
         """把自定义约束 + 蒸馏技能包摘要合成 settings/custom-skills.md。"""
-        store = _store(novel)
+        store = _store(novel, writable=True)
         sections: list[str] = ["# 创作约束（风格工坊绑定，最高优先级）"]
         for sid in body.custom_skill_ids:
             path = get_settings().novels_dir.parent / "custom_skills" / f"{sid}.md"

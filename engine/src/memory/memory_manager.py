@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from src.memory.hybrid import HybridRetriever
-from src.memory.md_store import MdDocument, MdStore
+from src.memory.md_store import MdStore
 from src.memory.retriever import VectorIndex
 from src.utils.logger import get_logger
 
@@ -190,10 +190,7 @@ class MemoryManager:
                 ctx.unresolved_foreshadowing.append(item)
                 resolve_ch = item.get("resolve_ch")
                 # 完结章：强制把所有仍未回收的已埋设伏笔纳入"务必回收"清单（完本收尾扫描）
-                if is_finale:
-                    ctx.due_foreshadowing.append(item)
-                # 已到/即将到预期回收章，主动提醒 Writer 尽快回收
-                elif resolve_ch and chapter >= resolve_ch - FORESHADOW_DUE_WINDOW:
+                if is_finale or resolve_ch and chapter >= resolve_ch - FORESHADOW_DUE_WINDOW:
                     ctx.due_foreshadowing.append(item)
 
         # ④ 世界观规则混合召回

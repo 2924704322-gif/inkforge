@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from typing import Optional
 
 import anthropic
 
@@ -16,7 +15,7 @@ logger = get_logger(__name__)
 class AnthropicProvider(ModelProvider):
     """Anthropic Messages API 接入。system 消息单独提升为 system 参数。"""
 
-    def __init__(self, name: str, api_key: str, base_url: Optional[str] = None):
+    def __init__(self, name: str, api_key: str, base_url: str | None = None):
         super().__init__(name)
         kwargs: dict = {"api_key": api_key, "max_retries": 0}
         if base_url:
@@ -28,7 +27,7 @@ class AnthropicProvider(ModelProvider):
         messages: list[ChatMessage],
         model: str,
         temperature: float = 0.7,
-        max_tokens: Optional[int] = None,
+        max_tokens: int | None = None,
         json_mode: bool = False,
     ) -> ChatResult:
         system_parts = [m.content for m in messages if m.role == "system"]
@@ -43,7 +42,7 @@ class AnthropicProvider(ModelProvider):
                 {"role": "assistant", "content": "{"}  # 预填引导 JSON 输出
             )
 
-        last_err: Optional[Exception] = None
+        last_err: Exception | None = None
         for attempt in range(3):
             try:
                 resp = self._client.messages.create(

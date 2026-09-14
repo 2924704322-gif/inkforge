@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import hmac
 import os
-from typing import Iterable
+from collections.abc import Iterable
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
