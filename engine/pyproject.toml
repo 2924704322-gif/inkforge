@@ -1,0 +1,80 @@
+[project]
+name = "inkforge-engine"
+version = "0.2.0"
+description = "Inkforge 长篇小说智能创作工作台 —— Python 引擎 sidecar"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "markdown>=3.6",
+    "langgraph>=1.0",
+    "langgraph-checkpoint-sqlite>=2.0",
+    "openai>=1.60",
+    "anthropic>=0.40",
+    "chromadb>=1.0",
+    "rank_bm25>=0.2.2",
+    "jieba>=0.42",
+    "python-frontmatter>=1.1",
+    "GitPython>=3.1",
+    "PyYAML>=6.0",
+    "ebooklib>=0.18",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "python-dotenv>=1.0",
+    "typer>=0.15",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "httpx>=0.27", "ruff>=0.6"]
+
+[tool.setuptools]
+packages = ["src"]
+
+# ─────────────── 测试 ───────────────
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q --strict-markers"
+filterwarnings = [
+    "ignore::DeprecationWarning:pkg_resources.*",
+    "ignore:.*pkg_resources.*:UserWarning",
+    "ignore::DeprecationWarning:jieba.*",
+]
+markers = [
+    "llm: 需要真实 LLM 调用的测试（默认跳过，显式 -m llm 运行）",
+]
+
+# ─────────────── Lint / Format ───────────────
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+# 引擎 web 层为蒸馏遗留的大函数文件，暂时放宽复杂度告警
+extend-exclude = ["data", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = [
+    "E501",    # 行长由 formatter 处理
+    "B008",    # FastAPI Depends() 默认参数是惯用写法
+    "SIM108",  # 三元表达式不强制
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 蒸馏遗留的巨型 web 模块：允许局部导入与较长函数，逐步收敛
+"src/web/*.py" = ["E402", "C901", "PLR0912", "PLR0915"]
+"tests/*.py" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
+
+# ─────────────── 类型检查（渐进式：只对新增/已收敛模块开启） ───────────────
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_ignores = false
+# 存量代码未做类型收敛，先只检查新增模块；后续逐目录放开
+files = ["src/web/auth.py", "src/memory/store_factory.py"]

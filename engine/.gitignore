@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 密钥与本地配置
+.env
+
+# 运行时派生数据（向量库、checkpoint 均可重建）
+data/runtime/
+*.sqlite
+*.sqlite3
+.chroma/
+
+# 蒸馏产物（书籍分块副本 + LLM 报告，均可通过 distill run 重建）
+data/skills/
+
+# 用户创作数据（小说 MD 事实源与自定义 Skill，不随仓库分发；
+# 历史由每本小说目录内独立 Git 仓库承担）
+data/novels/
+data/custom_skills/
+
+# 测试产物（E2E 截图与历史验证截图）
+e2e-shots/
+docs/_*.png
+docs/step*.png
+
+# IDE
+.idea/
+.vscode/
+
+# 日志
+logs/
+*.log

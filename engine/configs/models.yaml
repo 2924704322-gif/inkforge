@@ -1,0 +1,95 @@
+# 模型接入配置（D3：自主接入）
+# providers 定义接入点；roles 将 Agent 角色绑定到 接入点/模型/参数。
+# api_key 使用 ${ENV_VAR} 占位符从环境变量读取，不落盘。
+# 更换厂商/模型只改本文件，代码零改动。
+
+providers:
+  deepseek:
+    type: openai_compat
+    base_url: https://api.deepseek.com/v1
+    api_key: ${DEEPSEEK_API_KEY}
+  # my-claude:
+  #   type: anthropic
+  #   api_key: ${ANTHROPIC_API_KEY}
+  # local-ollama:
+  #   type: openai_compat
+  #   base_url: http://localhost:11434/v1
+  #   api_key: none
+
+roles:
+  # orchestrator 角色已移除：v1.0 采用 LangGraph 固定状态图编排（graph.py），
+  # 无 LLM 意图路由需求；如未来引入自由对话入口再恢复此绑定。
+  architect:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.8
+    # 可选：降级接入点（主接入点调用失败时自动切换，需在 providers 中定义该点）
+    # fallback:
+    #   provider: my-claude
+    #   model: claude-3-5-sonnet-20241022
+  writer:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.7
+  editor:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.0
+
+  # 对话智能体（Inkforge 工作台：主智能体 + 五个子智能体，各自可绑不同模型）
+  master:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.8
+  character:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.8
+  plot:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.8
+  outline:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.8
+  prose:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.7
+  review:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.2
+  # 兼容旧会话的通用对话角色
+  chat:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.8
+
+  # 蒸馏角色（NDS: 小说蒸馏系统；复用 deepseek 接入点，低温度保证结构化输出一致）
+  distiller:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.3
+
+# Embedding 配置
+# type 可选：
+#   chroma_default —— ChromaDB 内置 ONNX 模型（零依赖，英文优；开发调试用）
+#   openai_compat  —— 任意 OpenAI 兼容 embedding API（如硅基流动 BAAI/bge-m3）
+#   local_bge      —— 本地 BGE-M3（需 pip install FlagEmbedding）
+#
+# 默认档：硅基流动 BGE-M3（中文优化，正式生产推荐）。
+# 需在 .env 配置 EMBEDDING_API_KEY=<硅基流动 API Key>。
+# 切换 embedding 模型后须执行 rebuild-index 全量重建向量索引（identity 变化）。
+embedding:
+  type: openai_compat
+  base_url: https://api.siliconflow.cn/v1
+  api_key: ${EMBEDDING_API_KEY}
+  model: BAAI/bge-m3
+  # 零依赖开发档（ChromaDB 内置 ONNX MiniLM，英文优）：
+  # type: chroma_default
+  # 本地推理档（需 pip install FlagEmbedding，首次下载约 2GB）：
+  # type: local_bge
+  # model: BAAI/bge-m3
+

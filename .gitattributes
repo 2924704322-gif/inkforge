@@ -1,0 +1,35 @@
+# 统一行尾为 LF（S1-3 仓库卫生）
+#
+# 动机：引擎的事实源是「带 frontmatter 的 Markdown」，md_store 用文件字节的
+# sha256 做人工编辑检测（.file-hashes.json）。若检出时被 git 转成 CRLF，
+# 哈希会与写入时不一致，导致每章都把全部设定文档误判为「人工改过」而重复嵌入。
+# 统一 LF 可彻底消除这一类平台差异。
+* text=auto eol=lf
+
+# 二进制资产不做行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.zip binary
+*.epub binary
+*.sqlite binary
+*.sqlite3 binary
+*.woff binary
+*.woff2 binary
+
+# Windows 批处理必须保留 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 生成的锁文件按 linguist 归类，避免污染语言统计
+package-lock.json linguist-generated=true
+engine/requirements.lock linguist-generated=true
+
+# 文档与源码按语言标注（GitHub 高亮）
+*.md text
+*.py text
+*.ts text
+*.vue text

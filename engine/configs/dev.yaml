@@ -1,0 +1,15 @@
+# 开发环境覆盖（Deep Merge 到 base.yaml 之上）
+environment: dev
+log_level: DEBUG
+
+vector_store:
+  type: chroma
+  path: data/runtime/chroma
+
+# 开发环境启用立绘 Skill（dry_run 占位 URL，零 API 成本），
+# 并订阅 character_updated 事件自动补图，用于演示记忆总线联动
+skills:
+  image_gen:
+    enabled: true
+    dry_run: true
+    auto_on_update: true

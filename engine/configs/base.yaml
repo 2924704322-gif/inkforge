@@ -1,0 +1,51 @@
+# 应用分层配置基线（T3.1）
+# base.yaml 为公共基线，dev.yaml / prod.yaml 在其上做 Deep Merge 覆盖。
+# 环境由 APP_ENV 选择（dev / prod），默认 dev。
+# ${ENV_VAR} 占位符在加载时从环境变量解析（Fail-Fast 校验）。
+
+version: "1.0.0"
+environment: base
+log_level: INFO
+
+# 向量库后端：dev 用 ChromaDB；prod 预留 Milvus（T3.2 适配层）
+vector_store:
+  type: chroma
+  path: data/runtime/chroma
+
+# 混合检索调参（T2.3 混合检索 / T2.4 伏笔主动召回）
+retrieval:
+  hybrid_top_k: 5
+  rrf_k: 60
+  time_decay_lambda: 0.05
+  foreshadow_due_window: 2
+
+# 生成流程参数（D6 分级打回重试上限）
+generation:
+  default_target_words: 3000
+  max_partial_retries: 2
+  max_full_retries: 2
+  # 对话协商协作模式（v2.0 P4-A）：局部重写前 Writer 逐条回应→Editor 仲裁→定向修订；
+  # 每次 partial_rewrite 多 2 次 LLM 调用，基线默认关闭
+  negotiation_enabled: false
+
+# Skill 扩展（T3.3）：按名启用/配置，具体字段见各 Skill 的 SettingsModel
+skills:
+  image_gen:
+    enabled: false      # 立绘为可选扩展，基线默认关闭
+    dry_run: true       # 占位 URL 模式，不产生生图 API 成本
+    auto_on_update: false
+  export:
+    enabled: true       # 纯本地零成本，默认启用（TXT/EPUB 合并导出）
+    format: txt         # 默认导出格式：txt / epub
+    include_unapproved: false
+    auto_export_on_finale: false  # 记忆总线：末章定稿时自动全书导出
+  translate:
+    enabled: false      # 翻译有 LLM 调用成本，默认关闭
+    target_lang: English
+    role: editor
+    auto_on_commit: false  # 记忆总线：章节定稿后自动翻译该章（需 enabled=true）
+  distill:
+    enabled: true       # 蒸馏有 LLM 成本（16 维 × 每块）；此处为基线默认值，实际按调用点传参
+    chunk_strategy: BY_CHAPTERS  # BY_CHAPTERS / BY_WORDS
+    chunk_size: 20000    # BY_WORDS 策略每块字数
+    depth: DEEP           # DEEP=16维（预留 SHALLOW=4维）

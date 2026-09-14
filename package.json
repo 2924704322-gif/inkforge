@@ -1,0 +1,12 @@
+{
+  "name": "inkforge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Inkforge —— 长篇小说智能创作工作台（蒸馏自 DeepWrite 与 novel_agent2.1）",
+  "scripts": {
+    "dev": "npm --prefix apps/desktop run dev",
+    "build": "npm --prefix apps/desktop run build",
+    "typecheck": "npm --prefix apps/desktop run typecheck",
+    "engine:install": "pip install -r engine/requirements.txt"
+  }
+}

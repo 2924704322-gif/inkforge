@@ -1,0 +1,120 @@
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family:
+    'Segoe UI', 'Microsoft YaHei', 'PingFang SC', 'Noto Sans SC', system-ui, sans-serif;
+  background: #ffffff;
+  color: #26272b;
+  overflow: hidden;
+  font-size: 14px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.muted {
+  color: #8a8f99;
+  font-size: 12px;
+}
+
+.pre-wrap {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.scroll-y {
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #d9dce1 transparent;
+}
+
+.column {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* ── DeepWrite 风格对话框 ── */
+.dw-dialog {
+  border-radius: 12px;
+}
+.dw-dialog-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: #26272b;
+}
+
+/* ── 正文渲染 ── */
+.prose-html {
+  font-size: 15px;
+  line-height: 2;
+  max-width: 760px;
+  margin: 0 auto;
+  color: #26272b;
+}
+.prose-html p {
+  margin: 0.6em 0;
+  text-indent: 2em;
+}
+.prose-html blockquote {
+  border-left: 3px solid #e0e3e8;
+  margin: 0.8em 0;
+  padding: 0.2em 1em;
+  color: #5c6470;
+}
+.prose-html table {
+  border-collapse: collapse;
+  margin: 0.8em 0;
+}
+.prose-html th,
+.prose-html td {
+  border: 1px solid #e5e7eb;
+  padding: 4px 10px;
+}
+.prose-html h1,
+.prose-html h2,
+.prose-html h3 {
+  margin: 1em 0 0.5em;
+}
+
+/* ── 行级 diff ── */
+.diff-box {
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 12.5px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.diff-add {
+  background: #e6f6ec;
+  color: #116932;
+}
+.diff-del {
+  background: #fdebec;
+  color: #b42318;
+  text-decoration: line-through;
+}
+
+/* ── 编辑器文档区 ── */
+.doc-textarea {
+  width: 100%;
+  border: none;
+  outline: none;
+  resize: none;
+  font-family: 'Segoe UI', 'Microsoft YaHei', serif;
+  font-size: 15px;
+  line-height: 1.95;
+  color: #26272b;
+  background: transparent;
+  padding: 0;
+}
+.doc-textarea::placeholder {
+  color: #b6bac2;
+}

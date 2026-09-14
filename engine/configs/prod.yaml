@@ -1,0 +1,10 @@
+# 生产环境覆盖（Deep Merge 到 base.yaml 之上）
+environment: prod
+log_level: WARNING
+
+# 生产档使用 Milvus（T3.2 提供与 ChromaDB 同接口的适配层）
+# host/port 从环境变量注入，加载时解析 ${ENV_VAR}
+vector_store:
+  type: milvus
+  host: ${MILVUS_HOST}
+  port: ${MILVUS_PORT}

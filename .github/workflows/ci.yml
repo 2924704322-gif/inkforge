@@ -1,0 +1,121 @@
+name: CI
+
+# S2-2：把「按 README 装不起来」「测试零覆盖」「密钥入库」这类问题挡在合并之前。
+# 三道门：python（lint + 类型 + 测试 + 依赖一致性）、desktop（typecheck + 构建）、guard（密钥/仓库卫生）。
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: 引擎（lint / 测试 / 依赖自检）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: engine/requirements.lock
+
+      - name: 安装依赖（锁文件）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+          pip install ruff mypy
+
+      - name: 依赖清单自检（req vs 实际 import）
+        run: python scripts/verify_env.py
+
+      - name: Ruff lint
+        run: ruff check src tests scripts
+
+      - name: Mypy（仅已收敛模块）
+        run: mypy
+        continue-on-error: true
+
+      - name: Pytest（零真实 LLM 调用）
+        env:
+          INKFORGE_GIT_HISTORY: "0"
+        run: python -m pytest -q
+
+      - name: 上传测试报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report
+          path: engine/.pytest_cache
+          if-no-files-found: ignore
+
+  desktop:
+    name: 桌面壳（typecheck / build）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: 构建
+        run: npm run build
+
+  guard:
+    name: 密钥与仓库卫生
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 禁止明文密钥入库
+        run: |
+          set -e
+          if git grep -nE '(sk-[A-Za-z0-9_\-]{20,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})' \
+               -- . ':!*.md' ':!requirements.lock' ':!package-lock.json'; then
+            echo "::error::检测到疑似明文密钥，请移出仓库并轮换"
+            exit 1
+          fi
+          echo "未发现明文密钥。"
+
+      - name: 禁止 .env 入库
+        run: |
+          if git ls-files | grep -E '(^|/)\.env$'; then
+            echo "::error::.env 被纳入版本控制"
+            exit 1
+          fi
+          echo ".env 未入库。"
+
+      - name: README 引用路径存在性
+        run: python3 scripts/check_doc_paths.py
+
+  depsync:
+    name: 依赖清单与 import 一致性
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: 静态比对 requirements.txt 与 src 的第三方 import
+        run: python3 scripts/check_dep_manifest.py

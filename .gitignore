@@ -1,0 +1,53 @@
+# ─────────── Python ───────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ─────────── Node / Electron ───────────
+node_modules/
+out/
+dist/
+apps/desktop/release/
+# TS 增量编译缓存（提交过一次，应从源码树移除）
+*.tsbuildinfo
+
+# ─────────── 密钥（绝不入库） ───────────
+.env
+.env.*
+!.env.example
+
+# ─────────── 引擎运行时数据 ───────────
+# 派生数据（向量库 / checkpoint / 日志，可随时重建）
+engine/data/runtime/
+*.sqlite
+*.sqlite3
+*.sqlite-*
+# 蒸馏技能包（可由 distill 重建）
+engine/data/skills/
+# 用户创作数据（每本小说目录内另有独立 Git 仓库承担写作历史）
+engine/data/novels/
+engine/data/custom_skills/
+engine/data/materials/
+engine/data/learning/
+engine/data/config/
+
+# ─────────── 测试与临时产物 ───────────
+e2e-shots/
+smoke-output/
+engine/smoke-state.json
+engine/.smoke-*/
+docs/_*.png
+docs/step*.png
+
+# ─────────── IDE / 系统 ───────────
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
