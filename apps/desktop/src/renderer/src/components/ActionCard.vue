@@ -15,6 +15,7 @@ const props = defineProps<{
   novelId: string
   chatId: string
   actions: ActionReceipt[]
+  /** 待确认的写动作（来自会话内的 pending_action；为 null 说明没有待办）。 */
   pending?: PendingAction | null
   /** 工作区/书内：用于展示作用域徽标 */
   scope?: 'book' | 'workspace'
@@ -27,8 +28,26 @@ const busy = ref(false)
 
 const scopePath = computed(() => withNovel('', props.novelId || '__workspace__').slice(1))
 
-const reads = computed(() => props.actions.filter((a) => a.status !== 'pending_confirm'))
-const writes = computed(() => props.actions.filter((a) => a.status === 'pending_confirm'))
+/** 待办本身（唯一能触发执行的入口）。 */
+const pendingReceipt = computed<ActionReceipt | null>(() =>
+  props.pending
+    ? {
+        op: props.pending.op,
+        status: 'pending_confirm',
+        ok: true,
+        summary: props.pending.impact,
+      }
+    : null,
+)
+
+/** 其余回执（已执行 / 失败），排除与待办同名的重复项。 */
+const others = computed(() =>
+  props.actions.filter(
+    (a) => a.status !== 'pending_confirm' && a.op !== (props.pending?.op ?? ''),
+  ),
+)
+
+const hasContent = computed(() => pendingReceipt.value !== null || others.value.length > 0)
 
 const OP_LABEL: Record<string, string> = {
   book_list: '列出书目',
@@ -40,6 +59,9 @@ const OP_LABEL: Record<string, string> = {
   outline_read: '读取大纲',
   search_workspace: '跨书检索',
   material_list: '素材清单',
+  material_read: '读取素材',
+  learning_list: '学习仿写历史',
+  learning_read: '读取学习成果',
   skill_list: '技能包清单',
   constraint_list: '约束清单',
   model_config: '模型绑定',
@@ -94,35 +116,39 @@ async function decide(confirm: boolean): Promise<void> {
 </script>
 
 <template>
-  <div v-if="reads.length || writes.length" class="action-card">
+  <div v-if="hasContent" class="action-card">
     <div class="ac-head">
       <span class="ac-title">墨师动作</span>
       <NTag size="tiny" :type="scope === 'workspace' ? 'info' : 'default'" :bordered="false">
         {{ scope === 'workspace' ? '工作区' : '本书' }}
       </NTag>
       <span class="ac-path">{{ scopePath }}</span>
+      <NTag v-if="pendingReceipt" size="tiny" type="warning" :bordered="false">待你确认</NTag>
+      <NTag v-else size="tiny" type="success" :bordered="false">无待办</NTag>
     </div>
 
-    <div v-for="(a, i) in reads" :key="`r-${i}`" class="ac-row">
-      <NTag size="tiny" :type="a.status === 'failed' ? 'error' : 'success'" :bordered="false">
-        {{ a.status === 'failed' ? '失败' : '已执行' }}
-      </NTag>
-      <span class="ac-op">{{ label(a.op) }}</span>
-      <span class="ac-summary">{{ a.status === 'failed' ? a.error : preview(a) }}</span>
-    </div>
-
-    <div v-for="(a, i) in writes" :key="`w-${i}`" class="ac-pending">
+    <!-- 待确认：唯一可执行入口；确认后本块随 pending 一起消失，变成下面的"已执行"回执 -->
+    <div v-if="pendingReceipt" class="ac-pending">
       <div class="ac-pending-head">
         <NTag size="tiny" type="warning" :bordered="false">待确认</NTag>
-        <span class="ac-op">{{ label(a.op) }}</span>
+        <span class="ac-op">{{ label(pendingReceipt.op) }}</span>
       </div>
-      <div class="ac-impact">{{ a.summary }}</div>
+      <div class="ac-impact">{{ pendingReceipt.summary }}</div>
       <div class="ac-actions">
         <NButton size="tiny" type="primary" :loading="busy" @click="decide(true)">
           确认执行
         </NButton>
         <NButton size="tiny" quaternary :disabled="busy" @click="decide(false)">取消</NButton>
       </div>
+    </div>
+
+    <!-- 已执行 / 失败回执 -->
+    <div v-for="(a, i) in others" :key="`r-${i}`" class="ac-row">
+      <NTag size="tiny" :type="a.status === 'failed' ? 'error' : 'success'" :bordered="false">
+        {{ a.status === 'failed' ? '失败' : '已执行' }}
+      </NTag>
+      <span class="ac-op">{{ label(a.op) }}</span>
+      <span class="ac-summary">{{ a.status === 'failed' ? a.error : preview(a) }}</span>
     </div>
   </div>
 </template>

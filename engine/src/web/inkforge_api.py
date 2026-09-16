@@ -30,10 +30,14 @@ from src.utils.logger import get_logger
 from src.web.actions import (
     MAX_ACTIONS_PER_TURN,
     ActionContext,
+    consume_preview,
     execute as actions_execute,
     execute_pending,
+    forget_preview,
     manifest as actions_manifest_list,
+    normalize_op,
     read_audit,
+    register_preview,
 )
 from src.web.actions import ACTIONS as _ACTION_REGISTRY
 from src.web.scope import WORKSPACE, chats_dir, is_workspace
@@ -319,6 +323,29 @@ def _shrink_action_data(data: Any) -> Any:
     return data
 
 
+#: 用户话术 → 动作名前缀（只用于判断"模型自己选的动作是否答非所问"）。
+#: 实测：模型会在正文里说"动作清单里没有学习仿写查询接口"却只调了 book_list ——
+#: 这时补一次规划调用就能命中正确工具，所以需要一个"答非所问"的判据。
+_TOPIC_TO_OP_PREFIX: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("学习仿写", "学习成果", "样本拆解", "文风学习", "剧情学习", "学习历史"), "learning"),
+    (("素材", "参考资料"), "material"),
+    (("技能包", "蒸馏", "16 维", "十六维"), "skill"),
+    (("创作约束", "自定义约束", "风格约束"), "constraint"),
+    (("模型绑定", "接入点", "模型配置"), "model_config"),
+    (("书目", "有哪些书", "书架", "作品列表"), "book_list"),
+    (("章节", "第几章"), "chapter"),
+    (("大纲",), "outline"),
+    (("世界观", "人物档案", "设定文档", "资料库"), "doc"),
+)
+
+
+def _topic_ops(message: str) -> set[str]:
+    """用户话术对应的动作名前缀集合（空集 = 无法判定主题）。"""
+    text = message or ""
+    return {prefix for words, prefix in _TOPIC_TO_OP_PREFIX
+            if any(w in text for w in words)}
+
+
 def _looks_actionable(message: str) -> bool:
     """用户这句话是否明确要求"办事"（而不是闲聊/提问）。
 
@@ -335,12 +362,16 @@ def _looks_actionable(message: str) -> bool:
 def _pending_verdict_payload(verdict: dict) -> tuple[str, list[dict], bool]:
     """把闸门裁决转成 (回复文本, 动作回执, 是否真的执行了)。
 
-    抽成模块级纯函数，便于单测锁定"确认/取消"两条路径的文案与回执形态。
+    抽成模块级纯函数，便于单测锁定"确认/取消/拒绝"三条路径的文案与回执形态。
     """
+    kind = verdict.get("kind")
     result = verdict.get("result")
     pending = verdict.get("pending") or {}
     op = pending.get("op")
-    if verdict.get("kind") == "executed" and result is not None:
+    if kind == "refused":
+        return (f"⚠ 已阻止执行 {op}：{verdict.get('reason', '')}。"
+                "请重新发起一次操作，我给出影响说明后再确认。"), [], False
+    if kind == "executed" and result is not None:
         text = (f"✅ 已执行 {op}：{result.summary}" if result.ok
                 else f"❌ {op} 执行失败：{result.error}")
         receipts = [{
@@ -444,6 +475,13 @@ def _plan_actions_with_model(registry, role: str, user_msg: str,
         "**参数取值约定**：`mode` 只能是 pipeline 或 interactive；"
         "**新建书请用 `novel_id`（不是 book_key / id / 书名标识）**；"
         "`novel` 传已存在书目的标识（上下文里出现过的那本）；未提到书目时可省略 novel。\n"
+        "**用户话术 → 工具对照（按用户用词直接选，不要绕到别的工具）**：\n"
+        "  · 学习仿写 / 学习成果 / 样本拆解 / 剧情学习 / 文风学习 → learning_list（列历史）/ learning_read\n"
+        "  · 素材 / 素材库 / 参考资料 → material_list / material_read\n"
+        "  · 技能包 / 蒸馏 / 16 维 → skill_list\n"
+        "  · 创作约束 / 风格约束 → constraint_list\n"
+        "  · 书 / 书目 / 作品 → book_list；章节 → chapter_list；设定 / 世界观 / 人物 → doc_list\n"
+        "用户明确问哪一类，就只调那一类的列取工具（配套需要时再补列取，不要用别的工具凑）。\n"
         f"{extra}"
         "若确实无需任何工具，输出 {\"actions\": []}。\n\n"
         f"【工具清单】\n{_summarize_action_manifest()}\n\n"
@@ -473,7 +511,52 @@ def _plan_actions_with_model(registry, role: str, user_msg: str,
                 payload = item[key]
                 out.append({"op": str(key).strip(),
                             "args": payload if isinstance(payload, dict) else {}})
-    return out
+    return _backfill_from_user_message(out, user_msg)
+
+
+#: 动作参数 → "从用户原话里取值的兜底提示词"。模型经常漏填这些，而用户其实说得很清楚。
+_ARG_VALUE_PATTERNS: dict[str, tuple[str, ...]] = {
+    "novel_id": (
+        r"书名标识|标识|novel_id|book_id",
+        r"就叫|叫|用|填|取名|命名为",
+        r"[`\"'：:]\s*([A-Za-z][A-Za-z0-9_-]{2,40})",
+    ),
+}
+
+
+def _guess_arg_from_user(key: str, message: str) -> str:
+    """从用户原话里猜一个参数取值（目前只做 novel_id，建书最常见）。"""
+    text = message or ""
+    if key != "novel_id":
+        return ""
+    m = re.search(
+        r"(?:书名标识|标识|novel_id|book_id|id)\s*(?:就用|用|是|为|叫|就叫|：|:)?\s*[`\"']?"
+        r"([A-Za-z][A-Za-z0-9_-]{2,40})",
+        text,
+    )
+    if m:
+        return m.group(1)
+    m = re.search(r"[`\"']([A-Za-z][A-Za-z0-9_-]{3,40})[`\"']", text)
+    return m.group(1) if m else ""
+
+
+def _backfill_from_user_message(actions: list[dict], user_msg: str) -> list[dict]:
+    """补齐模型漏掉的必填参数（值从用户原话里取）。
+
+    实测：用户已经说"标识就用 xx"，模型仍会漏 ``novel_id``（或写成 title），
+    结果动作直接失败、用户点了确认却什么都没发生。这里做一层确定性补齐。
+    """
+    for item in actions:
+        op = normalize_op(str(item.get("op") or ""))
+        item["op"] = op
+        args = dict(item.get("args") or {})
+        if op == "book_create" and not str(args.get("novel_id") or "").strip():
+            guess = _guess_arg_from_user("novel_id", user_msg) or _guess_novel_id(user_msg)
+            if guess:
+                args["novel_id"] = guess
+                logger.info("规划结果漏了 novel_id，已从用户原话补齐：%s", guess)
+        item["args"] = args
+    return actions
 
 
 def _parse_actions(text: str) -> tuple[str, list[dict]]:
@@ -517,8 +600,8 @@ def _save_chat_to(root: Path, chat: dict) -> None:
 def _decide_pending_action(chat: dict, message: str, ctx) -> dict | None:
     """待确认动作闸门（纯函数，不落盘）。
 
-    · 用户说"确认/执行" → 真正执行，返回 {"kind": "executed", ...}
-    · 用户说"取消/算了" → 丢弃待办，返回 {"kind": "cancelled", ...}
+    · 用户说"确认/执行" → 校验预览凭证后真正执行，返回 {"kind": "executed", ...}
+    · 用户说"取消/算了" → 丢弃待办与预览登记，返回 {"kind": "cancelled", ...}
     · 其它话语 → 返回 None（视为新话题，待办保留在原处）
 
     抽成模块级函数：这是安全关键路径（写动作的唯一放行口），必须可独立单测。
@@ -528,10 +611,16 @@ def _decide_pending_action(chat: dict, message: str, ctx) -> dict | None:
         return None
     decision = _pending_decision(message)
     if decision == "approve":
+        refusal = consume_preview(ctx, pending)
+        if refusal:
+            # 预览凭证缺失/过期 → 不执行，回来执意提醒用户重新预览（不静默落盘）
+            return {"kind": "refused", "pending": pending, "result": None,
+                    "reason": refusal}
         result = execute_pending(ctx, pending)
         chat.pop(_ACTIONS_PENDING_KEY, None)
         return {"kind": "executed", "pending": pending, "result": result}
     if decision == "cancel":
+        forget_preview(ctx, str(pending.get("op") or ""))
         chat.pop(_ACTIONS_PENDING_KEY, None)
         return {"kind": "cancelled", "pending": pending, "result": None}
     return None
@@ -574,11 +663,12 @@ class BookSelectBody(BaseModel):
 
 
 class ActionRunBody(BaseModel):
-    """直接执行墨师动作（P3）：写动作必须带 confirm=true。"""
+    """直接执行墨师动作（P3）：写动作必须带 confirm=true，且需匹配一次真实预览。"""
 
     op: str
     args: dict = Field(default_factory=dict)
     confirm: bool = False
+    token: str = ""
 
 
 class ChatSendBody(BaseModel):
@@ -1079,6 +1169,8 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
         # 重新登记为待确认，用户点了"确认"却看到还挂着一条待办（实测踩到过）。
         _pending_before = chat.get(_ACTIONS_PENDING_KEY) or {}
         verdict = _decide_pending_action(chat, user_msg, _action_ctx(scope_value, book))
+        if _pending_before:
+            logger.info("待确认闸门：用户=%r 裁决=%s", user_msg, (verdict or {}).get("kind"))
         if verdict is not None:
             was_executed = verdict["kind"] == "executed"
             if was_executed and verdict["pending"].get("op") == "book_select":
@@ -1268,8 +1360,12 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
         return f"{_ACTION_PROMPT_HEAD}\n\n当前上下文：{where}"
 
     def _run_actions(scope_value: str, book: str, actions: list[dict],
-                     *, confirmed: bool) -> list[dict]:
-        """执行墨师给出的动作清单（只读自动执行；写动作未确认时只登记）。"""
+                     *, confirmed: bool, dry_run: bool = False) -> list[dict]:
+        """执行墨师给出的动作清单。
+
+        · dry_run=True（默认）：写动作只登记待确认，不落盘；
+        · dry_run=False + confirmed=True：用户已确认，写动作直接执行。
+        """
         ctx = _action_ctx(scope_value, book)
         out: list[dict] = []
         for item in actions[:MAX_ACTIONS_PER_TURN]:
@@ -1277,13 +1373,15 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
                 continue
             op = str(item.get("op", "")).strip()
             args = item.get("args") if isinstance(item.get("args"), dict) else {}
-            result = actions_execute(op, args, ctx=ctx, execute_write=confirmed)
+            result = actions_execute(op, args, ctx=ctx,
+                                     execute_write=(confirmed and not dry_run))
             out.append({
                 "op": result.op,
                 "status": result.status,
                 "ok": result.ok,
                 "summary": result.summary,
                 "error": result.error,
+                "args": result.args,
                 "data": _shrink_action_data(result.data),
             })
             # 建书后立刻把工作台当前书目切过去，用户不必再说一句"切到新书"
@@ -1311,44 +1409,97 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
         from src.llm.base import ChatMessage
 
         clean, actions = _parse_actions(reply)
+        confirmed_round = False          # 本轮动作是否来自"用户刚确认过的重规划"
+        if actions:
+            # 模型自己给了动作，但要防"答非所问"：用户问学习仿写、它却只列书目。
+            # 命中这种情况就当作没给动作，走补漏规划。
+            wanted = _topic_ops(user_msg)
+            got = {str(a.get("op", "")) for a in actions if isinstance(a, dict)}
+            if (wanted and got
+                    and not any(op.startswith(p) for op in got for p in wanted)
+                    and not any(o.startswith(("book_create", "book_select", "gen_",
+                                              "demo_", "interactive_", "book_delete",
+                                              "book_bind", "material_create",
+                                              "constraint_create"))
+                            for o in got)):
+                logger.info("模型动作答非所问（wanted=%s got=%s），改走补漏规划",
+                            sorted(wanted), sorted(got))
+                actions = []
         if not actions:
             if not allow_planner:
                 # 本轮已经执行过一个已确认动作：绝不再补规划，
                 # 否则同一个写动作会被登记第二次（实测：用户确认后又被挂成待确认）。
                 return clean, []
             if _is_affirmative(user_msg):
-                # 优先确定性转换：用户确认 + 上文是要建书 → 直接从原话取标识建 pending，
-                # 不依赖模型（实测模型会漏 args，如 novel_id 缺失，导致"确认"后什么都没发生）。
+                # 用户说"确认"但没有待办（上一轮模型只问了、没登记）：
+                # 这意味着用户已经同意过，本轮的动作应当**直接执行**而不是再挂一张确认卡。
                 actions = _fallback_action_from_history(chat, user_msg)
                 if actions:
-                    logger.info("用户确认：确定性转换出 %d 个动作（跳过规划调用）", len(actions))
+                    confirmed_round = True
+                    logger.info("用户确认：确定性转换出 %d 个动作并直接执行", len(actions))
             if not actions and _looks_actionable(user_msg):
-                # 补漏：消息明确要求办事 → 规划调用。
+                # 补漏：消息明确要求办事 → 规划调用（写动作仍会走确认闸门）。
                 actions = _plan_actions_with_model(registry, role, user_msg, prior, context)
             elif not actions:
-                # 用户在对上一条提议说"确认"但系统没登记待办 → 按"已确认"再规划一次
                 actions = _plan_actions_with_model(registry, role, user_msg, prior, context,
                                                    after_confirm=True)
                 if actions:
-                    logger.info("用户确认但无待办：按已确认补规划出 %d 个动作", len(actions))
+                    confirmed_round = True
+                    logger.info("用户确认但无待办：按已确认补规划出 %d 个动作并直接执行",
+                                len(actions))
             if not actions:
                 return clean, []
 
-        results = _run_actions(scope_value, book, actions, confirmed=False)
+            # 规划结果若"缺必填参数"而确定性兜底能给全（典型：模型只给模式、忘了 novel_id），
+            # 用兜底版本替换——否则用户点了"确认"却只收到一条失败回执（实测反复踩到）。
+            fallback = _fallback_action_from_history(chat, user_msg)
+            for cand in fallback:
+                same = [a for a in actions
+                        if isinstance(a, dict) and a.get("op") == cand["op"]]
+                if not same:
+                    continue
+                cur = {k: v for k, v in (same[0].get("args") or {}).items() if v not in (None, "")}
+                need = {k: v for k, v in (cand.get("args") or {}).items()}
+                if set(need) > set(cur):
+                    logger.info("规划结果缺参数，改用确定性兜底：%s", cand)
+                    actions = [cand if a is same[0] else a for a in actions]
+
+        # 用户刚确认过的回合：直接执行（不再登记待确认），否则用户点了确认却看到新卡。
+        results = _run_actions(scope_value, book, actions,
+                               confirmed=confirmed_round, dry_run=not confirmed_round)
+        if confirmed_round and results:
+            chat.pop(_ACTIONS_PENDING_KEY, None)
+            return (_action_response_text(results) or clean), results
         pending = next((r for r in results if r["status"] == "pending_confirm"), None)
         if pending:
-            chat[_ACTIONS_PENDING_KEY] = {
-                "op": pending["op"],
-                "args": next((a.get("args") for a in actions
-                              if isinstance(a, dict)
-                              and str(a.get("op")) == str(pending["op"])), {}),
-                "impact": pending.get("summary", ""),
-            }
+            # 用**规范化后的参数**登记预览：确认时比对的也是这一份，
+            # 否则"模型写 mode=free、系统折算 pipeline"会让两边不等而拒绝确认。
+            chat[_ACTIONS_PENDING_KEY] = register_preview(
+                _action_ctx(scope_value, book),
+                pending["op"],
+                pending.get("args") or {},
+                pending.get("summary", ""),
+            )
         else:
             chat.pop(_ACTIONS_PENDING_KEY, None)
 
         receipt = _summary_from_results(results)
         if not receipt:
+            return clean, results
+
+        logger.info(
+            "动作轮：用户已确认=%s 结果=%s 待确认项=%s",
+            confirmed_round, [r["status"] for r in results], (pending or {}).get("op"),
+        )
+
+        # 纯"待确认"轮：把确定性的影响说明固定附在回复末尾（不依赖模型改写它）。
+        # 理由：这条消息会被反复读取（确认前后都在），内容必须稳定，
+        # 否则前端确认卡看起来像挂在另一条消息上（用户会以为按钮没生效）。
+        # 同时保留模型自己的话术（它对参数的理解写在正文里），只是把"影响说明"这条钉死。
+        if pending is not None and not any(r["status"] == "ok" for r in results):
+            notice = _action_response_text(results) or pending.get("summary", "")
+            if notice and notice not in (clean or ""):
+                clean = (f"{clean}\n\n{notice}").strip() if clean else notice
             return clean, results
 
         # 结果回灌：让墨师用自然语言汇总（并在纯动作轮里给出可读答复）
@@ -1371,12 +1522,6 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
         if not final_clean.strip():
             logger.info("动作结果汇总为空，改用确定性回执文本")
             final_clean = _action_response_text(results)
-        # 若本轮登记了待确认写动作（且没有已执行结果），回执必须包含"未执行"的事实，
-        # 否则模型可能顺势说成"正在创建"，用户以为已经落盘（实测踩到过）。
-        if pending is not None and not any(r["status"] == "ok" for r in results):
-            notice = f"\n\n（尚未执行：需要你确认后我才会真正执行。操作：{pending['op']}）"
-            if notice.strip() not in final_clean:
-                final_clean = (final_clean + notice).strip()
         return final_clean, results
 
     @app.get("/api/actions")
@@ -1421,8 +1566,14 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
         if not body.confirm:
             result = actions_execute(op, body.args, ctx=_action_ctx(scope_value, book),
                                      execute_write=False)
-            pending = {"op": op, "args": body.args, "impact": result.summary}
+            pending = register_preview(_action_ctx(scope_value, book), op, body.args,
+                                       result.summary)
             return JSONResponse({"ok": True, "status": "pending_confirm", "pending": pending})
+        # 确认必须对应一次真实预览（防"口头声称确认"直接落盘）
+        refusal = consume_preview(_action_ctx(scope_value, book),
+                                  {"op": op, "args": body.args, "token": body.token})
+        if refusal:
+            raise HTTPException(409, refusal)
         result = actions_execute(op, body.args, ctx=_action_ctx(scope_value, book),
                                  execute_write=True)
         if result.ok and op == "book_select":
@@ -1444,6 +1595,9 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
         if not pending:
             raise HTTPException(409, "当前没有待确认的动作")
         ctx = _action_ctx(scope_value, book)
+        refusal = consume_preview(ctx, pending)
+        if refusal:
+            raise HTTPException(409, refusal)
         result = execute_pending(ctx, pending)
         chat.pop(_ACTIONS_PENDING_KEY, None)
         chat["messages"].append({
@@ -1467,10 +1621,12 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
 
     @app.delete("/api/chats/{cid}/action")
     def chat_action_cancel(cid: str, novel: str = "") -> JSONResponse:
-        """取消会话里的待确认动作。"""
-        scope_value, _book = _resolve_scope(novel)
+        """取消会话里的待确认动作（含预览登记）。"""
+        scope_value, book = _resolve_scope(novel)
         chat = _load_chat(scope_value, cid)
         pending = chat.pop(_ACTIONS_PENDING_KEY, None)
+        if pending:
+            forget_preview(_action_ctx(scope_value, book), str(pending.get("op") or ""))
         _save_chat(scope_value, chat)
         return JSONResponse({"ok": True, "cancelled": bool(pending)})
 

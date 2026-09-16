@@ -422,6 +422,10 @@ def test_memory_rule(make_memory):       # (MdStore, MemoryManager)，用 FakeIn
 | 15 | 在函数内写 `from fastapi import HTTPException` 后又在该函数**别处**用 `raise HTTPException(...)` | Python 把该名字判为**局部变量** → `UnboundLocalError: cannot access local variable 'HTTPException'`，接口 500 且栈里看不到真实原因 | 模块顶部已统一 import；**不要**在函数内重复 import 同名符号 |
 | 16 | 在 `src/agents/prompts/` 放非模板的 `.md`（如动作说明） | `prompt_loader.validate_templates()` 会扫描该目录**全部** `*.md` 当模板校验，含 `{var}` 单花括号即 `ConfigError` → **引擎启动失败** | 非模板文档放 `src/agents/actions/`（由 `action_prompt.py` 直读） |
 | 17 | 以为"模型的工具调用"会按协议输出 | 真实 DeepSeek 实测：只回答不调工具、动作名自造（`list_books`）、枚举值自造（`mode: "free"`）、参数漏填（缺 `novel_id`）、"确认"后反复追问 | 见 `docs/07-全量功能冒烟报告-20260916.md` §5.2 的 7 条修法：补漏规划调用 + 确定性兜底 + op 别名表 + 枚举折算 + 单书自动定位 + 闸门即时返回 + "未执行"强制提示 |
+| 18 | 把写动作的"预览登记"按**会话维度**做键 | 同一个写动作可能在工作区会话预览、在书内会话确认（或反之），按会话分会话就互相找不到预览 → 用户点"确认"被拒、卡片一直挂着 | 预览键统一用 `{目标书}::{op}`（与会话无关），并在**参数规范化之后**登记/比对（`normalize_args` 一次折算、并丢弃未声明键），两边才严格相等 |
+| 19 | 用户说"确认"时按普通回合再规划一次 | 用户已经同意过，却又被挂成一张新的待确认卡（"点了确认，卡还在"） | 命中确认词 → 该轮标记 `confirmed_round`，动作**直接执行**（`dry_run=False`）并立即返回，绝不再登记待办 |
+| 20 | 指望模型把用户原话里的参数填进动作 | 用户明说"标识就用 xx"，模型仍漏 `novel_id`（或写成 `title`）→ 动作失败、确认后什么都没发生 | 规划结果过一遍 `_backfill_from_user_message`：`book_create` 缺 `novel_id` 时从用户原话确定性补齐（`_guess_arg_from_user`） |
+| 21 | 模型在正文里说"这个功能我查不到" | 其实清单里有对应工具（如 `learning_list`），它却把用户话术（"学习仿写"）匹配到了别的工具 | 规划提示词加"用户话术 → 工具对照表"；执行前用 `_topic_ops` 做"答非所问"判定，命中就丢弃模型自选动作、改走补漏规划 |
 
 ---
 

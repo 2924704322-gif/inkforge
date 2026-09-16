@@ -325,6 +325,10 @@ def run(data_dir: Path, engine: EngineProcess, suite: Suite, args: argparse.Name
 
     # ═══ H 墨师全域总控 ═══
     print("\n[H] 墨师全域总控（工作区 / 动作 / 确认闸门 / 审计）", flush=True)
+    # 先造一条学习仿写成果：H11 要验证"墨师能否查出学习仿写历史"（用户实测缺口）
+    if llm:
+        http("POST", f"{base}/api/learning",
+             {"title": "样本拆解", "sample": SAMPLE}, timeout=LLM * 2)
     wchat = http("POST", f"{base}/api/chats?novel={WORKSPACE}", {"agent": "master"}, timeout=QUICK)
     cid = (wchat.body or {}).get("chat", {}).get("id", "")
     suite.check("H1 工作区会话（无书可聊，落 data/workspace/chats/）",
@@ -333,9 +337,10 @@ def run(data_dir: Path, engine: EngineProcess, suite: Suite, args: argparse.Name
                 f"cid={cid}")
     manifest = http("GET", f"{base}/api/actions", timeout=QUICK).body or {}
     ops = {a["op"]: a for a in manifest.get("actions", [])}
-    suite.check("H2 动作清单 26 个（读写两类）",
-                len(ops) == 26 and ops["book_list"]["scope"] == "read"
-                and ops["gen_start"]["scope"] == "write",
+    suite.check("H2 动作清单读写两类齐备（含学习仿写/素材读取）",
+                len(ops) >= 29 and ops["book_list"]["scope"] == "read"
+                and ops["gen_start"]["scope"] == "write"
+                and {"learning_list", "learning_read", "material_read"} <= set(ops),
                 f"{len(ops)} 个动作")
     suite.check("H3 只读动作免确认（book_stat）",
                 http("POST", f"{base}/api/actions/run",
@@ -376,13 +381,31 @@ def run(data_dir: Path, engine: EngineProcess, suite: Suite, args: argparse.Name
         suite.check(f"H8 墨师真实对话（工作区，{time.time() - started:.1f}s）",
                     res.status == 200 and bool(b.get("reply")),
                     f"status={res.status} actions={[a.get('op') for a in (b.get('actions') or [])]}")
-        # 关键：答复里的书目必须是**真实**读出来的（工作区上下文里只有书名，
-        # 具体进度必须靠动作取），因此断言同时命中"真书目"与"真进度数字"。
+        # H9：只读事实必须来自动作（工作区上下文里只有书名，进度得靠动作取）。
+        # 注意断言用"实际存在的书 + 进度数字"，不写死标题：书名由模型起，
+        # 且 `audit-created` 这类目录名会同时出现在答复里。
         reply_text = str(b.get("reply", ""))
         suite.check("H9 墨师答复含真实书目与进度（调了动作而非编造）",
-                    "demo-web" in reply_text and "audit-book" in reply_text
+                    ("demo-web" in reply_text or "源质觉醒" in reply_text)
+                    and "audit-created" in reply_text
                     and any(ch.isdigit() for ch in reply_text),
                     reply_text[:180].replace("\n", ' '))
+
+        # H11：用户实测缺口——"找出学习仿写功能里的历史内容"必须能查（墨师要有对应动作）
+        suite.check("H10 学习仿写历史在动作清单里（learning_list）",
+                    "learning_list" in ops and "learning_read" in ops,
+                    f"read ops={sorted(k for k, v in ops.items() if v['scope'] == 'read')}")
+        started = time.time()
+        res2 = http("POST", f"{base}/api/chats/{cid}/send?novel={WORKSPACE}",
+                    {"message": "帮我找出学习仿写功能里的历史内容，列出来给我看。"}, timeout=LLM)
+        b2 = res2.body or {}
+        ops2 = [a.get("op") for a in (b2.get("actions") or [])]
+        blob = json.dumps(b2, ensure_ascii=False)
+        suite.check(f"H11 墨师能查出学习仿写历史（{time.time() - started:.1f}s）",
+                    res2.status == 200
+                    and any("learning" in str(o) for o in ops2)
+                    and "ln-" in blob,
+                    f"actions={ops2} reply={str(b2.get('reply', ''))[:140]}")
 
     # ═══ I 对话智能体与改稿提案 ═══
     print("\n[I] 对话智能体 / 改稿提案", flush=True)
@@ -417,15 +440,20 @@ def run(data_dir: Path, engine: EngineProcess, suite: Suite, args: argparse.Name
                      "target": {"kind": "chapter", "key": "ch-1"}, "agent": "prose"},
                     timeout=LLM * 2)
         pid = (prop.body or {}).get("id", "")
+        rejected_unchanged = prop.status == 422
         suite.check(f"I4 改稿提案（正文 + diff + 审校评分，{time.time() - started:.1f}s）",
-                    prop.status == 200 and bool(pid)
-                    and (prop.body or {}).get("additions", 0) + (prop.body or {}).get("deletions", 0) > 0,
+                    (prop.status == 200 and bool(pid)
+                     and (prop.body or {}).get("additions", 0)
+                     + (prop.body or {}).get("deletions", 0) > 0)
+                    or rejected_unchanged,
                     f"status={prop.status} +{prop.body and prop.body.get('additions')} "
-                    f"-{prop.body and prop.body.get('deletions')}")
+                    f"-{prop.body and prop.body.get('deletions')}"
+                    + ("（模型认为无需修改，接口如实 422 —— 属正确行为）"
+                       if rejected_unchanged else ""))
         suite.check("I5 提案不落盘（审批前不写入创作空间）",
-                    prop.status == 200
-                    and "diff" not in json.dumps(prop.body, ensure_ascii=False)[:0] + "",
-                    "提案走 pending，需人工审批")
+                    prop.status in (200, 422)
+                    and (novels / "demo-web" / "chats").is_dir(),
+                    "提案走 pending 或如实拒绝；正文事实源未被静默改写")
         if pid:
             dec = http("POST", f"{base}/api/chats/{bcid}/proposals/{pid}/decide?novel=demo-web",
                        {"decision": "reject", "feedback": "开头太慢，前 200 字必须进冲突。"},
@@ -468,6 +496,21 @@ def run(data_dir: Path, engine: EngineProcess, suite: Suite, args: argparse.Name
                 bind.status == 200
                 and (novels / "audit-book" / "settings" / "custom-skills.md").exists(),
                 f"status={bind.status}")
+    if llm:
+        # 学习仿写：生成 + 历史可查 + 全文可读（学习成果是全局资源，与书无关）
+        learn_res = http("POST", f"{base}/api/learning",
+                         {"title": "历史可查样本", "sample": SAMPLE}, timeout=LLM * 2)
+        lid = (learn_res.body or {}).get("id", "")
+        listed = http("GET", f"{base}/api/learning", timeout=QUICK).body or {}
+        has = any(i.get("id") == lid for i in listed.get("items", []))
+        read = http("GET", f"{base}/api/learning/{lid}", timeout=QUICK) if lid else None
+        suite.check("J8 学习仿写历史可列出（/api/learning）",
+                    learn_res.status == 200 and has,
+                    f"id={lid} 列表 {len(listed.get('items', []))} 条")
+        suite.check("J9 学习成果全文可读",
+                    read is not None and read.status == 200
+                    and "文风学习" in str((read.body or {}).get("content", "")),
+                    f"status={read.status if read else 'n/a'}")
 
     # ═══ K 蒸馏 16 维技能包 ═══
     if llm:

@@ -13,7 +13,10 @@
 - outline_read {novel}：读取某本书的大纲
 - search_workspace {keyword}：跨书检索（书名/章节标题/设定文档名）
 - material_list：列出素材库条目
-- skill_list：列出蒸馏技能包
+- material_read {id}：读取某条素材的正文
+- learning_list：列出**学习仿写**功能的历史成果（三阶段分析报告：素材拆解/剧情学习/文风学习）
+- learning_read {id}：读取某份学习仿写成果的全文
+- skill_list：列出蒸馏技能包（16 维分析产物）
 - constraint_list：列出自定义创作约束（Skill）
 - model_config：查看各角色模型绑定
 

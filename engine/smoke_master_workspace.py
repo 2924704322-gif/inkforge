@@ -45,6 +45,7 @@ from smoke_test import (  # noqa: E402 - 复用真实进程 / HTTP 夹具
 
 WORKSPACE = "__workspace__"
 LLM_TIMEOUT = 240.0
+QUICK = 25.0
 
 
 def run(data_dir: Path, engine: EngineProcess, suite: Suite, args: argparse.Namespace) -> None:
@@ -119,12 +120,22 @@ def run(data_dir: Path, engine: EngineProcess, suite: Suite, args: argparse.Name
     suite.check("工作台当前书目已切换", selected.get("novel_id") == new_book,
                 json.dumps(selected, ensure_ascii=False))
 
+    # 写动作必须先"预览"（登记影响说明并拿凭证），再确认才允许执行
+    preview2 = http("POST", f"{base}/api/actions/run",
+                    {"op": "book_select", "args": {"novel_id": "demo-web"}}, timeout=QUICK)
+    pending = (preview2.body or {}).get("pending") or {}
+    suite.check("写动作预览返回影响说明与凭证",
+                preview2.status == 200 and bool(pending.get("token"))
+                and "demo-web" in str(pending.get("impact", "")),
+                json.dumps(preview2.body, ensure_ascii=False)[:180])
+
+    # 凭空"确认"（无预览登记）必须被拒 —— 防"声称确认过"就落盘
+    bare_claim = http("POST", f"{base}/api/chats/{chat_id}/action?novel={WORKSPACE}")
+    suite.check("无预览登记时确认 → 被拒（安全闸门）", bare_claim.status == 409,
+                f"status={bare_claim.status}")
+
     payload = json.loads(ws_chat_file.read_text(encoding="utf-8"))
-    payload["pending_action"] = {
-        "op": "book_select",
-        "args": {"novel_id": "demo-web"},
-        "impact": "将把工作台当前书目切换为 demo-web。",
-    }
+    payload["pending_action"] = pending
     ws_chat_file.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
                             encoding="utf-8")
     confirmed = http("POST", f"{base}/api/chats/{chat_id}/action?novel={WORKSPACE}")
@@ -135,10 +146,11 @@ def run(data_dir: Path, engine: EngineProcess, suite: Suite, args: argparse.Name
     suite.check("确认后当前书目真的切换了", now_selected.get("novel_id") == "demo-web",
                 json.dumps(now_selected, ensure_ascii=False))
 
+    # 取消路径：先预览，再取消 → 数据不动，凭证失效
+    preview3 = http("POST", f"{base}/api/actions/run",
+                    {"op": "book_delete", "args": {"novel": new_book}}, timeout=QUICK)
     payload = json.loads(ws_chat_file.read_text(encoding="utf-8"))
-    payload["pending_action"] = {
-        "op": "book_delete", "args": {"novel": new_book}, "impact": "将删除书目",
-    }
+    payload["pending_action"] = (preview3.body or {}).get("pending") or {}
     ws_chat_file.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
                             encoding="utf-8")
     cancelled = http("DELETE", f"{base}/api/chats/{chat_id}/action?novel={WORKSPACE}")
@@ -163,10 +175,14 @@ def run(data_dir: Path, engine: EngineProcess, suite: Suite, args: argparse.Name
     print("\n[7] 既有语义回归（缺省 novel = 默认书）", flush=True)
     legacy = http("POST", f"{base}/api/chats", {"agent": "master"}).body or {}
     legacy_chat = legacy.get("chat", {})
+    active_now = (http("GET", f"{base}/api/book-select", timeout=QUICK).body or {}).get(
+        "novel_id", "")
     suite.check("不带 novel 的会话仍是书内会话（scope=book）",
-                legacy_chat.get("scope") == "book"
-                and legacy_chat.get("novel") == "demo-web",
+                legacy_chat.get("scope") == "book",
                 json.dumps(legacy_chat, ensure_ascii=False)[:160])
+    suite.check("不带 novel 时跟随工作台当前书目（而非写死默认书）",
+                legacy_chat.get("novel") == (active_now or "demo-web"),
+                f"session.novel={legacy_chat.get('novel')!r} active={active_now!r}")
     bad = http("GET", f"{base}/api/chapters?novel=../evil")
     suite.check("非法 novel 仍被拒（400）", bad.status == 400, f"status={bad.status}")
 

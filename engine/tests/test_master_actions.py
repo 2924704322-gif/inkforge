@@ -274,8 +274,43 @@ def test_action_manifest_marks_scopes():
     ops = {a["op"]: a for a in act.manifest()}
     assert ops["book_list"]["scope"] == "read"
     assert ops["book_create"]["scope"] == "write"
+    # 学习仿写/素材读取必须可被墨师调用（用户实测过"找不出学习仿写历史"）
+    for op in ("learning_list", "learning_read", "material_read"):
+        assert ops[op]["scope"] == "read", op
     assert act.MAX_ACTIONS_PER_TURN >= 1
     assert WORKSPACE == "__workspace__"
+
+
+def test_learning_actions_list_and_read(act_ctx, sandbox: SimpleNamespace):
+    """学习仿写历史：能列出、能读全文（这是用户报的"墨师找不到"的回归）。"""
+    import frontmatter
+
+    d = sandbox.novels.parent / "learning"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "ln-abcdef12.md").write_text(
+        frontmatter.dumps(frontmatter.Post("## 素材拆解\n要点\n## 文风学习\n短句",
+                                           title="样本拆解")),
+        encoding="utf-8",
+    )
+    listed = act.execute("learning_list", {}, ctx=act_ctx)
+    assert listed.ok and any(i["id"] == "ln-abcdef12" for i in listed.data["items"])
+    read = act.execute("learning_read", {"id": "ln-abcdef12"}, ctx=act_ctx)
+    assert read.ok and "文风学习" in read.data["content"]
+    assert act.execute("learning_read", {"id": "bad-id"}, ctx=act_ctx).status == "failed"
+
+
+def test_material_read_and_alias(act_ctx, sandbox: SimpleNamespace):
+    """素材正文可读；模型写 list_learning / read_material 之类的别名也能命中。"""
+    import frontmatter
+
+    d = sandbox.novels.parent / "materials"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "mt-abcdef12.md").write_text(
+        frontmatter.dumps(frontmatter.Post("素材正文", title="末法剑修")), encoding="utf-8"
+    )
+    read = act.execute("read_material", {"id": "mt-abcdef12"}, ctx=act_ctx)
+    assert read.ok and read.op == "material_read" and "素材正文" in read.data["content"]
+    assert act.execute("list_materials", {}, ctx=act_ctx).op == "material_list"
 
 
 # ---------- 待确认闸门：只认显式"确认/取消" ----------
@@ -283,9 +318,11 @@ def test_action_manifest_marks_scopes():
 def test_pending_gate_confirm_executes(act_ctx, sandbox: SimpleNamespace):
     from src.web.inkforge_api import _decide_pending_action
 
-    chat = {act.PENDING_KEY: {"op": "book_create",
-                             "args": {"novel_id": "gated", "mode": "pipeline"},
-                             "impact": "将新建书目 gated"}}
+    # 预览登记：确认必须对应一次真实的预览（否则闸门拒绝执行）
+    pending = act.register_preview(act_ctx, "book_create",
+                                   {"novel_id": "gated", "mode": "pipeline"},
+                                   "将新建书目 gated")
+    chat = {act.PENDING_KEY: pending}
     # 与待办无关的话 → 不执行、不清除
     assert _decide_pending_action(chat, "这本书写得怎么样", act_ctx) is None
     assert act.PENDING_KEY in chat
@@ -298,16 +335,43 @@ def test_pending_gate_confirm_executes(act_ctx, sandbox: SimpleNamespace):
     assert (sandbox.novels / "gated" / "settings").is_dir()
 
 
-def test_pending_gate_cancel_discards(act_ctx, sandbox: SimpleNamespace):
+def test_pending_gate_confirm_without_preview_is_refused(act_ctx, sandbox: SimpleNamespace):
+    """没有预览登记就"确认" → 拒绝执行（防口头声称确认直接落盘）。"""
     from src.web.inkforge_api import _decide_pending_action
 
     chat = {act.PENDING_KEY: {"op": "book_create",
-                             "args": {"novel_id": "never", "mode": "pipeline"},
-                             "impact": "将新建书目 never"}}
+                             "args": {"novel_id": "sneaky", "mode": "pipeline"},
+                             "impact": "将新建书目 sneaky"}}
+    verdict = _decide_pending_action(chat, "确认", act_ctx)
+    assert verdict and verdict["kind"] == "refused"
+    assert "预览" in verdict["reason"]
+    assert not (sandbox.novels / "sneaky").exists()
+
+
+def test_pending_gate_preview_token_must_match(act_ctx, sandbox: SimpleNamespace):
+    """预览凭证不匹配（换了参数或旧凭证）→ 拒绝。"""
+    from src.web.inkforge_api import _decide_pending_action
+
+    pending = act.register_preview(act_ctx, "book_create",
+                                  {"novel_id": "tok1", "mode": "pipeline"}, "将新建 tok1")
+    tampered = {**pending, "args": {"novel_id": "tok2", "mode": "pipeline"}}
+    verdict = _decide_pending_action({act.PENDING_KEY: tampered}, "确认", act_ctx)
+    assert verdict and verdict["kind"] == "refused"
+    assert not (sandbox.novels / "tok2").exists()
+
+
+def test_pending_gate_cancel_discards(act_ctx, sandbox: SimpleNamespace):
+    from src.web.inkforge_api import _decide_pending_action
+
+    pending = act.register_preview(act_ctx, "book_create",
+                                   {"novel_id": "never", "mode": "pipeline"}, "将新建 never")
+    chat = {act.PENDING_KEY: pending}
     verdict = _decide_pending_action(chat, "算了", act_ctx)
     assert verdict and verdict["kind"] == "cancelled"
     assert act.PENDING_KEY not in chat
     assert not (sandbox.novels / "never").exists()
+    # 取消会同时清掉预览登记 → 再拿旧凭证确认也无效
+    assert act.consume_preview(act_ctx, pending) != ""
 
 
 def test_pending_gate_no_pending_is_none(act_ctx):
@@ -318,7 +382,7 @@ def test_pending_gate_no_pending_is_none(act_ctx):
 
 # ---------- 动作 HTTP 通道 ----------
 
-def test_actions_endpoints(app_client):
+def test_actions_endpoints(app_client, sandbox: SimpleNamespace):
     client, _ = app_client
     manifest = client.get("/api/actions").json()["actions"]
     assert any(a["op"] == "book_list" for a in manifest)
@@ -330,51 +394,78 @@ def test_actions_endpoints(app_client):
     res = client.post("/api/actions/run", json={"op": "book_list", "confirm": True})
     assert res.status_code == 400
 
-    # 写动作未确认 → 只回影响说明，不落盘
+    # 写动作未确认 → 只回影响说明与预览凭证，不落盘
     preview = client.post("/api/actions/run",
                           json={"op": "book_create",
-                                "args": {"novel_id": "via-api", "mode": "pipeline"}})
+                                "args": {"novel_id": "via-api:".replace(":", "-"),
+                                         "mode": "pipeline"}})
     assert preview.status_code == 200
-    assert preview.json()["status"] == "pending_confirm"
+    body = preview.json()
+    assert body["status"] == "pending_confirm" and body["pending"]["token"]
+    assert not (sandbox.novels / "via-api-").exists()
+
+    # 凭空"确认"（没有对应预览）→ 409，且不落盘
+    bare = client.post("/api/actions/run",
+                       json={"op": "book_create",
+                             "args": {"novel_id": "bare-claim", "mode": "pipeline"},
+                             "confirm": True})
+    assert bare.status_code == 409
+    assert not (sandbox.novels / "bare-claim").exists()
 
     done = client.post("/api/actions/run",
                        json={"op": "book_create",
-                             "args": {"novel_id": "via-api", "mode": "pipeline"},
-                             "confirm": True})
+                             "args": {"novel_id": "via-api-", "mode": "pipeline"},
+                             "confirm": True, "token": body["pending"]["token"]})
     assert done.status_code == 200 and done.json()["ok"] is True
+    assert (sandbox.novels / "via-api-" / "settings").is_dir()
 
 
 def test_chat_action_confirm_and_cancel(app_client, sandbox: SimpleNamespace):
-    from src.web.inkforge_api import _save_chat_to
-
+    """会话内确认/取消：走"预览登记 → 确认执行"两步，两步都必须对应。"""
     client, _ = app_client
     chat_id = client.post("/api/chats?novel=demo-web",
                           json={"agent": "master"}).json()["chat"]["id"]
-    book_root = sandbox.novels / "demo-web"
 
     # 无待办时确认 → 409
     assert client.post(f"/api/chats/{chat_id}/action?novel=demo-web").status_code == 409
 
-    # 人为造一个待办（等价于墨师登记了一个写动作），再从 HTTP 确认
+    # 先预览（拿到凭证），再确认 → 真正执行
+    preview = client.post("/api/actions/run?novel=demo-web",
+                          json={"op": "book_create",
+                                "args": {"novel_id": "from-chat", "mode": "pipeline"}})
+    assert preview.status_code == 200
+    pending = preview.json()["pending"]
+    assert pending["token"]
+
+    # 把预览登记同步进会话（真实链路上由墨师动作循环写入）
+    from src.web.inkforge_api import _save_chat_to
+
     chat = client.get(f"/api/chats/{chat_id}?novel=demo-web").json()
-    chat["pending_action"] = {"op": "book_create",
-                              "args": {"novel_id": "from-chat", "mode": "pipeline"},
-                              "impact": "将新建书目 from-chat"}
-    _save_chat_to(book_root, chat)
+    chat["pending_action"] = pending
+    _save_chat_to(sandbox.novels / "demo-web", chat)
 
     res = client.post(f"/api/chats/{chat_id}/action?novel=demo-web")
     assert res.status_code == 200 and res.json()["ok"] is True
     assert (sandbox.novels / "from-chat" / "settings").is_dir()
     assert client.get(f"/api/chats/{chat_id}?novel=demo-web").json().get("pending_action") is None
 
-    # 再造一个待办并从 HTTP 取消
+    # 取消路径：再造一个待办并取消 → 数据不动，且凭证失效
+    preview2 = client.post("/api/actions/run?novel=demo-web",
+                           json={"op": "book_delete", "args": {"novel": "from-chat"}})
+    pending2 = preview2.json()["pending"]
     chat = client.get(f"/api/chats/{chat_id}?novel=demo-web").json()
-    chat["pending_action"] = {"op": "book_delete", "args": {"novel": "from-chat"},
-                              "impact": "将删除"}
-    _save_chat_to(book_root, chat)
+    chat["pending_action"] = pending2
+    _save_chat_to(sandbox.novels / "demo-web", chat)
+
     cancelled = client.delete(f"/api/chats/{chat_id}/action?novel=demo-web")
     assert cancelled.status_code == 200 and cancelled.json()["cancelled"] is True
     assert (sandbox.novels / "from-chat").is_dir()   # 取消后数据仍在
+    # 用已作废的凭证确认 → 拒绝
+    stale = client.post("/api/actions/run?novel=demo-web",
+                        json={"op": "book_delete", "args": {"novel": "from-chat"},
+                              "confirm": True, "token": pending2["token"]})
+    assert stale.status_code == 409
+    assert (sandbox.novels / "from-chat").is_dir()
 
 
 def test_audit_endpoint_hides_args_digest(app_client, act_ctx):

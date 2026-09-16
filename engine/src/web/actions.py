@@ -78,6 +78,9 @@ class ActionExec:
     data: Any = None
     pending: dict | None = None
     error: str = ""
+    #: 真正生效的（规范化后的）参数。预览登记与确认比对都以此为准，
+    #: 避免"模型写 free、系统折算成 pipeline"造成两边参数不相等而拒绝确认。
+    args: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -422,6 +425,60 @@ def _h_material_list(ctx: ActionContext, args: dict) -> ActionExec:
                       f"素材库 {len(items)} 条：" +
                       ("、".join(i["title"] for i in items) or "（空）"),
                       {"materials": items})
+
+
+def _h_material_read(ctx: ActionContext, args: dict) -> ActionExec:
+    """读素材正文：list 只能给标题，用户问"某条素材讲了什么"必须能取到内容。"""
+    mid = _arg_str(args, "id")
+    if not re.match(r"^mt-[a-f0-9]{8}$", mid):
+        raise ActionError(f"非法素材 ID：{mid!r}", status=400)
+    path = library.novels_root().parent / "materials" / f"{mid}.md"
+    if not path.exists():
+        raise ActionError(f"素材不存在：{mid}", status=404)
+    post = frontmatter.load(str(path))
+    return ActionExec("material_read", True, "ok",
+                      f"素材《{post.metadata.get('title', mid)}》正文如下。",
+                      {"id": mid, "title": str(post.metadata.get("title") or mid),
+                       "content": post.content})
+
+
+def _h_learning_list(ctx: ActionContext, args: dict) -> ActionExec:
+    """列出学习仿写的历史成果（三阶段分析报告）。
+
+    实测缺口：用户问"找出学习仿写里的历史内容"，墨师手上没有这个动作，
+    只能回答"我查不到"——功能端点是有的（GET /api/learning），但没进动作清单。
+    """
+    d = library.novels_root().parent / "learning"
+    items: list[dict] = []
+    if d.exists():
+        for path in sorted(d.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                post = frontmatter.load(str(path))
+            except Exception:  # noqa: BLE001 - 单文件损坏跳过
+                continue
+            items.append({
+                "id": path.stem,
+                "title": str(post.metadata.get("title") or path.stem),
+                "created": path.stat().st_mtime,
+            })
+    summary = (f"学习仿写历史 {len(items)} 条：" +
+               "；".join(f"{i['title']}（{i['id']}）" for i in items)) if items \
+        else "学习仿写历史为空：还没有做过样本分析（可在「学习仿写」页粘贴样本生成）。"
+    return ActionExec("learning_list", True, "ok", summary, {"items": items})
+
+
+def _h_learning_read(ctx: ActionContext, args: dict) -> ActionExec:
+    lid = _arg_str(args, "id")
+    if not re.match(r"^ln-[a-f0-9]{8}$", lid):
+        raise ActionError(f"非法学习成果 ID：{lid!r}", status=400)
+    path = library.novels_root().parent / "learning" / f"{lid}.md"
+    if not path.exists():
+        raise ActionError(f"学习成果不存在：{lid}", status=404)
+    post = frontmatter.load(str(path))
+    return ActionExec("learning_read", True, "ok",
+                      f"学习仿写《{post.metadata.get('title', lid)}》全文如下。",
+                      {"id": lid, "title": str(post.metadata.get("title") or lid),
+                       "content": post.content})
 
 
 def _h_skill_list(ctx: ActionContext, args: dict) -> ActionExec:
@@ -839,6 +896,10 @@ def _bootstrap_registry() -> None:
     _register_read("search_workspace", "跨书检索书名/章节/设定名", ("keyword",),
                    _h_search_workspace)
     _register_read("material_list", "列出素材库条目", (), _h_material_list)
+    _register_read("material_read", "读取某条素材的正文", ("id",), _h_material_read)
+    _register_read("learning_list", "列出学习仿写的历史成果（三阶段分析）", (),
+                   _h_learning_list)
+    _register_read("learning_read", "读取某份学习仿写成果的全文", ("id",), _h_learning_read)
     _register_read("skill_list", "列出蒸馏技能包", (), _h_skill_list)
     _register_read("constraint_list", "列出自定义创作约束", (), _h_constraint_list)
     _register_read("model_config", "查看各角色模型绑定", (), _h_model_config)
@@ -889,6 +950,18 @@ OP_ALIASES: dict[str, str] = {
     "list_books": "book_list",
     "books_list": "book_list",
     "list_book": "book_list",
+    "list_learning": "learning_list",
+    "learning_history": "learning_list",
+    "list_study": "learning_list",
+    "asset_list": "learning_list",
+    "assets_list": "learning_list",
+    "list_assets": "learning_list",
+    "study_list": "learning_list",
+    "read_learning": "learning_read",
+    "get_learning": "learning_read",
+    "list_material": "material_list",
+    "read_material": "material_read",
+    "get_material": "material_read",
     "list_chapters": "chapter_list",
     "chapters_list": "chapter_list",
     "read_chapter": "chapter_read",
@@ -956,6 +1029,23 @@ def normalize_op(op: str) -> str:
     return value
 
 
+def normalize_args(op: str, args: dict | None) -> dict:
+    """把参数折算到规范取值，并**丢弃未声明的多余键**。
+
+    必须在**执行前、且对同一次动作只做一次**：预览时登记的 args 与确认时比对的 args
+    都取同一份规范化结果，否则"模型写了 free、系统折算成 pipeline"或"模型自造了
+    title 参数"都会让两边不相等，确认被拒（实测踩到过：用户点确认，卡还挂在那里）。
+
+    丢弃未声明键也顺带起到白名单作用：动作只会收到自己声明的参数。
+    """
+    raw = dict(args or {})
+    allowed = ACTIONS[op].args if op in ACTIONS else tuple(raw)
+    out = {k: v for k, v in raw.items() if k in allowed}
+    if op == "book_create" and "mode" in out:
+        out["mode"] = _normalize_mode(str(out.get("mode") or ""))
+    return out
+
+
 def known_ops() -> list[str]:
     return sorted(ACTIONS)
 
@@ -1010,6 +1100,7 @@ def execute(op: str, args: dict | None = None, *, ctx: ActionContext,
                                        error=f"未知动作：{op}（可用：{', '.join(known_ops())}）"),
                        args or {}, started)
     op = canonical
+    args = normalize_args(op, args)   # 枚举折算只做一次，预览/确认两边一致
     if action.is_write and not execute_write:
         execute_write = False  # 显式声明意图，写动作永远先确认
     try:
@@ -1026,6 +1117,7 @@ def execute(op: str, args: dict | None = None, *, ctx: ActionContext,
     except Exception as exc:  # noqa: BLE001 - 动作失败不能掀翻整轮对话
         logger.exception("动作 %s 执行异常", op)
         result = ActionExec(op, False, "failed", error=f"{type(exc).__name__}: {exc}")
+    result.args = args          # 带上规范化后的参数，供预览登记/确认比对使用
     return _finish(ctx, result, args or {}, started)
 
 
@@ -1059,3 +1151,66 @@ def execute_pending(ctx: ActionContext, pending: dict) -> ActionExec:
     """执行一个已确认的待办动作。"""
     return execute(pending.get("op", ""), pending.get("args") or {},
                    ctx=ctx, execute_write=True)
+
+
+# ---------- 预览登记（P3 加固）：确认必须对应一次真实预览 ----------
+# 由来：`/api/actions/run` 若接受任意 confirm=true，就等于有人"声称确认过"即可执行写动作，
+# 中间没有"系统确实给过影响说明"的证据。这里把每次预览登记下来，确认时必须命中，
+# 保证"确认"永远对应一次用户看得见的预览（对话确认与界面确认走同一套）。
+
+_PREVIEWS: dict[str, dict] = {}
+PREVIEW_TTL_SECONDS = 15 * 60
+
+
+def _preview_key(ctx: ActionContext, op: str) -> str:
+    """预览登记键：按"动作作用域"而不是"会话维度"归并。
+
+    为什么不用 ``session_key``（会话维度）：同一个写动作可能从工作区会话发起预览、
+    又在书内会话里确认（反之亦然），若按会话维度分会话就会互相找不到预览，
+    表现为"确认被拒、要重新预览"——用户看到的是"点了确认没反应"。
+    统一用 ``{目标书}::{op}``：预览说的是"对哪本书做什么"，与会话无关。
+    """
+    target = ctx.book or ctx.active_novel() or ctx.default_novel
+    return f"{target}::{op}"
+
+
+def register_preview(ctx: ActionContext, op: str, args: dict, impact: str,
+                     token: str = "") -> dict:
+    """登记一次写动作预览，返回可直接回给前端的 pending 结构。"""
+    tk = token or hashlib.sha1(
+        f"{_preview_key(ctx, op)}::{json.dumps(args, sort_keys=True, default=str)}"
+        f"::{time.time()}".encode("utf-8")
+    ).hexdigest()[:16]
+    _PREVIEWS[_preview_key(ctx, op)] = {
+        "token": tk, "args": args, "impact": impact, "at": time.time(),
+    }
+    return {"op": op, "args": args, "impact": impact, "token": tk}
+
+
+def consume_preview(ctx: ActionContext, pending: dict) -> str:
+    """校验并消费一次预览；返回空串表示通过，否则返回拒绝原因。"""
+    key = _preview_key(ctx, pending.get("op", ""))
+    record = _PREVIEWS.get(key)
+    if record is None:
+        logger.info("预览消费失败：没有登记（key=%s）", key)
+        return "该写动作没有经过预览登记：请先发起一次预览，确认后才会执行"
+    if time.time() - float(record.get("at", 0)) > PREVIEW_TTL_SECONDS:
+        _PREVIEWS.pop(key, None)
+        logger.info("预览消费失败：已过期（key=%s）", key)
+        return "预览已过期（超过 15 分钟），请重新发起一次"
+    token = str(pending.get("token") or "")
+    if token and token != record["token"]:
+        logger.info("预览消费失败：凭证不匹配（key=%s）", key)
+        return "预览凭证不匹配：请重新发起一次预览并在同一张卡上确认"
+    if (record.get("args") or {}) != (pending.get("args") or {}):
+        logger.info("预览消费失败：参数不一致（key=%s）登记=%s 待办=%s", key,
+                    json.dumps(record.get("args") or {}, ensure_ascii=False),
+                    json.dumps(pending.get("args") or {}, ensure_ascii=False))
+        return "待执行参数与预览参数不一致：请重新预览后再确认"
+    _PREVIEWS.pop(key, None)
+    return ""
+
+
+def forget_preview(ctx: ActionContext, op: str) -> None:
+    """取消预览登记（用户点"取消"时调用）。"""
+    _PREVIEWS.pop(_preview_key(ctx, op), None)

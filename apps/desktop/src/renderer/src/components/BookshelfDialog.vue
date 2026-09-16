@@ -3,7 +3,7 @@ import { NInput, NInputNumber, NModal, NSelect, useDialog, useMessage } from 'na
 import { ref, watch } from 'vue'
 
 import { api, withNovel } from '../api'
-import { appStore, openBook } from '../store'
+import { appStore, openBook, openWorkspace } from '../store'
 import { BRIEF_FIELD_DEFS, emptyBriefFields, hasBriefFields } from '../types'
 import type { Book, BriefFields, CustomSkill } from '../types'
 import DemoWizardModal from './DemoWizardModal.vue'
@@ -160,7 +160,8 @@ function removeBook(book: Book): void {
       try {
         await api('DELETE', `/api/books/${encodeURIComponent(book.novel_id)}`)
         message.success('已删除')
-        if (book.novel_id === appStore.bookId) appStore.bookId = ''
+        // 删掉的就是当前书 → 回到工作区（清空标题/选中/待办，并刷新资源树）
+        if (book.novel_id === appStore.bookId) openWorkspace()
         void refresh()
       } catch (err) {
         message.error(err instanceof Error ? err.message : String(err))

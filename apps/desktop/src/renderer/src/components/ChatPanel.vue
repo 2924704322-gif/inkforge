@@ -321,23 +321,32 @@ async function send(text?: string): Promise<void> {
   }
 }
 
-/** 动作执行后同步"当前书目"：墨师建书/切书后，前端与右侧资源树要跟上。 */
+/**
+ * 动作执行后同步"当前书目"：墨师建书/切书后，前端与右侧资源树要跟上。
+ *
+ * 每一轮对话结束后都会调用（不只动作轮）——墨师完全可能在纯文本回合里已经改过
+ * 当前书目，漏掉这一点就会出现"墨师说已切到 B 书，界面还停在 A 书"。
+ */
 async function syncBookAfterActions(): Promise<void> {
   try {
     const res = await api<{ novel_id: string }>('GET', '/api/book-select')
     const nid = res.novel_id || ''
-    if (nid !== appStore.bookId) {
-      if (nid) {
-        const books = await api<{ books: Book[] }>('GET', '/api/books')
-        const found = books.books.find((b) => b.novel_id === nid)
-        appStore.bookId = nid
-        appStore.bookTitle = found?.title || nid
-      } else {
-        openWorkspace()
-      }
-      appStore.treeVersion += 1
-      void detectBookKind()
+    if (nid === appStore.bookId) return
+    if (nid) {
+      const books = await api<{ books: Book[] }>('GET', '/api/books')
+      const found = books.books.find((b) => b.novel_id === nid)
+      appStore.bookId = nid
+      appStore.bookTitle = found?.title || nid
+    } else {
+      openWorkspace()
+      return
     }
+    // 换书即重置：右侧选中、待确认动作、资源树全部跟着走
+    appStore.selection = null
+    pendingAction.value = null
+    lastActions.value = []
+    appStore.treeVersion += 1
+    void detectBookKind()
   } catch {
     /* 静默：仅影响书目标记的即时性 */
   }
@@ -476,12 +485,13 @@ function onReviewDecided(): void {
   appStore.treeVersion += 1
 }
 
-/** 动作确认/取消后：清掉待确认态、刷新书目与资源树（可能刚建书/切书）。 */
+/** 动作确认/取消后：真正重取会话（拿到新落盘的回执），并刷新书目与资源树。 */
 function onActionDecided(): void {
   pendingAction.value = null
   appStore.treeVersion += 1
   void syncBookAfterActions()
-  void loadChats()
+  if (appStore.chatId) void openChat(appStore.chatId)
+  else void loadChats()
 }
 
 function enterInteractive(): void {
@@ -711,17 +721,6 @@ onUnmounted(() => {
           <div class="msg-body pre-wrap">{{ m.content }}</div>
         </div>
 
-        <!-- 墨师动作卡：本轮动作回执 + 待确认写动作的确认闸门 -->
-        <ActionCard
-          v-if="lastActions.length || pendingAction"
-          :novel-id="appStore.bookId"
-          :chat-id="appStore.chatId"
-          :actions="lastActions"
-          :pending="pendingAction"
-          :scope="inWorkspace() ? 'workspace' : 'book'"
-          @decided="onActionDecided"
-        />
-
         <!-- 改稿提案卡（DeepWrite 的 proposal 语义：pending→accepting→accepted/rejected/conflict） -->
         <ProposalCard
           v-for="p in proposalsByAnchor[i] ?? []"
@@ -732,6 +731,21 @@ onUnmounted(() => {
           @decided="onProposalDecided"
         />
       </template>
+
+      <!--
+        墨师动作卡：**固定在对话流末尾**（不属于任何一条历史消息）。
+        原因：它承载"待确认"这个实时状态——确认之后这张卡要立刻变成"已执行"，
+        若挂在某条消息上就会跟着那条旧消息一起定格，看起来像"按钮没变化"。
+      -->
+      <ActionCard
+        v-if="lastActions.length || pendingAction"
+        :novel-id="appStore.bookId"
+        :chat-id="appStore.chatId"
+        :actions="lastActions"
+        :pending="pendingAction"
+        :scope="inWorkspace() ? 'workspace' : 'book'"
+        @decided="onActionDecided"
+      />
 
       <!-- 流水线人审关卡（审阅卡进入对话流） -->
       <ReviewCard
