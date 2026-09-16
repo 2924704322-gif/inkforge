@@ -57,3 +57,7 @@ docs/step*.png
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 提交信息临时文件
+COMMIT_MSG_TMP.txt
+.git/COMMIT_MSG_TMP
