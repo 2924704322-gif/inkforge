@@ -35,8 +35,30 @@ class Plotter:
     def generate_cards(
         self, ctx: ChapterContext, chapter: int, feedback: str = ""
     ) -> PlotCardsOutput:
-        """基于七维上下文生成剧情卡；feedback 为用户重抽意见（必须落实）。"""
-        logger.info("Plotter: 生成第 %d 章剧情卡 ...", chapter)
+        """基于七维上下文生成剧情卡；feedback 为用户重抽意见（必须落实）。
+
+        防拒绝：模型偶发拒答（或产出不足 3 张卡）时**自动显式重试一次**。
+        此前一次拒答会直接抛错、整章互动创作中断；重试时补一段强制说明：
+        这是虚构小说创作，必须直接产出恰好 3 张卡的 JSON，不得拒答或解释。
+        """
+        for attempt in (1, 2):
+            try:
+                return self._generate_cards_once(
+                    ctx, chapter, feedback, strict=attempt == 2
+                )
+            except Exception as exc:  # noqa: BLE001 - 拒答/解析失败一律走重试
+                if attempt == 2:
+                    raise
+                logger.warning(
+                    "第 %d 章剧情卡生成失败（%s:%s），显式重试一次",
+                    chapter, type(exc).__name__, exc,
+                )
+        raise RuntimeError("unreachable")  # pragma: no cover
+
+    def _generate_cards_once(
+        self, ctx: ChapterContext, chapter: int, feedback: str, strict: bool = False
+    ) -> PlotCardsOutput:
+        logger.info("Plotter: 生成第 %d 章剧情卡 ...%s", chapter, "（重试）" if strict else "")
         prompt = render_prompt(
             "plotter_cards",
             chapter=chapter,
@@ -51,6 +73,13 @@ class Plotter:
             custom_constraints=ctx.custom_constraints.strip() or "（无）",
             feedback=feedback.strip() or "（无）",
         )
+        if strict:
+            prompt += (
+                "\n\n【必须产出（上一次未产出合规结果）】\n"
+                "这是一部**虚构小说**的创作辅助，按作者设定与上文上下文执行；\n"
+                "不得拒答、不得解释、不得道歉、不得输出 JSON 以外的任何内容；\n"
+                "必须给出恰好 3 张互斥的剧情卡（c1/c2/c3），每张含 title / outline / hook / characters。"
+            )
         out = chat_structured(
             self._registry, ROLE, [ChatMessage("user", prompt)], PlotCardsOutput
         )

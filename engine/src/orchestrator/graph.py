@@ -29,7 +29,11 @@ from src.agents.writer import (
 from src.config.app_config import GenerationConfig
 from src.llm.registry import ModelRegistry
 from src.memory.md_store import MdStore
-from src.memory.memory_manager import ChapterContext, MemoryManager
+from src.memory.memory_manager import (
+    ChapterContext,
+    MemoryManager,
+    read_custom_constraints,
+)
 from src.orchestrator.finalize import finalize_chapter
 from src.orchestrator.scheduler import generation_config
 from src.orchestrator.state import NovelState, plan_for_chapter
@@ -103,7 +107,11 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
         brief = state["brief"]
         if feedback:
             brief = f"{brief}\n\n【人工审阅打回意见，必须落实】\n{feedback}"
-        outline = pipe.architect.generate_settings(brief, state["total_chapters"])
+        # 项目级约束（settings/custom-skills.md）与 brief 同处送达设定/大纲渲染（W5）
+        outline = pipe.architect.generate_settings(
+            brief, state["total_chapters"],
+            custom_constraints=read_custom_constraints(pipe.store),
+        )
         # 设定落盘后全量建立索引
         pipe.memory.rebuild_index()
         return {"outline": outline.model_dump(), "outline_feedback": ""}
@@ -117,7 +125,8 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
         )
         if decision.get("action") == "approve":
             logger.info("大纲人审通过，进入章节循环")
-            maybe_generate_style(pipe, state.get("brief", ""), state["outline"])
+            maybe_generate_style(pipe, state.get("brief", ""), state["outline"],
+                                 read_custom_constraints(pipe.store))
             if pipe.bus is not None:
                 pipe.bus.publish(EVENT_OUTLINE_APPROVED, {
                     "novel_id": state.get("novel_id", ""),
@@ -338,7 +347,30 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
             return {"done": True}
         return {"current_chapter": chapter + 1, "done": False}
 
+    def chapter_gate_node(state: NovelState) -> dict:
+        """逐章确认关卡：上一章定稿后**停下来**，由用户在对话框发指令才写下一章。
+
+        与 human_review 用同一套 interrupt/resume 机制（前端通过 /api/decision
+        或对话框里的「继续」指令放行）。这是刻意的产品行为：一章一章来，
+        不让流水线自己往下跑。
+        """
+        decision = interrupt(
+            {
+                "type": "chapter_gate",
+                "approved_chapter": state["current_chapter"] - 1,
+                "next_chapter": state["current_chapter"],
+            }
+        )
+        if decision.get("action") == "approve":
+            logger.info("用户指示继续：开始生成第 %d 章", state["current_chapter"])
+            return {}
+        logger.info("用户选择暂不继续：第 %d 章待写", state["current_chapter"])
+        return {"done": True}
+
     def route_after_writeback(state: NovelState) -> str:
+        return END if state.get("done") else "chapter_gate"
+
+    def route_after_gate(state: NovelState) -> str:
         return END if state.get("done") else "assemble_context"
 
     def route_after_outline(state: NovelState) -> str:
@@ -354,6 +386,7 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
     graph.add_node("editor", editor_node)
     graph.add_node("human_review", human_review_node)
     graph.add_node("writeback", writeback_node)
+    graph.add_node("chapter_gate", chapter_gate_node)
 
     graph.add_edge(START, "architect")
     graph.add_edge("architect", "outline_review")
@@ -367,7 +400,10 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
         "human_review", route_after_human, ["writer", "writeback"]
     )
     graph.add_conditional_edges(
-        "writeback", route_after_writeback, ["assemble_context", END]
+        "writeback", route_after_writeback, ["chapter_gate", END]
+    )
+    graph.add_conditional_edges(
+        "chapter_gate", route_after_gate, ["assemble_context", END]
     )
 
     checkpoint_db.parent.mkdir(parents=True, exist_ok=True)

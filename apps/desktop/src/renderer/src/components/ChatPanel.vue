@@ -1,12 +1,19 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onErrorCaptured, onMounted, onUnmounted, ref, watch } from 'vue'
 
 import { api, withNovel } from '../api'
 import { useMessage } from 'naive-ui'
-import { appStore } from '../store'
-import { type ChatData, type ChatSummary, type StatusSnapshot } from '../types'
+import { appStore, inWorkspace, openWorkspace, scopeParam } from '../store'
+import {
+  type ActionReceipt,
+  type ChatData,
+  type ChatSummary,
+  type PendingAction,
+  type StatusSnapshot,
+} from '../types'
+import ActionCard from './ActionCard.vue'
 import InteractiveCards from './InteractiveCards.vue'
-import ProposalCard, { type Proposal } from './ProposalCard.vue'
+import ProposalCard, { type Proposal, type ProposalReview } from './ProposalCard.vue'
 import ReviewCard from './ReviewCard.vue'
 import type { Book, InteractiveState } from '../types'
 
@@ -17,10 +24,14 @@ const sending = ref(false)
 const loadingChat = ref(false)
 const snapshot = ref<StatusSnapshot | null>(null)
 const showHistory = ref(false)
+/** 墨师动作回执（本轮）与待确认写动作（P2/P3）。 */
+const lastActions = ref<ActionReceipt[]>([])
+const pendingAction = ref<PendingAction | null>(null)
 
-/** DeepWrite 语义：改稿模式（发送即产出提案卡）与审批模式（替我审批）。 */
+/** 改稿模式（发送即产出提案卡）。
+ *  没有「替我审批 / 自动接受」：生成或修改的内容一律先经人工审批，
+ *  通过后才写入创作空间中的资料。 */
 const proposeMode = ref(false)
-const approvalMode = ref<'request-approval' | 'auto-approve'>('request-approval')
 const proposals = ref<Proposal[]>([])
 const interactive = ref<InteractiveState | null>(null)
 /** 互动创作模式开关：仅正文逐章创作使用；服务端断点始终保留。 */
@@ -29,6 +40,86 @@ const interactiveMode = ref(false)
 const resumeHint = ref(false)
 
 const showInteractive = computed(() => interactiveMode.value && interactive.value !== null)
+
+/** 四维均分（与审阅卡同一口径：一致性 / 大纲符合度 / 衔接连贯性 / 文笔质量）。 */
+function avgScore(r: ProposalReview): string {
+  const v = (r.consistency + r.plot + r.continuity + r.prose) / 4
+  return (Math.round(v * 100) / 100).toFixed(2)
+}
+
+const INTERACTIVE_LABEL: Record<string, string> = {
+  generating_cards: '正在设计剧情卡',
+  awaiting_choice: '等待选卡',
+  writing: '正在写章',
+  awaiting_review: '等待人审',
+  committing: '定稿入库中',
+  error: '互动创作异常',
+}
+
+/**
+ * 顶部工作状态：**综合所有「智能体在工作」的来源**，而不是只看流水线会话。
+ *
+ * 之前只看 `/api/status` 的 started/done/pending —— 那三个字段是流水线会话的状态，
+ * 于是对话改稿、互动创作期间顶部一直显示"空闲"，看起来像状态坏了。
+ */
+const workStatus = computed<{ kind: 'idle' | 'busy' | 'warn' | 'ok' | 'err'; text: string }>(() => {
+  if (sending.value) return { kind: 'busy', text: '智能体思考中' }
+  const iv = interactive.value
+  if (iv && !['idle', 'done'].includes(iv.status)) {
+    return { kind: 'busy', text: `互动创作 · ${INTERACTIVE_LABEL[iv.status] ?? iv.status}` }
+  }
+  const p = snapshot.value?.pending
+  if (p) {
+    if (p.type === 'chapter_gate') {
+      const g = p as unknown as { next_chapter: number }
+      return { kind: 'warn', text: `待你指令 · 第 ${g.next_chapter} 章` }
+    }
+    return {
+      kind: 'warn',
+      text: p.type === 'chapter_review' ? `待审 · 第 ${p.chapter} 章` : '待审 · 大纲',
+    }
+  }
+  if (snapshot.value?.started && !snapshot.value?.done) return { kind: 'busy', text: '流水线生成中' }
+  if (proposals.value.length) return { kind: 'warn', text: `待审提案 ${proposals.value.length} 张` }
+  if (snapshot.value?.error) return { kind: 'err', text: '流水线异常' }
+  if (snapshot.value?.done) return { kind: 'ok', text: '已完本' }
+  return { kind: 'idle', text: '空闲' }
+})
+
+/**
+ * 提案卡按创建时间插回对话流的原位。
+ *
+ * 旧写法是把所有提案统一渲染在**全部消息之后**，于是每一张待审提案都会
+ * 「一直挂在最下面」：后续消息都排在它上面，而每次发送后的 scrollBottom()
+ * 又把视野拽到流底，正好停在提案卡上——提案卡因此成了挡在眼前的一块。
+ *
+ * 引擎给提案写了 `created`（time.time()），消息有 `ts`（同一时钟域），
+ * 所以按时间去插回原位在重启后依然成立。
+ * 返回 { -1: 早于全部可见消息的提案, i: 应排在 messages[i] 之后的提案 }。
+ */
+const proposalsByAnchor = computed(() => {
+  const buckets: Record<number, Proposal[]> = {}
+  const hasTs = messages.value.some((m) => (m.ts ?? 0) > 0)
+  for (const p of proposals.value) {
+    const created = p.created ?? 0
+    // 默认挂在最后一条消息之后（＝追加到末尾，旧行为）；能定位就插回原位
+    let anchor = messages.value.length - 1
+    if (hasTs && created > 0) {
+      anchor = -1
+      for (let i = messages.value.length - 1; i >= 0; i -= 1) {
+        const ts = messages.value[i]?.ts ?? 0
+        if (ts > 0 && ts <= created) {
+          anchor = i
+          break
+        }
+      }
+    }
+    const list = buckets[anchor]
+    if (list) list.push(p)
+    else buckets[anchor] = [p]
+  }
+  return buckets
+})
 
 const streamRef = ref<HTMLElement | null>(null)
 const historyWrap = ref<HTMLElement | null>(null)
@@ -68,16 +159,18 @@ const proposeTargetLabel = computed(() => {
 })
 
 async function loadChats(): Promise<void> {
-  if (!appStore.bookId) return
+  // 工作区也允许对话（墨师全域）：无书时用哨兵值取工作区会话列表。
   try {
     const res = await api<{ chats: ChatSummary[] }>(
       'GET',
-      withNovel('/api/chats', appStore.bookId),
+      withNovel('/api/chats', scopeParam()),
     )
-    chats.value = res.chats
+    const wantScope = inWorkspace() ? 'workspace' : 'book'
+    const filtered = res.chats.filter((c) => (c.scope ?? 'book') === wantScope)
+    chats.value = filtered
     // 自动恢复最近会话（仅当前没有任何会话时；不打断进行中的对话）
-    if (!appStore.chatId && chats.value.length > 0) {
-      await openChat(chats.value[0]!.id)
+    if (!appStore.chatId && filtered.length > 0) {
+      await openChat(filtered[0]!.id)
     }
   } catch {
     /* 静默 */
@@ -86,11 +179,13 @@ async function loadChats(): Promise<void> {
 
 async function removeChat(id: string): Promise<void> {
   try {
-    await api('DELETE', withNovel(`/api/chats/${id}`, appStore.bookId))
+    await api('DELETE', withNovel(`/api/chats/${id}`, scopeParam()))
     if (appStore.chatId === id) {
       appStore.chatId = ''
       messages.value = []
       proposals.value = []
+      lastActions.value = []
+      pendingAction.value = null
     }
     chats.value = chats.value.filter((c) => c.id !== id)
     message.success('历史对话已删除')
@@ -109,7 +204,8 @@ function fmtRelative(ts: number): string {
 }
 
 async function loadProposals(): Promise<void> {
-  if (!appStore.bookId || !appStore.chatId) return
+  // 改稿提案仍绑定"当前书的文档"：工作区没有目标文档，直接跳过（后端也会拒绝）
+  if (inWorkspace() || !appStore.chatId) return
   try {
     const res = await api<{ proposals: Proposal[] }>(
       'GET',
@@ -122,17 +218,22 @@ async function loadProposals(): Promise<void> {
 }
 
 async function openChat(id: string): Promise<void> {
-  if (!appStore.bookId || !id) return
+  if (!id) return
   loadingChat.value = true
   try {
-    const chat = await api<ChatData>('GET', withNovel(`/api/chats/${id}`, appStore.bookId))
+    const chat = await api<ChatData>('GET', withNovel(`/api/chats/${id}`, scopeParam()))
     messages.value = chat.messages
     appStore.chatId = chat.id
+    // 待确认动作与动作回执随会话恢复（刷新/重启后不丢闸门）
+    pendingAction.value = chat.pending ?? null
+    lastActions.value = (chat.messages[chat.messages.length - 1]?.actions ?? []) as ActionReceipt[]
     await loadProposals()
   } catch {
     appStore.chatId = ''
     messages.value = []
     proposals.value = []
+    lastActions.value = []
+    pendingAction.value = null
   } finally {
     loadingChat.value = false
     showHistory.value = false
@@ -141,14 +242,15 @@ async function openChat(id: string): Promise<void> {
 }
 
 async function newChat(): Promise<void> {
-  if (!appStore.bookId) return
   try {
-    const res = await api<{ chat: ChatData }>('POST', withNovel('/api/chats', appStore.bookId), {
+    const res = await api<{ chat: ChatData }>('POST', withNovel('/api/chats', scopeParam()), {
       agent: 'master',
     })
     appStore.chatId = res.chat.id
     messages.value = []
     proposals.value = []
+    lastActions.value = []
+    pendingAction.value = null
     void loadChats()
   } catch (err) {
     message.error(`新建会话失败：${err instanceof Error ? err.message : String(err)}`)
@@ -166,8 +268,9 @@ async function send(text?: string): Promise<void> {
   const content = (text ?? input.value).trim()
   if (sending.value) return
   if (!content) return
-  if (!appStore.bookId) {
-    message.warning('请先在左侧选择一部作品')
+  // 无书时不再拦人：工作区模式照样能把事交给墨师（建书/取资料/开写都在它的动作里）
+  if (proposeMode.value && inWorkspace()) {
+    message.warning('改稿模式需要先打开一部作品，并在右侧选中一篇文档')
     return
   }
   if (proposeMode.value && !proposeTarget.value) {
@@ -187,19 +290,24 @@ async function send(text?: string): Promise<void> {
   sending.value = true
   void scrollBottom()
   try {
-    const res = await api<{ reply: string }>(
-      'POST',
-      withNovel(`/api/chats/${appStore.chatId}/send`, appStore.bookId),
-      {
-        message: content,
-        target: appStore.selection
+    const res = await api<{
+      reply: string
+      actions?: ActionReceipt[]
+      pending?: PendingAction | null
+    }>('POST', withNovel(`/api/chats/${appStore.chatId}/send`, scopeParam()), {
+      message: content,
+      target:
+        !inWorkspace() && appStore.selection
           ? appStore.selection.kind === 'chapter'
             ? { kind: 'chapter', key: `ch-${appStore.selection.chapter}` }
             : { kind: 'settings', key: appStore.selection.rel }
           : undefined,
-      },
-    )
+    })
     messages.value.push({ role: 'assistant', content: res.reply, ts: Date.now() / 1000 })
+    lastActions.value = res.actions ?? []
+    pendingAction.value = res.pending ?? null
+    // 墨师可能刚建了书/切了书：同步前端书目与资源树
+    void syncBookAfterActions()
     void loadChats()
   } catch (err) {
     messages.value.push({
@@ -210,6 +318,28 @@ async function send(text?: string): Promise<void> {
   } finally {
     sending.value = false
     void scrollBottom()
+  }
+}
+
+/** 动作执行后同步"当前书目"：墨师建书/切书后，前端与右侧资源树要跟上。 */
+async function syncBookAfterActions(): Promise<void> {
+  try {
+    const res = await api<{ novel_id: string }>('GET', '/api/book-select')
+    const nid = res.novel_id || ''
+    if (nid !== appStore.bookId) {
+      if (nid) {
+        const books = await api<{ books: Book[] }>('GET', '/api/books')
+        const found = books.books.find((b) => b.novel_id === nid)
+        appStore.bookId = nid
+        appStore.bookTitle = found?.title || nid
+      } else {
+        openWorkspace()
+      }
+      appStore.treeVersion += 1
+      void detectBookKind()
+    }
+  } catch {
+    /* 静默：仅影响书目标记的即时性 */
   }
 }
 
@@ -237,25 +367,10 @@ async function sendPropose(instruction: string): Promise<void> {
     proposals.value.unshift(proposal)
     messages.value.push({
       role: 'assistant',
-      content: `已根据指令生成改稿提案（+${proposal.additions} / −${proposal.deletions}），请在下方卡片审阅。`,
+      content: `已根据指令生成改稿提案（+${proposal.additions} / −${proposal.deletions}）${proposal.review ? `，审校主编评分 ${avgScore(proposal.review)}` : ''}，请在下方卡片审阅：通过后才会写入创作空间，打回可写意见让它重做一版。`,
       ts: Date.now() / 1000,
     })
-    if (approvalMode.value === 'auto-approve') {
-      const target = proposals.value[0]!
-      target.status = 'accepting'
-      try {
-        const res = await api<Proposal>(
-          'POST',
-          withNovel(`/api/chats/${appStore.chatId}/proposals/${target.id}/decide`, appStore.bookId),
-          { decision: 'accept' },
-        )
-        Object.assign(target, { status: res.status, statusMessage: res.statusMessage })
-        appStore.treeVersion += 1
-      } catch (err) {
-        target.status = 'error'
-        target.statusMessage = err instanceof Error ? err.message : String(err)
-      }
-    }
+    // 人工审批门禁：不自动应用，等用户在卡片上点「通过 / 打回」。
     void loadChats()
   } catch (err) {
     messages.value.push({
@@ -270,7 +385,7 @@ async function sendPropose(instruction: string): Promise<void> {
 }
 
 async function pollStatus(): Promise<void> {
-  if (!appStore.bookId) return
+  if (inWorkspace()) return    // 工作区没有流水线会话可轮询
   try {
     snapshot.value = await api<StatusSnapshot>(
       'GET',
@@ -282,7 +397,7 @@ async function pollStatus(): Promise<void> {
 }
 
 async function pollInteractive(): Promise<void> {
-  if (!appStore.bookId) return
+  if (inWorkspace()) return    // 互动创作是"书内"状态机
   try {
     const st = await api<InteractiveState>(
       'GET',
@@ -296,16 +411,19 @@ async function pollInteractive(): Promise<void> {
 }
 
 async function detectBookKind(): Promise<void> {
-  if (!appStore.bookId) {
+  if (inWorkspace()) {
     interactive.value = null
     resumeHint.value = false
+    interactiveMode.value = false
+    snapshot.value = null
     return
   }
   try {
     const res = await api<{ books: Book[] }>('GET', '/api/books')
     const book = res.books.find((b) => b.novel_id === appStore.bookId)
     if (book?.interactive) {
-      // 互动模式书：探测一次断点状态（不自动打开界面，由用户在模式切换器恢复）
+      // 互动模式书：直接进入互动界面（本书只有这一条推进路径）
+      interactiveMode.value = true
       void pollInteractive()
     }
   } catch {
@@ -319,14 +437,51 @@ async function scrollBottom(): Promise<void> {
   if (el) el.scrollTop = el.scrollHeight
 }
 
+/** 待审卡片的身份键（换章/换稿即变化）。 */
+const reviewKey = computed(() => {
+  const p = snapshot.value?.pending
+  if (!p) return ''
+  return p.type === 'chapter_review' ? `ch-${p.chapter}-${p.attempt}` : 'outline'
+})
+
+/**
+ * 待审出现时把审阅卡**顶部**滚进视野。
+ *
+ * 审阅卡一屏放不下（评分 + 审阅意见 + 正文预览 + 决策区），而对话流默认停在
+ * 最底部——于是「评分系统」和「改稿意见」这两块长在卡片顶部的内容会被滚出视野，
+ * 看起来像"没有显示"。这里改为主动对齐卡片顶部。
+ */
+async function scrollToReviewTop(): Promise<void> {
+  await nextTick()
+  const stream = streamRef.value
+  const card = stream?.querySelector<HTMLElement>('.review-card')
+  if (!stream || !card) return
+  const delta = card.getBoundingClientRect().top - stream.getBoundingClientRect().top
+  stream.scrollTop = Math.max(0, stream.scrollTop + delta - 8)
+}
+
+watch(reviewKey, (key) => {
+  if (key) void scrollToReviewTop()
+})
+
 function onProposalDecided(): void {
   void pollStatus()
+  // 打回会立刻按意见重做一版提案，重新拉一次列表才能看到新卡
+  void loadProposals()
   appStore.treeVersion += 1
 }
 
 function onReviewDecided(): void {
   void pollStatus()
   appStore.treeVersion += 1
+}
+
+/** 动作确认/取消后：清掉待确认态、刷新书目与资源树（可能刚建书/切书）。 */
+function onActionDecided(): void {
+  pendingAction.value = null
+  appStore.treeVersion += 1
+  void syncBookAfterActions()
+  void loadChats()
 }
 
 function enterInteractive(): void {
@@ -356,6 +511,47 @@ function onDocClick(e: MouseEvent): void {
 
 let timer: ReturnType<typeof setInterval> | null = null
 
+/**
+ * 渲染错误隔离。
+ *
+ * 真实反馈过「互动出卡后整页点不动」：Vue 里只要有一个子组件渲染抛错，
+ * 后续更新就会停住，表现正是"界面还在、点什么都没反应"。
+ * 这里兜住子组件（审阅卡 / 提案卡 / 互动卡）的渲染异常：
+ * 出错只在本区域显示提示，其余界面照常可点，并给一个恢复入口。
+ */
+const renderError = ref('')
+onErrorCaptured((err) => {
+  renderError.value = err instanceof Error ? err.message : String(err)
+  console.error('[ChatPanel] 子组件渲染出错（已隔离，未影响其它区域）', err)
+  return false
+})
+
+function recoverRender(): void {
+  renderError.value = ''
+  // 触发一次重渲染：把可能已被污染的卡片状态刷新掉
+  void pollStatus()
+  appStore.treeVersion += 1
+}
+
+/** 暂停生成：当前章写完后停在逐章确认关卡；已停在关卡则立即结束本轮。 */
+async function pauseRun(): Promise<void> {
+  if (inWorkspace()) return
+  try {
+    const res = await api<{ paused: boolean; immediate: boolean }>(
+      'POST',
+      withNovel('/api/pause', appStore.bookId),
+    )
+    message.success(
+      res.immediate
+        ? '已暂停：本轮到此为止，随时在对话框发指令即可继续'
+        : '已标记暂停：当前这一章写完后停下，不会自动往下写',
+    )
+    void pollStatus()
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : String(err))
+  }
+}
+
 watch(
   () => appStore.bookId,
   () => {
@@ -366,6 +562,8 @@ watch(
     interactive.value = null
     interactiveMode.value = false
     resumeHint.value = false
+    lastActions.value = []
+    pendingAction.value = null
     void loadChats()
     void pollStatus()
     void detectBookKind()
@@ -391,15 +589,26 @@ onUnmounted(() => {
 
 <template>
   <section class="chat-panel">
+    <!-- 渲染错误隔离条：出错只显示这一条，界面其余部分照样能点 -->
+    <div v-if="renderError" class="render-error">
+      <span>⚠ 有卡片渲染出错，已隔离（其它功能不受影响）：{{ renderError }}</span>
+      <button class="ghost-btn" @click="recoverRender">重试</button>
+    </div>
     <div class="chat-head">
       <div class="agent-block">
         <span class="agent-name">{{ agentLabel }}</span>
+        <span v-if="inWorkspace()" class="chip workspace" title="未打开作品：墨师在全域工作台上工作，可建书/取资料/开写">
+          🧭 工作区
+        </span>
         <span v-if="appStore.bookTitle" class="muted ctx-label">
           主上下文：{{ proposeTargetLabel === '未选择' ? appStore.bookTitle : proposeTargetLabel }}
         </span>
-        <span v-if="snapshot?.pending" class="chip warn">待审</span>
-        <span v-else-if="snapshot?.started && !snapshot?.done" class="chip busy">生成中</span>
-        <span v-else-if="snapshot?.done" class="chip ok">已完本</span>
+        <!-- 工作状态常驻：综合对话 / 互动创作 / 流水线 / 待审提案，
+             不再出现「智能体明明在干活却显示空闲」。 -->
+        <span class="chip" :class="workStatus.kind">{{ workStatus.text }}</span>
+        <span v-if="snapshot?.metrics" class="chip idle" title="已定稿 / 计划总章">
+          已定稿 {{ snapshot.metrics.approved }}/{{ snapshot.metrics.total_chapters }}
+        </span>
       </div>
       <div class="head-actions">
         <div class="mode-switch">
@@ -422,6 +631,14 @@ onUnmounted(() => {
           </button>
         </div>
         <div ref="historyWrap" class="history-wrap">
+          <button
+            v-if="snapshot?.started && !snapshot?.done"
+            class="ghost-btn pause-btn"
+            title="暂停生成：当前章写完后停在逐章确认关卡，不会自动往下写"
+            @click="pauseRun"
+          >
+            ⏸ 暂停生成
+          </button>
           <button class="ghost-btn" @click="showHistory = !showHistory">🕘 历史对话</button>
           <div v-if="showHistory" class="history-pop" @click.stop>
             <div class="history-pop-head muted">点击继续对话 · ✕ 删除</div>
@@ -459,6 +676,16 @@ onUnmounted(() => {
         </div>
       </div>
 
+      <!-- 早于全部可见消息的提案卡（插回对话流原位，而不是永远堆在底部） -->
+      <ProposalCard
+        v-for="p in proposalsByAnchor[-1] ?? []"
+        :key="p.id"
+        :novel-id="appStore.bookId"
+        :chat-id="appStore.chatId"
+        :proposal="p"
+        @decided="onProposalDecided"
+      />
+
       <template v-for="(m, i) in messages" :key="i">
         <div class="msg" :class="m.role">
           <div class="msg-meta">
@@ -483,18 +710,28 @@ onUnmounted(() => {
           </div>
           <div class="msg-body pre-wrap">{{ m.content }}</div>
         </div>
-      </template>
 
-      <!-- 改稿提案卡（DeepWrite 的 proposal 语义：pending→accepting→accepted/rejected/conflict） -->
-      <ProposalCard
-        v-for="p in proposals"
-        :key="p.id"
-        :novel-id="appStore.bookId"
-        :chat-id="appStore.chatId"
-        :proposal="p"
-        :auto-approve="approvalMode === 'auto-approve'"
-        @decided="onProposalDecided"
-      />
+        <!-- 墨师动作卡：本轮动作回执 + 待确认写动作的确认闸门 -->
+        <ActionCard
+          v-if="lastActions.length || pendingAction"
+          :novel-id="appStore.bookId"
+          :chat-id="appStore.chatId"
+          :actions="lastActions"
+          :pending="pendingAction"
+          :scope="inWorkspace() ? 'workspace' : 'book'"
+          @decided="onActionDecided"
+        />
+
+        <!-- 改稿提案卡（DeepWrite 的 proposal 语义：pending→accepting→accepted/rejected/conflict） -->
+        <ProposalCard
+          v-for="p in proposalsByAnchor[i] ?? []"
+          :key="p.id"
+          :novel-id="appStore.bookId"
+          :chat-id="appStore.chatId"
+          :proposal="p"
+          @decided="onProposalDecided"
+        />
+      </template>
 
       <!-- 流水线人审关卡（审阅卡进入对话流） -->
       <ReviewCard
@@ -545,19 +782,14 @@ onUnmounted(() => {
           <button
             class="tool-btn"
             :class="{ on: proposeMode }"
-            title="改稿模式：发送即对右侧文档产出改稿提案"
+            title="改稿模式：发送即对右侧文档产出改稿提案（提案需你审批通过后才写入创作空间）"
             @click="proposeMode = !proposeMode"
           >
             ✎ 改稿
           </button>
-          <button
-            class="tool-btn"
-            :class="{ on: approvalMode === 'auto-approve' }"
-            title="替我审批：提案生成后自动应用保存（仍做版本冲突校验）"
-            @click="approvalMode = approvalMode === 'auto-approve' ? 'request-approval' : 'auto-approve'"
-          >
-            ✓ 替我审批
-          </button>
+          <span class="tool-hint" title="所有生成与修改一律先出提案，由你点『通过』后才写入创作空间">
+            提案需人工审批
+          </span>
         </div>
         <div class="composer-right">
           <span class="model-chip">deepseek-chat</span>
@@ -569,6 +801,20 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.render-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 8px 12px 0;
+  padding: 8px 12px;
+  border: 1px solid #fde68a;
+  border-radius: 8px;
+  background: #fffbeb;
+  color: #92400e;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
 .chat-panel {
   flex: 1;
   min-width: 340px;
@@ -619,6 +865,14 @@ onUnmounted(() => {
   background: #fef3c7;
   color: #92400e;
 }
+.chip.idle {
+  background: #f3f4f6;
+  color: #5c6470;
+}
+.chip.err {
+  background: #fde8e8;
+  color: #b42318;
+}
 .head-actions {
   display: flex;
   gap: 4px;
@@ -637,6 +891,9 @@ onUnmounted(() => {
 }
 .ghost-btn:hover {
   background: #f0f1f3;
+}
+.pause-btn {
+  color: #b45309;
 }
 .mode-switch {
   display: flex;
@@ -765,6 +1022,15 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+/*
+ * 关键：.stream 是「定高列向 flex + overflow-y:auto」的滚动容器。
+ * flex 项的默认 flex-shrink:1 会让浏览器**先压缩子项、再产生滚动**，
+ * 于是消息卡 / 审阅卡 / 互动卡在窗口偏矮时被压扁（正文预览框可缩到 20 余 px、
+ * 并被 sticky 的意见框盖住）。把收缩锁死，容器才会老老实实滚动。
+ */
+.stream > * {
+  flex-shrink: 0;
 }
 .welcome {
   margin: auto;
@@ -900,6 +1166,12 @@ onUnmounted(() => {
   background: #1d4ed8;
   border-color: #1d4ed8;
   color: #fff;
+}
+.tool-hint {
+  font-size: 11.5px;
+  color: #8a8f99;
+  align-self: center;
+  white-space: nowrap;
 }
 .composer-right {
   display: flex;

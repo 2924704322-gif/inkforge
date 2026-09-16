@@ -4,7 +4,8 @@ import { ref, watch } from 'vue'
 
 import { api, withNovel } from '../api'
 import { appStore, openBook } from '../store'
-import type { Book, CustomSkill } from '../types'
+import { BRIEF_FIELD_DEFS, emptyBriefFields, hasBriefFields } from '../types'
+import type { Book, BriefFields, CustomSkill } from '../types'
 import DemoWizardModal from './DemoWizardModal.vue'
 
 const show = defineModel<boolean>('show', { default: false })
@@ -18,7 +19,9 @@ const showCreate = ref(false)
 const createForm = ref({
   novelId: '',
   brief: '',
+  fields: emptyBriefFields(),
   chapters: 12,
+  mode: 'pipeline' as 'pipeline' | 'interactive',
   withDemo: true,
   skillIds: [] as string[],
 })
@@ -26,6 +29,7 @@ const creating = ref(false)
 
 const wizardBook = ref('')
 const wizardBrief = ref('')
+const wizardFields = ref<BriefFields>(emptyBriefFields())
 const wizardChapters = ref(12)
 
 let retryTimer: ReturnType<typeof setInterval> | null = null
@@ -51,7 +55,15 @@ async function refresh(): Promise<void> {
 }
 
 function openCreate(): void {
-  createForm.value = { novelId: '', brief: '', chapters: 12, withDemo: true, skillIds: [] }
+  createForm.value = {
+    novelId: '',
+    brief: '',
+    fields: emptyBriefFields(),
+    mode: 'pipeline',
+    chapters: 12,
+    withDemo: true,
+    skillIds: [],
+  }
   showCreate.value = true
   void api<{ skills: CustomSkill[] }>('GET', '/api/custom-skills')
     .then((res) => {
@@ -66,28 +78,32 @@ async function submitCreate(): Promise<void> {
     message.warning('书名标识仅限字母 / 数字 / 下划线 / 连字符')
     return
   }
-  if (!createForm.value.brief.trim()) {
-    message.warning('创作需求不能为空')
+  // X1 结构化 brief 优先；自由补充文本可作为兜底
+  if (!hasBriefFields(createForm.value.fields) && !createForm.value.brief.trim()) {
+    message.warning('创作需求不能为空：请至少填写一个结构化字段，或补充说明')
     return
   }
   creating.value = true
   try {
-    await api('POST', '/api/books', { novel_id: novelId })
+    await api('POST', '/api/books', { novel_id: novelId, mode: createForm.value.mode })
     message.success(`书目 ${novelId} 已创建`)
     showCreate.value = false
     if (createForm.value.withDemo) {
       await api('POST', withNovel('/api/demo', novelId), {
         brief: createForm.value.brief.trim(),
+        brief_fields: createForm.value.fields,
         chapters: createForm.value.chapters,
         skill_ids: createForm.value.skillIds,
       })
       wizardBook.value = novelId
       wizardBrief.value = createForm.value.brief.trim()
+      wizardFields.value = { ...createForm.value.fields }
       wizardChapters.value = createForm.value.chapters
       void refresh()
     } else {
       await api('POST', withNovel('/api/start', novelId), {
         brief: createForm.value.brief.trim(),
+        brief_fields: createForm.value.fields,
         chapters: createForm.value.chapters,
         skill_ids: createForm.value.skillIds,
       })
@@ -104,9 +120,22 @@ async function submitCreate(): Promise<void> {
 
 function onWizardConfirmed(): void {
   const novelId = wizardBook.value
+  const mode = createForm.value.mode
   wizardBook.value = ''
+  if (mode === 'interactive') {
+    // 互动创作：设定确认后**不启动章节流水线**，直接进互动创作开始出剧情卡
+    openBook(novelId)
+    show.value = false
+    api('POST', withNovel('/api/interactive/start', novelId))
+      .then(() => message.success('设定已入库，进入互动创作：正在为你设计本章剧情卡'))
+      .catch((err) =>
+        message.error(`进入互动创作失败：${err instanceof Error ? err.message : String(err)}`),
+      )
+    return
+  }
   api('POST', withNovel('/api/start', novelId), {
     brief: wizardBrief.value,
+    brief_fields: wizardFields.value,
     chapters: wizardChapters.value,
   })
     .then(() => {
@@ -219,17 +248,45 @@ watch(show, (opened) => {
           <span class="label">书名标识（novel_id，仅字母数字下划线连字符）</span>
           <NInput v-model:value="createForm.novelId" placeholder="例：my-first-novel" />
         </label>
+        <div class="field">
+          <span class="label">创作模式</span>
+          <div class="mode-row">
+            <label class="mode-opt" :class="{ on: createForm.mode === 'pipeline' }">
+              <input v-model="createForm.mode" type="radio" value="pipeline" />
+              <b>自由创作</b>
+              <small class="muted">大纲 → 章节流水线；按计划推进，逐章人审</small>
+            </label>
+            <label class="mode-opt" :class="{ on: createForm.mode === 'interactive' }">
+              <input v-model="createForm.mode" type="radio" value="interactive" />
+              <b>互动创作</b>
+              <small class="muted">只要世界观与人物（不产大纲）；剧情卡逐章推进，自由度更高</small>
+            </label>
+          </div>
+        </div>
         <label class="field">
-          <span class="label">创作需求（brief）</span>
+          <span class="label">创作需求 brief（你要写什么，直接由你提供）</span>
           <NInput
             v-model:value="createForm.brief"
             type="textarea"
             :rows="4"
-            placeholder="例：东方玄幻，冷峻剑修主角，复仇主线，注重战力体系一致性……"
+            placeholder="例：东方玄幻，冷峻剑修主角，复仇主线，女主是卧底；每章结尾留钩子；不要金手指……"
           />
         </label>
+        <div class="field">
+          <span class="label">结构化创作需求（选填 · 字段越具体，产出越不跑偏）</span>
+          <div class="brief-grid">
+            <label v-for="d in BRIEF_FIELD_DEFS" :key="d.key" class="field">
+              <span class="label">{{ d.label }}</span>
+              <NInput
+                v-model:value="createForm.fields[d.key]"
+                size="small"
+                :placeholder="d.placeholder"
+              />
+            </label>
+          </div>
+        </div>
         <div class="row">
-          <label class="field half">
+          <label v-if="createForm.mode === 'pipeline'" class="field half">
             <span class="label">总章数</span>
             <NInputNumber v-model:value="createForm.chapters" :min="1" :max="2000" />
           </label>
@@ -276,7 +333,9 @@ watch(show, (opened) => {
       <DemoWizardModal
         :novel-id="wizardBook"
         :brief="wizardBrief"
+        :brief-fields="wizardFields"
         :chapters="wizardChapters"
+        :mode="createForm.mode"
         @confirmed="onWizardConfirmed"
         @cancelled="wizardBook = ''"
       />
@@ -396,6 +455,11 @@ watch(show, (opened) => {
   font-size: 13px;
   color: #5c6470;
 }
+.brief-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 14px;
+}
 .row {
   display: flex;
   gap: 14px;
@@ -423,5 +487,30 @@ watch(show, (opened) => {
   font-size: 13px;
   cursor: pointer;
   color: #3a3d44;
+}
+.mode-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.mode-opt {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 9px 12px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.mode-opt.on {
+  border-color: #1d4ed8;
+  background: #f0f5ff;
+}
+.mode-opt b {
+  font-weight: 600;
+}
+.mode-opt small {
+  line-height: 1.5;
 }
 </style>

@@ -33,6 +33,7 @@ def finalize_chapter(
         total_chapters=total_chapters,
         is_finale=chapter >= total_chapters,
         state_board=ctx.state_board,
+        custom_constraints=ctx.custom_constraints,
     )
     pipe.memory.writeback_chapter(
         chapter=chapter,

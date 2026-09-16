@@ -3,11 +3,13 @@ import { NButton, NCheckbox, NInput, NInputNumber, NModal, NSelect, NSwitch, use
 import { computed, ref, watch } from 'vue'
 
 import { api, withNovel } from '../api'
-import type { CustomSkill } from '../types'
+import { BRIEF_FIELD_DEFS, emptyBriefFields, hasBriefFields } from '../types'
+import type { BriefFields, CustomSkill } from '../types'
 
 const props = defineProps<{
   novelId: string
   defaultBrief?: string
+  defaultBriefFields?: BriefFields
   defaultChapters?: number
 }>()
 
@@ -18,6 +20,7 @@ const message = useMessage()
 const visible = defineModel<boolean>('show', { default: false })
 
 const brief = ref(props.defaultBrief ?? '')
+const briefFields = ref<BriefFields>(props.defaultBriefFields ?? emptyBriefFields())
 const chapters = ref(props.defaultChapters ?? 10)
 const parallel = ref(false)
 const workers = ref(2)
@@ -32,6 +35,7 @@ const skillOptions = computed(() =>
 watch(visible, (opened) => {
   if (!opened) return
   if (props.defaultBrief) brief.value = props.defaultBrief
+  if (props.defaultBriefFields) briefFields.value = { ...props.defaultBriefFields }
   if (props.defaultChapters) chapters.value = props.defaultChapters
   void api<{ skills: CustomSkill[] }>('GET', '/api/custom-skills')
     .then((res) => {
@@ -42,14 +46,15 @@ watch(visible, (opened) => {
 
 async function start(): Promise<void> {
   console.info('[StartRunModal] start clicked, brief length =', brief.value.trim().length)
-  if (!brief.value.trim()) {
-    message.warning('创作需求（brief）不能为空')
+  if (!hasBriefFields(briefFields.value) && !brief.value.trim()) {
+    message.warning('创作需求不能为空：请至少填写一个结构化字段，或补充说明')
     return
   }
   starting.value = true
   try {
     await api('POST', withNovel('/api/start', props.novelId), {
       brief: brief.value.trim(),
+      brief_fields: briefFields.value,
       chapters: chapters.value ?? 10,
       parallel: parallel.value,
       workers: parallel.value ? workers.value : 0,
@@ -71,13 +76,26 @@ async function start(): Promise<void> {
 <template>
   <NModal v-model:show="visible" preset="card" title="开始生成" style="width: 620px">
     <div class="form">
+      <div class="field">
+        <span class="label">结构化创作需求（X1：字段越具体，产出越不跑偏）</span>
+        <div class="brief-grid">
+          <label v-for="d in BRIEF_FIELD_DEFS" :key="d.key" class="field">
+            <span class="label">{{ d.label }}</span>
+            <NInput
+              v-model:value="briefFields[d.key]"
+              size="small"
+              :placeholder="d.placeholder"
+            />
+          </label>
+        </div>
+      </div>
       <label class="field">
-        <span class="label">创作需求（brief）</span>
+        <span class="label">补充说明（可选）</span>
         <NInput
           v-model:value="brief"
           type="textarea"
-          :rows="4"
-          placeholder="例：东方玄幻，冷峻剑修主角，复仇主线，群像立体……"
+          :rows="2"
+          placeholder="例：另需每章结尾留钩子；避免使用现代网络用语……"
         />
       </label>
       <div class="row">
@@ -124,6 +142,11 @@ async function start(): Promise<void> {
 .label {
   font-size: 13px;
   opacity: 0.85;
+}
+.brief-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 14px;
 }
 .row {
   display: flex;

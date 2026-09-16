@@ -205,6 +205,48 @@ cd apps/desktop && npm run typecheck && npm run build
 
 ## §5 ⚠ 行为契约变更（**必须遵守**，违反会引入 bug）
 
+### 5.0 墨师全域化（P0–P4）：作用域哨兵 / 动作层 / 确认闸门
+
+墨师现在可以在**工作区**（不隶属任何书）里工作：对话、查书目与资料、建书、开写。
+以下四条是新增的硬契约，改动相关代码前必须读懂。
+
+**(1) 作用域哨兵 `novel="__workspace__"`**
+
+```python
+from src.web.scope import WORKSPACE, is_workspace, resolve_book
+
+resolve_book(novel, default_novel)
+#  ""            → 默认书（旧语义，逐字不变）
+#  "<book-id>"   → 指定书（旧语义，逐字不变）
+#  "__workspace__" → ""（工作区不隶属任何书，**绝不**静默落到默认书）
+```
+
+- 哨兵值天然通过既有 `NOVEL_ID_RE`，因此**所有既有校验函数零改动**；非法值（`../evil`）仍被拒。
+- 禁止在任何地方再写字面量 `"__workspace__"`（唯一来源是 `src/web/scope.py`）。
+- 工作区会话落在 `data/workspace/chats/`（`scope.chats_dir()`），不进任何书的目录。
+
+**(2) 动作层：单一实现源**
+
+- 建书/删书/书架枚举 = `src/services/library.py`；HTTP 端点与动作 handler **共用同一实现**，
+  端点只做 `LibraryError.code → HTTP 状态码` 的薄翻译（`server.py::_library_error_to_http`）。
+- 动作注册表在 `src/web/actions.py`；新增能力时**先抽服务层函数，再两端调用**，不许各写一份。
+
+**(3) 写动作闸门：未确认绝不落盘**
+
+- `execute(op, args, ctx, execute_write=False)` 对 `scope="write"` 的动作只返回
+  `status="pending_confirm"` + 影响说明；真正执行必须 `execute_write=True`。
+- 会话内的待办存在 chat JSON 的 `pending_action` 字段（会话即事实源），确认词表见
+  `inkforge_api._pending_decision`（"确认/执行/OK" 才放行，"取消/算了" 丢弃，其它话语不动待办）。
+- 网关逻辑抽在 `inkforge_api._decide_pending_action`（纯函数）——**安全关键路径必须可单测**，
+  不允许把它埋回 HTTP 处理里。
+
+**(4) 动作说明不进 `prompts/` 模板目录**
+
+- `src/agents/actions/master_actions.md` 是**独立目录**：`prompt_loader.validate_templates()`
+  会扫描 `prompts/*.md` 并拒绝含 `{var}` 单花括号的文件（写动作参数占位就是单花括号），
+  放进去会让引擎启动即 Fail-Fast。
+- 动作块由 `agent_prompt()` 统一追加（与 `CONSTITUTION` 同级），**用户自定义提示词覆盖不掉**。
+
 ### 5.1 `MdStore` 构造一律走工厂
 
 ```python
@@ -319,6 +361,18 @@ self._commit(msg)                                # ⚠ 走 _safe_tree_paths 兜�
 
 ## §8 测试约定
 
+### 8.0 墨师全域化的四道验证（改这块必跑）
+
+```bash
+cd engine
+python -m pytest tests -q                      # 315 条：含 workspace/scope/actions/gate 契约
+python smoke_master_workspace.py               # 21 项真实引擎进程验收（零 LLM，可常驻）
+python smoke_master_workspace.py --with-llm    # 追加"墨师自己决定调动作"的真实 LLM 用例（会计费）
+```
+
+- 新增动作时：先在 `tests/test_master_actions.py` 补"未确认零落盘 + 确认后生效"两条；
+- 新增作用域相关端点时：在 `tests/test_workspace_scope.py` 补"缺省仍是默认书"的回归，防止旧语义被改坏。
+
 ### 8.1 加回归测试（`engine/tests/`）
 
 ```python
@@ -364,6 +418,10 @@ def test_memory_rule(make_memory):       # (MdStore, MemoryManager)，用 FakeIn
 | 11 | 把 `role` 写在 `NModal` 上期望透传到面板 | `role` 是 `NModal` **自己声明的 prop**，会被消费掉，不会到子元素（`aria-modal` 不是 prop，才会透传） | 可访问性属性直接写在自绘面板的根元素上 |
 | 12 | 用**无 `preset`** 的 `NModal` 装自绘面板 | 面板**全透明**：`.n-modal` 默认样式只有 `position/align-self/margin/box-shadow`，没有 `background`（背景由 `NCard`/`NDialog` 预设提供）→ 屏幕全灰、只有自带背景的输入框可见 | 自绘面板必须自己给 `background`；`content-style` 也只在 `preset="card"` 时生效，无 preset 时被静默忽略 |
 | 13 | 把需要独立存活的弹窗嵌套在另一个 `NModal` 的 slot 里 | `displayDirective` 默认 `'if'`：**外层一关闭就卸载整个 slot，内层弹窗跟着被销毁** | 长时间运行的向导/流程弹窗应提到顶层（或至少清楚这条耦合，别让外层被意外关闭） |
+| 14 | **对「有未提交改动」的文件执行 `git checkout -- <path>`** | 本批次真实踩过：`inkforge_api.py` 当时含大量未提交改动（W2 上下文预算 + 墨师动作层），被回退到上一次提交，**丢失约千行**；只能按测试断言重建 | **绝不**对未提交文件用 `checkout` 做"恢复"；需要参考旧版用 `git show HEAD:path > /tmp/ref`（只读）；改大文件前先 `git add`（或 commit 一个 WIP）建立安全点 |
+| 15 | 在函数内写 `from fastapi import HTTPException` 后又在该函数**别处**用 `raise HTTPException(...)` | Python 把该名字判为**局部变量** → `UnboundLocalError: cannot access local variable 'HTTPException'`，接口 500 且栈里看不到真实原因 | 模块顶部已统一 import；**不要**在函数内重复 import 同名符号 |
+| 16 | 在 `src/agents/prompts/` 放非模板的 `.md`（如动作说明） | `prompt_loader.validate_templates()` 会扫描该目录**全部** `*.md` 当模板校验，含 `{var}` 单花括号即 `ConfigError` → **引擎启动失败** | 非模板文档放 `src/agents/actions/`（由 `action_prompt.py` 直读） |
+| 17 | 以为"模型的工具调用"会按协议输出 | 真实 DeepSeek 实测：只回答不调工具、动作名自造（`list_books`）、枚举值自造（`mode: "free"`）、参数漏填（缺 `novel_id`）、"确认"后反复追问 | 见 `docs/07-全量功能冒烟报告-20260916.md` §5.2 的 7 条修法：补漏规划调用 + 确定性兜底 + op 别名表 + 枚举折算 + 单书自动定位 + 闸门即时返回 + "未执行"强制提示 |
 
 ---
 
@@ -439,6 +497,8 @@ rm -rf .git .gitattributes        # 会丢失全部历史，慎用
 | 改 IPC 契约 | `apps/desktop/src/shared/bridge.ts`（真源）→ 同步 `preload/index.ts`、`api.ts`、`types.ts` |
 | 改引擎监督 | `apps/desktop/src/main/engine-supervisor.ts` |
 | 加测试 | `engine/tests/`（夹具见 `conftest.py`） |
-| 加冒烟用例 | `engine/smoke_test.py` |
+| 加冒烟用例 | `engine/smoke_test.py`（零 LLM 接口回归）、`smoke_master_workspace.py`（墨师全域化验收） |
+| 改墨师作用域/会话维度 | `engine/src/web/scope.py`（哨兵唯一来源） |
+| 加/改墨师动作 | `engine/src/web/actions.py`（注册表）+ `src/services/library.py`（实现）+ `src/agents/actions/master_actions.md`（提示词） |
 | 改对话框 / 排查 UI 观感问题 | `apps/desktop/ui-probe/`（真实浏览器 + 像素断言，见其 README 的坑位清单） |
-| 查全部提示词位置 | `engine/src/agents/prompts/`、`engine/src/distillation/prompts/`、`engine/src/web/inkforge_api.py`（`AGENT_PRESETS` / `SUB_AGENTS`）、`inkforge_windows.py` |
+| 查全部提示词位置 | `engine/src/agents/prompts/`、`engine/src/agents/actions/`、`engine/src/distillation/prompts/`、`engine/src/web/inkforge_api.py`（`AGENT_PRESETS` / `SUB_AGENTS`）、`inkforge_windows.py` |

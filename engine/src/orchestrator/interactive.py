@@ -284,6 +284,16 @@ class InteractiveRunner:
             "length_deviation": dev,
         }
 
+    def author_directive(self, chapter: int) -> str:
+        """作者自拟卡的原话（本章最高优先级约束）。
+
+        断点恢复同样成立：原话存在剧情卡记录里，不依赖调用方传参。
+        """
+        record = self.load_cards(chapter)
+        if not record or record.get("chosen") != "custom":
+            return ""
+        return (record.get("custom_text") or "").strip()
+
     def _chapter_context(self, chapter: int, plan: dict) -> ChapterContext:
         self.pipe.memory.sync_changed()
         ctx = self.pipe.memory.retrieve_context(
@@ -296,6 +306,16 @@ class InteractiveRunner:
         rule = self._new_character_rule(plan)
         base = ctx.custom_constraints.strip()
         ctx.custom_constraints = f"{base}\n\n{rule}" if base else rule
+        # 作者自拟剧情卡：原话逐字注入最高优先级通道（与自定义 Skill 同级）
+        directive = self.author_directive(chapter)
+        if directive:
+            block = (
+                "【作者钦定的本章走向（最高优先级，必须逐条落实）】\n"
+                f"{directive}\n"
+                "要求：本章必须按上述走向推进；不得替换成其它方向、不得省略其中任一条、"
+                "不得提前或延后到其它章节。若与既有上下文冲突，以上述走向为准并做最小改写。"
+            )
+            ctx.custom_constraints = f"{ctx.custom_constraints}\n\n{block}"
         return ctx
 
     def _new_character_rule(self, plan: dict) -> str:

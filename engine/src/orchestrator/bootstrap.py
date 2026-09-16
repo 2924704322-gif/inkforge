@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from src.agents.architect import Architect
 from src.agents.editor import Editor
+from src.agents.prompt_loader import validate_templates
 from src.agents.summarizer import Summarizer
 from src.agents.writer import Writer
 from src.config.app_config import get_app_config
@@ -25,6 +26,8 @@ logger = get_logger(__name__)
 
 def build_pipeline(novel_id: str, target_words: int | None = None) -> Pipeline:
     """按 novel_id 装配全套运行时依赖。"""
+    # 启动期模板自检（W1）：变量—参数不一致在启动即炸，不留到生成中途
+    validate_templates()
     settings = get_settings()
     setup_logging(settings.log_level, settings.runtime_dir / "logs" / f"{novel_id}.log")
 

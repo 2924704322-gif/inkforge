@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { NConfigProvider, NDialogProvider, NMessageProvider, zhCN, dateZhCN } from 'naive-ui'
-import { onMounted, ref, watch } from 'vue'
+import { onMounted, ref } from 'vue'
 
+import { api } from './api'
 import { appStore } from './store'
 import BookshelfDialog from './components/BookshelfDialog.vue'
 import ChatPanel from './components/ChatPanel.vue'
@@ -56,15 +57,29 @@ onMounted(() => {
     appStore.enginePort = event.port
     appStore.engineMessage = event.message
   })
-  if (!appStore.bookId) appStore.dialogs.bookshelf = true
+  // 首次启动**不**强制弹书架：无作品时直接进入"工作区"模式，
+  // 墨师仍可对话、查书目、建新书（顶部书目标识处可随时切换/新建）。
+  if (!appStore.bookId) void syncActiveBook()
 })
 
-watch(
-  () => appStore.bookId,
-  (id) => {
-    if (!id) appStore.dialogs.bookshelf = true
-  },
-)
+/** 与引擎对齐"工作台当前书目"（墨师在工作区会话里操作的目标）。 */
+async function syncActiveBook(): Promise<void> {
+  try {
+    const res = await api<{ novel_id: string; exists?: boolean }>(
+      'GET',
+      '/api/book-select',
+    ).catch(() => null)
+    if (res?.novel_id && res.exists !== false) {
+      appStore.bookId = res.novel_id
+      appStore.bookTitle = res.novel_id
+    }
+    await api('PUT', '/api/book-select', { novel_id: appStore.bookId }).catch(
+      () => undefined,
+    )
+  } catch {
+    /* 静默：书目标记不影响其它功能 */
+  }
+}
 </script>
 
 <template>

@@ -29,6 +29,18 @@ STYLE_REL = "settings/style.md"
 CUSTOM_SKILLS_REL = "settings/custom-skills.md"
 
 
+def read_custom_constraints(store: MdStore) -> str:
+    """直读项目级约束 settings/custom-skills.md 正文（W5 传参唯一读取口）。
+
+    与 retrieve_context 第 ⑦ 步同源同逻辑：文件不存在返回空串。Architect /
+    Summarizer 的 custom_constraints 传参与 Writer/Editor 注入都走这一个实现，
+    不建立第二套读取逻辑。
+    """
+    if not store.exists(CUSTOM_SKILLS_REL):
+        return ""
+    return store.read(CUSTOM_SKILLS_REL).content.strip()
+
+
 def kind_for_path(rel_path: str) -> str:
     """由相对路径推断文档类型。"""
     if rel_path.startswith("settings/worldview"):
@@ -213,8 +225,7 @@ class MemoryManager:
             ctx.style_guide = self.store.read(STYLE_REL).content.strip()
 
         # ⑦ 自定义 Skill 约束：全量直读 custom-skills.md 正文（向导选定，人工可编辑）
-        if self.store.exists(CUSTOM_SKILLS_REL):
-            ctx.custom_constraints = self.store.read(CUSTOM_SKILLS_REL).content.strip()
+        ctx.custom_constraints = read_custom_constraints(self.store)
 
         return ctx
 

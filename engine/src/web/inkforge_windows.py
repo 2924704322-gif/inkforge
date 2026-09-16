@@ -48,7 +48,13 @@ def _load_overrides() -> dict:
 
 
 def agent_prompt(agent: str) -> str:
-    """供 chat / propose 使用的最终预设提示词（覆盖优先）。"""
+    """供 chat / propose 使用的最终预设提示词（覆盖优先）。
+
+    P1 墨师全域化：具备动作能力的智能体（当前为 master）在**任何情况下**都会拿到
+    工作台动作说明——包括用户自定义覆盖了提示词的情形。因此动作块在这里统一追加，
+    而不是写进 AGENT_PRESETS 常量（后者会被 override 整段替换掉）。
+    """
+    from src.agents.action_prompt import actions_block_for
     from src.web.inkforge_api import AGENT_PRESETS, CONSTITUTION
 
     if agent == "chat":
@@ -58,6 +64,10 @@ def agent_prompt(agent: str) -> str:
     # 最高刚性指令：无论默认还是用户自定义提示词，运行时一律附加
     if "第零条" not in base:
         base = base + "\n\n" + CONSTITUTION
+    # 动作说明：与 CONSTITUTION 同级，永远附带
+    actions = actions_block_for(agent)
+    if actions and "【工作台动作清单" not in base:
+        base = base + "\n\n" + actions
     return base
 
 

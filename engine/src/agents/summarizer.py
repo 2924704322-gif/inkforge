@@ -27,6 +27,7 @@ class Summarizer:
         total_chapters: int = 0,
         is_finale: bool = False,
         state_board: list[dict] | None = None,
+        custom_constraints: str = "",
     ) -> SummaryOutput:
         logger.info("Summarizer: 生成第 %d 章摘要 ...", chapter)
         if is_finale:
@@ -53,6 +54,7 @@ class Summarizer:
             foreshadowing=_fmt_foreshadowing(unresolved_foreshadowing),
             state_board=_fmt_state_board(state_board or []),
             finale_directive=finale_directive,
+            custom_constraints=custom_constraints.strip() or "（无）",
         )
         out = chat_structured(
             self._registry, ROLE, [ChatMessage("user", prompt)], SummaryOutput

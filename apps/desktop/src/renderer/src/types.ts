@@ -19,6 +19,53 @@ export interface CustomSkill {
   content?: string
 }
 
+/**
+ * X1 结构化 brief（W6）：以字段替代单框文本。
+ * 键与引擎侧 `architect.BRIEF_FIELDS` / `server.BriefFieldsBody` 一一对应（手写双份）。
+ */
+export interface BriefFields {
+  genre?: string        // 体裁
+  pov?: string          // 视角
+  tone?: string         // 基调
+  protagonist?: string  // 主角
+  antagonist?: string   // 对立面
+  setting?: string      // 设定
+  themes?: string       // 主题
+  arc?: string          // 期望弧线
+  avoid?: string        // 明确不要的写法
+}
+
+/** 结构化 brief 字段编辑顺序与中文标签（与引擎侧一致）。 */
+export const BRIEF_FIELD_DEFS: { key: keyof BriefFields; label: string; placeholder: string }[] = [
+  { key: 'genre', label: '体裁', placeholder: '例：东方玄幻 / 冷硬派推理 / 惊悚' },
+  { key: 'pov', label: '视角', placeholder: '例：第三人称限知，紧贴主角 / 反派第一人称' },
+  { key: 'tone', label: '基调', placeholder: '例：冷硬克制 / 阴暗压抑 / 温柔治愈' },
+  { key: 'protagonist', label: '主角', placeholder: '例：废柴剑修，隐忍、记仇、有底线' },
+  { key: 'antagonist', label: '对立面', placeholder: '例：同门师兄，表面温厚实则夺权' },
+  { key: 'setting', label: '设定', placeholder: '例：灵气枯竭的末法时代，宗门垄断灵脉' },
+  { key: 'themes', label: '主题', placeholder: '例：复仇与代价 / 身份与自由' },
+  { key: 'arc', label: '期望弧线', placeholder: '例：从隐忍到失控，最终以代价收场' },
+  { key: 'avoid', label: '明确不要的写法', placeholder: '例：不要说教、不要金手指、不要大团圆' },
+]
+
+export function emptyBriefFields(): BriefFields {
+  return {
+    genre: '',
+    pov: '',
+    tone: '',
+    protagonist: '',
+    antagonist: '',
+    setting: '',
+    themes: '',
+    arc: '',
+    avoid: '',
+  }
+}
+
+export function hasBriefFields(fields: BriefFields): boolean {
+  return BRIEF_FIELD_DEFS.some((d) => (fields[d.key] ?? '').trim().length > 0)
+}
+
 // ---------- 流水线状态与审阅 ----------
 
 export interface Metrics {
@@ -89,6 +136,12 @@ export interface OutlinePayload {
 
 export type PendingItem =
   | ({ type: 'outline_review'; outline: OutlinePayload } & Record<string, unknown>)
+  | ({
+      /** 逐章确认关卡：上一章已定稿，等用户在对话框发指令才写下一章 */
+      type: 'chapter_gate'
+      approved_chapter: number
+      next_chapter: number
+    } & Record<string, unknown>)
   | ({
       type: 'chapter_review'
       chapter: number
@@ -264,6 +317,8 @@ export interface ChatSummary {
   agent_label: string
   title: string
   updated: number
+  scope?: 'book' | 'workspace'
+  novel?: string
 }
 
 export interface ChatDelegation {
@@ -278,6 +333,40 @@ export interface ChatMessage {
   content: string
   ts?: number
   delegations?: ChatDelegation[]
+  /** 墨师动作回执（P2/P3）：本轮执行/登记的动作结果 */
+  actions?: ActionReceipt[]
+  action_result?: { op: string; ok: boolean; status: string; error?: string }
+}
+
+/** 墨师动作回执（与 engine/src/web/actions.py 的 ActionExec 对应）。 */
+export interface ActionReceipt {
+  op: string
+  status: 'ok' | 'pending_confirm' | 'failed'
+  ok: boolean
+  summary?: string
+  error?: string
+  data?: unknown
+}
+
+/** 待用户确认的写动作（确认后才真正执行）。 */
+export interface PendingAction {
+  op: string
+  args: Record<string, unknown>
+  impact: string
+}
+
+/** 数据看板「墨师操作」页的记录（/api/actions/audit）。 */
+export interface ActionAuditRecord {
+  ts: number
+  session: string
+  book: string
+  op: string
+  scope: string
+  status: string
+  ok: boolean
+  elapsed_ms: number
+  summary?: string
+  error?: string
 }
 
 export interface ChatData {
@@ -285,7 +374,10 @@ export interface ChatData {
   agent: string
   title: string
   created: number
+  scope?: 'book' | 'workspace'
+  novel?: string
   messages: ChatMessage[]
+  pending?: PendingAction | null
 }
 
 export interface SettingsTreeItem {

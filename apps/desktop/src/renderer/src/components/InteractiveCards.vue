@@ -2,7 +2,7 @@
 import { computed, ref } from 'vue'
 
 import { NInput } from 'naive-ui'
-import { api, withNovel } from '../api'
+import { api, scoreColor, withNovel } from '../api'
 import type { InteractiveState, PlotCard } from '../types'
 
 /**
@@ -84,11 +84,29 @@ const decide = (action: 'approve' | 'reject'): void => {
   })
 }
 
-function scoreOf(): number | null {
+const DIMS = [
+  { key: 'consistency', label: '设定一致性' },
+  { key: 'plot', label: '大纲符合度' },
+  { key: 'continuity', label: '衔接连贯性' },
+  { key: 'prose', label: '文笔质量' },
+] as const
+
+/** 四维均分（与自由创作的人审同一口径）。 */
+function avgScore(): number | null {
   const r = props.state.draft?.review
   if (!r) return null
   return Math.round(((r.consistency + r.plot + r.continuity + r.prose) / 4) * 100) / 100
 }
+
+/**
+ * 署名按阶段拆分：
+ * 剧情策划智能体**只负责出剧情卡与接收选择**；写正文、审校、定稿由主智能体汇总反馈。
+ */
+const agentName = computed(() =>
+  ['generating_cards', 'awaiting_choice'].includes(props.state.status)
+    ? '剧情策划智能体'
+    : '主智能体 · 墨师',
+)
 
 function pickCard(card: PlotCard): void {
   if (busy.value) return
@@ -99,7 +117,7 @@ function pickCard(card: PlotCard): void {
 <template>
   <div class="interactive-card">
     <div class="ic-head">
-      <span class="ic-agent">剧情策划智能体</span>
+      <span class="ic-agent">{{ agentName }}</span>
       <span class="chip">{{ statusText }}</span>
       <span class="muted">第 {{ state.chapter }} 章 · 已定稿 {{ state.approved_count ?? 0 }}</span>
       <button class="ic-exit" title="退出互动界面（服务端断点保留，可随时恢复）" @click="emit('exit')">
@@ -144,8 +162,15 @@ function pickCard(card: PlotCard): void {
         <div class="pc-hook muted">钩子：{{ card.hook }} · 出场：{{ card.characters.join('、') }}</div>
       </div>
       <div class="custom-card">
+        <div class="pc-head" @click="showCustom = !showCustom" style="cursor: pointer">
+          <span class="pc-tag">自拟</span>
+          <span class="pc-title">第 4 张 · 由你决定本章走向</span>
+        </div>
+        <div class="pc-outline muted" style="cursor: pointer" @click="showCustom = !showCustom">
+          {{ showCustom ? '在下面写下你想要的剧情，再点「采用自拟剧情」。' : '点这里展开，写你自己想要的走向（核心事件 / 冲突 / 结尾钩子）。' }}
+        </div>
         <button class="link-btn" @click="showCustom = !showCustom">
-          {{ showCustom ? '收起自拟卡' : '＋ 自拟本章剧情' }}
+          {{ showCustom ? '收起' : '展开自拟卡' }}
         </button>
         <template v-if="showCustom">
           <NInput
@@ -173,9 +198,29 @@ function pickCard(card: PlotCard): void {
     <!-- 人审 -->
     <template v-else-if="state.status === 'awaiting_review' && state.draft?.draft_text">
       <div class="ic-body">
-        本章已写完，请审阅。Editor 参考评分：
-        <b>{{ scoreOf() ?? '—' }}</b>
+        本章已写完，等你审阅。审校主编综合分 <b>{{ avgScore() ?? '—' }}</b>
         <span v-if="state.draft.model" class="muted">（{{ state.draft.model }}，第 {{ state.draft.attempt }} 稿）</span>
+      </div>
+      <div v-if="state.draft.review" class="ic-scores">
+        <span
+          v-for="d in DIMS"
+          :key="d.key"
+          class="ic-score"
+          :class="`is-${scoreColor(state.draft.review[d.key])}`"
+        >
+          {{ d.label }} {{ state.draft.review[d.key] }}
+        </span>
+        <span class="ic-score is-default">字数 {{ state.draft.review.length }}</span>
+      </div>
+      <div v-if="state.draft.review?.comment" class="ic-comment">{{ state.draft.review.comment }}</div>
+      <div v-if="state.draft.review?.issues?.length" class="ic-issues">
+        <div v-for="(it, i) in state.draft.review.issues" :key="i" class="ic-issue">
+          <span class="ic-sev" :class="it.severity === 'major' ? 'is-major' : 'is-minor'">
+            {{ it.severity === 'major' ? '重大' : '轻微' }}
+          </span>
+          <span>{{ it.description }}</span>
+          <div v-if="it.suggestion" class="ic-sug">建议：{{ it.suggestion }}</div>
+        </div>
       </div>
       <div class="draft-box pre-wrap">{{ state.draft.draft_text }}</div>
       <NInput
@@ -287,7 +332,7 @@ function pickCard(card: PlotCard): void {
   color: #3a3d44;
 }
 .custom-card {
-  border: 1px dashed #d9dce1;
+  border: 1px solid #e5e7eb;
   border-radius: 10px;
   padding: 8px 10px;
   display: flex;
@@ -306,6 +351,65 @@ function pickCard(card: PlotCard): void {
 .redraw-row {
   display: flex;
   gap: 8px;
+}
+.ic-scores {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.ic-score {
+  font-size: 11.5px;
+  border-radius: 999px;
+  padding: 1px 9px;
+  background: #f3f4f6;
+  color: #5c6470;
+}
+.ic-score.is-success {
+  background: #e6f6ec;
+  color: #116932;
+}
+.ic-score.is-warning {
+  background: #fef3c7;
+  color: #92400e;
+}
+.ic-score.is-error {
+  background: #fde8e8;
+  color: #b42318;
+}
+.ic-comment {
+  font-size: 12.5px;
+  color: #5c6470;
+  line-height: 1.7;
+}
+.ic-issues {
+  display: flex;
+  flex-direction: column;
+  max-height: 22vh;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.ic-issue {
+  font-size: 12.5px;
+  line-height: 1.7;
+  padding: 4px 0;
+  border-top: 1px dashed #e5e7eb;
+}
+.ic-sev {
+  font-size: 11px;
+  border-radius: 999px;
+  padding: 0 7px;
+  margin-right: 6px;
+}
+.ic-sev.is-major {
+  background: #fde8e8;
+  color: #b42318;
+}
+.ic-sev.is-minor {
+  background: #fef3c7;
+  color: #92400e;
+}
+.ic-sug {
+  color: #116932;
 }
 .draft-box {
   max-height: 260px;

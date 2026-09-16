@@ -127,6 +127,24 @@ watch(
   },
 )
 
+/**
+ * 外部改写后必须重取正文。
+ *
+ * 接受改稿提案（ProposalCard → onProposalDecided）、流水线定稿、删除章节等
+ * 都只自增 `appStore.treeVersion`；本组件原来只监听 selection/bookId，
+ * 于是「让智能体改了正文，正文面板还是旧稿」——改动只落到 MD 事实源，
+ * 界面看不到。有未保存编辑时不覆盖（那是用户正在写的内容）。
+ */
+watch(
+  () => appStore.treeVersion,
+  () => {
+    if (!appStore.selection) return
+    if (dirty.value) return
+    void loadSelection()
+    void loadChapters()
+  },
+)
+
 function onInput(): void {
   dirty.value = doc.value !== null && doc.value.content !== doc.value.savedContent
 }

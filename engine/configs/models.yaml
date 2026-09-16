@@ -19,6 +19,20 @@ providers:
 roles:
   # orchestrator 角色已移除：v1.0 采用 LangGraph 固定状态图编排（graph.py），
   # 无 LLM 意图路由需求；如未来引入自由对话入口再恢复此绑定。
+  #
+  # fallback 查因结论（W10 / E3）：全 11 个角色均未启用 fallback。
+  #   关闭原因**不是** provider 不支持、也**不是** schema 未接：FallbackBinding、
+  #   ModelRegistry.chat_as 的降级链路、probe_all 的降级探活（只告警不阻断）都已完整
+  #   实现，used_fallback 也已写入章节 frontmatter 并透出到 UI。唯一原因是本文件当前
+  #   只定义了一个可用接入点（deepseek），而 ModelsConfig._validate_bindings 要求
+  #   fallback.provider 必须已在 providers 中定义——指向未定义接入点会在加载期直接
+  #   Fail-Fast（原 architect 段下的 my-claude 示例正是这种情况：其 provider 条目同样
+  #   处于注释状态）。故本版**决定暂不启用**：不启用不会改变任何现有行为，贸然启用才会
+  #   在启动期失败。待存在第二个真实接入点时，取消 providers 段相应条目的注释并为各角色
+  #   补上 fallback 段即可，代码零改动。
+  # 附带确认（纯静态可查，不再作为待确认项）：章节审查走 `editor` 角色
+  #   （Editor.ROLE = "editor"，Summarizer 复用同一绑定）；`review` 角色只服务工作台
+  #   的「审校主编」子智能体，不参与章节审查。
   architect:
     provider: deepseek
     model: deepseek-chat

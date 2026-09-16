@@ -20,7 +20,7 @@ from collections.abc import Callable
 
 from src.agents.architect import maybe_generate_style
 from src.agents.writer import human_revision_notes
-from src.memory.memory_manager import ChapterContext
+from src.memory.memory_manager import ChapterContext, read_custom_constraints
 from src.orchestrator.finalize import finalize_chapter
 from src.orchestrator.scheduler import (
     chapters_of_volume,
@@ -72,7 +72,10 @@ def ensure_outline(pipe, brief: str, total_chapters: int,
         effective_brief = brief
         if feedback:
             effective_brief = f"{brief}\n\n【人工审阅打回意见，必须落实】\n{feedback}"
-        outline_out = pipe.architect.generate_settings(effective_brief, total_chapters)
+        outline_out = pipe.architect.generate_settings(
+            effective_brief, total_chapters,
+            custom_constraints=read_custom_constraints(pipe.store),
+        )
         pipe.memory.rebuild_index()
         outline = outline_out.model_dump()
         decision = outline_cb({"type": "outline_review", "outline": outline})
@@ -157,7 +160,7 @@ def run_parallel(
     """卷级并行全流程。返回 {"chapters_done": int, "waves": int}。"""
     outline = ensure_outline(pipe, brief, total_chapters, outline_cb, novel_id)
     # 文风指纹（P4-D）：大纲就绪后幂等生成（style.md 已存在则跳过）
-    maybe_generate_style(pipe, brief, outline)
+    maybe_generate_style(pipe, brief, outline, read_custom_constraints(pipe.store))
     state = {"outline": outline, "total_chapters": total_chapters}
     waves = compute_waves(outline)
     approved = _approved_chapters(pipe.store)

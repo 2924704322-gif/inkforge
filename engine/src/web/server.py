@@ -16,10 +16,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-import shutil
 import sqlite3
-import stat
-import sys
 import threading
 from pathlib import Path
 
@@ -59,63 +56,66 @@ def _parse_estimated_words(content: str) -> tuple[str, int | None]:
     return cleaned, int(m.group(1))
 
 # 自定义创作 Skill（约束型）：全局存于 data/custom_skills/，向导选定后
-# 合并写入该书 settings/custom-skills.md（与 memory_manager.CUSTOM_SKILLS_REL 对齐，
-# 此处不直接 import 以免 server 模块拖入向量库依赖）
-CUSTOM_SKILLS_REL = "settings/custom-skills.md"
-_SKILL_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
+# 合并写入该书 settings/custom-skills.md。
+#
+# P0 重构：实现搬到 src/services/library.py（HTTP 端点与墨师动作层共用一份实现），
+# 此处保留同名薄包装与常量 re-export，既有调用方与测试接口逐字不变。
+from src.services.library import (  # noqa: E402 - 顶部导入块之后集中登记
+    BOOK_SUBDIRS as _BOOK_SUBDIRS,
+    CREATION_MODES as _CREATION_MODES,
+    CUSTOM_SKILLS_REL,
+    LibraryError,
+    LibraryError as _LibraryError,
+    NOVEL_ID_RE as _NOVEL_ID_RE,
+    SKILL_ID_RE as _SKILL_ID_RE,
+    UPLOAD_ROOTS_ENV,
+    UPLOAD_SUFFIXES as _UPLOAD_SUFFIXES,
+    apply_skills_to_store as _apply_skills_to_store,
+    compose_skill_constraints as _compose_skill_constraints,
+    create_book as _lib_create_book,
+    delete_book as _lib_delete_book,
+    force_rmtree as _force_rmtree,
+    list_books as _lib_list_books,
+    list_custom_skills as _list_custom_skills,
+    novel_dir as _novel_dir,
+    purge_derived_data as _purge_derived_data,
+)
 
 
 def _custom_skills_dir() -> Path:
-    d = get_settings().novels_dir.parent / "custom_skills"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    from src.services.library import custom_skills_dir
+
+    return custom_skills_dir()
 
 
-def _list_custom_skills() -> list[dict]:
-    """枚举全部自定义 Skill（按文件名升序）。"""
-    items = []
-    for path in sorted(_custom_skills_dir().glob("*.md")):
-        try:
-            post = frontmatter.load(str(path))
-        except Exception as exc:  # noqa: BLE001 - 损坏文件跳过不阻断列表
-            logger.error("自定义 Skill 解析失败，已跳过 %s: %s", path.name, exc)
-            continue
-        items.append({
-            "skill_id": path.stem,
-            "title": post.metadata.get("title") or path.stem,
-            "content": post.content.strip(),
-        })
-    return items
+def _effective_brief(brief: str, fields: BriefFieldsBody | None) -> str:
+    """X1：结构化字段（原样渲染）+ 自由补充文本，合成最终 brief。
+
+    字段全部为空时只返回自由文本（保持既有单框 brief 用法可用）。
+    """
+    from src.agents.architect import render_brief_fields
+
+    structured = render_brief_fields(fields.model_dump() if fields is not None else None)
+    free = (brief or "").strip()
+    return "\n\n".join(part for part in (structured, free) if part)
 
 
-def _compose_skill_constraints(skill_ids: list[str]) -> tuple[str, list[str]]:
-    """把选定 Skill 合并为约束文本；返回 (合并正文, 命中的标题列表)。"""
-    by_id = {s["skill_id"]: s for s in _list_custom_skills()}
-    sections, titles = [], []
-    for sid in skill_ids:
-        skill = by_id.get(sid)
-        if skill is None:
-            logger.warning("向导选定的自定义 Skill 不存在，已跳过: %s", sid)
-            continue
-        sections.append(f"## {skill['title']}\n\n{skill['content']}")
-        titles.append(skill["title"])
-    return "\n\n".join(sections), titles
+def _library_error_to_http(exc: "LibraryError"):
+    """把服务层错误按 code 翻译为既有 HTTP 状态码与文案（行为保持逐字一致）。"""
+    mapping = {"bad_request": 400, "not_found": 404, "conflict": 409}
+    raise HTTPException(mapping.get(exc.code, 400), exc.message) from exc
+
+
+def _invalidate_workspace_index() -> None:
+    """书目增删后立即失效工作区索引缓存（让墨师"刚建完的书"马上可见）。"""
+    from src.services import workspace as _workspace
+
+    _workspace.invalidate()
 
 
 def _apply_skills_to_novel(store: MdStore, skill_ids: list[str]) -> list[str]:
     """将选定 Skill 合并写入该书 settings/custom-skills.md（未选则不动既有文件）。"""
-    if not skill_ids:
-        return []
-    content, titles = _compose_skill_constraints(skill_ids)
-    if not content:
-        return []
-    store.write(
-        CUSTOM_SKILLS_REL,
-        content,
-        metadata={"title": "自定义创作约束", "skills": titles},
-        commit_message="向导选定自定义 Skill",
-    )
-    return titles
+    return _apply_skills_to_store(store, skill_ids)
 
 
 # ---------- 大纲编辑（资料库页人工修改后落盘为唯一事实源） ----------
@@ -211,6 +211,20 @@ def _model_config_view(raw: dict) -> dict:
 # ---------- 请求体模型（须在模块级定义：from __future__ import annotations 下，
 # FastAPI 无法解析函数内局部 BaseModel 的注解，会误判为 query 参数）----------
 
+class BriefFieldsBody(BaseModel):
+    """X1 结构化 brief（W6）：以字段替代单框文本，键与 architect.BRIEF_FIELDS 一致。"""
+
+    genre: str = ""        # 体裁
+    pov: str = ""          # 视角
+    tone: str = ""         # 基调
+    protagonist: str = ""  # 主角
+    antagonist: str = ""   # 对立面
+    setting: str = ""      # 设定
+    themes: str = ""       # 主题
+    arc: str = ""          # 期望弧线
+    avoid: str = ""        # 明确不要的写法
+
+
 class Decision(BaseModel):
     action: str          # approve / reject
     feedback: str = ""
@@ -218,11 +232,12 @@ class Decision(BaseModel):
 
 
 class StartBody(BaseModel):
-    brief: str
+    brief: str = ""
     chapters: int = 10
     parallel: bool = False
     workers: int = 0
     skill_ids: list[str] = []   # 向导选定的自定义 Skill（写入 settings/custom-skills.md）
+    brief_fields: BriefFieldsBody = BriefFieldsBody()   # X1 结构化 brief（优先）
 
 
 class ResumeBody(BaseModel):
@@ -232,13 +247,16 @@ class ResumeBody(BaseModel):
 
 class BookCreateBody(BaseModel):
     novel_id: str
+    # 创作模式：pipeline（自由创作，大纲+章节流水线）/ interactive（互动创作，只要世界观）
+    mode: str = "pipeline"
 
 
 class DemoBody(BaseModel):
-    brief: str
+    brief: str = ""
     chapters: int = 10
     feedback: str = ""     # 重新生成时携带上一版审核意见
     skill_ids: list[str] = []   # 自定义 Skill 约束附加进 brief，使 Demo 设定也遵循
+    brief_fields: BriefFieldsBody = BriefFieldsBody()   # X1 结构化 brief（优先）
 
 
 class CustomSkillBody(BaseModel):
@@ -511,11 +529,38 @@ class ReviewSession:
             "issue_count": len(getattr(review, "issues", []) or []),
         }
 
+    def request_pause(self) -> dict:
+        """暂停生成。
+
+        不引入新的中断点，复用逐章确认关卡：
+        · 已停在关卡上 → 立即结束本轮（action=stop 让关卡路由到 END）；
+        · 正在写某一章 → 打标记，这一章写完到达关卡时自动停下，不自动往下写。
+        已产出的章节都已落盘，随时可删书或断点续跑。
+        """
+        with self._cond:
+            pending = self._pending or {}
+            self._pause_requested = True
+            if isinstance(pending, dict) and pending.get("type") == "chapter_gate":
+                self._resume = {"action": "stop"}
+                self._cond.notify_all()
+                return {
+                    "paused": True,
+                    "immediate": True,
+                    "next_chapter": pending.get("next_chapter"),
+                }
+            return {"paused": True, "immediate": False}
+
     def _await_decision(self, payload: dict) -> dict:
         """挂起等待前端提交决定。"""
         with self._cond:
             self._pending = self._enrich_chapter_payload(payload)
             self._resume = None
+            # 逐章确认关卡：若用户已点过「暂停生成」，不再等待，直接结束本轮
+            if payload.get("type") == "chapter_gate" and getattr(self, "_pause_requested", False):
+                self._pause_requested = False
+                self._pending = None
+                logger.info("用户已请求暂停：跳过第 %s 章的生成", payload.get("next_chapter"))
+                return {"action": "stop"}
             self._cond.notify_all()
             while self._resume is None:
                 self._cond.wait()
@@ -595,7 +640,15 @@ class ReviewSession:
 
     def _run_demo(self, brief: str, chapters: int, feedback: str) -> None:
         try:
-            demo = self._build_architect().generate_demo(brief, chapters, feedback)
+            from src.memory.memory_manager import read_custom_constraints
+
+            store = self.write_store()
+            # 项目级约束与 brief 同处送达 Demo 渲染（W5：与 memory_manager 同源直读）
+            demo = self._build_architect(store).generate_demo(
+                brief, chapters, feedback,
+                custom_constraints=read_custom_constraints(store),
+                interactive=(store.root / "interactive").is_dir(),
+            )
             with self._lock:
                 self._demo_result = demo
                 self._demo_status = "done"
@@ -605,13 +658,13 @@ class ReviewSession:
                 self._demo_error = str(exc)
                 self._demo_status = "error"
 
-    def _build_architect(self):
+    def _build_architect(self, store=None):
         """轻量装配 Architect（仅 registry+store，不建向量索引/图）。"""
         from src.agents.architect import Architect
         from src.config.settings import load_models_config
         from src.llm.registry import ModelRegistry
 
-        return Architect(ModelRegistry(load_models_config()), self.write_store())
+        return Architect(ModelRegistry(load_models_config()), store or self.write_store())
 
     def confirm_demo(self, demo_override=None) -> dict:
         """人工同意后把 Demo 写入资料库 settings/。
@@ -625,7 +678,10 @@ class ReviewSession:
             demo = demo_override or self._demo_result
             if demo is None or (demo_override is None and self._demo_status != "done"):
                 raise RuntimeError("当前无待确认的设定 Demo")
-        self._build_architect().save_demo(demo)
+        self._build_architect().save_demo(
+                demo,
+                interactive=(get_settings().novels_dir / self.novel_id / "interactive").is_dir(),
+            )
         with self._lock:
             self._demo_result = demo
             self._demo_status = "confirmed"
@@ -849,8 +905,6 @@ class InteractiveSession:
 
 # ---------- 多书会话中枢（v2.0 P4-B）----------
 
-_NOVEL_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
-
 
 class SessionHub:
     """按 novel_id 管理多个 ReviewSession（线程安全，多书并存）。"""
@@ -903,80 +957,13 @@ class SessionHub:
             self._interactive.pop(novel_id, None)
 
 
-# ---------- 删书：健壮删除目录树（处理 Windows 下 .git 只读对象文件） ----------
-
-def _rmtree_onerror(func, path, _exc):
-    """rmtree 出错回调：清除只读位后重试（func 为失败的 os 操作）。
-
-    独立书目录常含 .git（用户数据独立仓库，D-用户数据分离），其
-    objects/pack 文件被 git 标记为只读；Windows 下 shutil.rmtree 默认
-    对只读文件抛 PermissionError。清除只读位再重试即可删除。
-    """
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
-
-
-def _force_rmtree(path: Path) -> None:
-    """删除目录树，兼容含只读文件（如 .git 对象）的场景。"""
-    if sys.version_info >= (3, 12):
-        shutil.rmtree(path, onexc=_rmtree_onerror)
-    else:
-        shutil.rmtree(path, onerror=_rmtree_onerror)
-
-
-# ---------- 删书清理：派生数据（向量库/checkpoint/日志）尽力清除 ----------
-
-def _purge_derived_data(novel_id: str) -> list[str]:
-    """删除一本书的派生数据；全部 best-effort，返回警告列表。
-
-    MD 事实源是唯一事实源（D9），派生数据即使残留也可随时重建/覆盖，
-    因此任何一步失败只记警告，不阻断删除。
-    """
-    settings = get_settings()
-    warnings: list[str] = []
-
-    # 1) Chroma 向量 collection（命名规则与 retriever.VectorIndex 一致）
-    chroma_dir = settings.chroma_dir
-    if chroma_dir.exists():
-        try:
-            import chromadb
-
-            name = "novel-" + hashlib.sha1(novel_id.encode("utf-8")).hexdigest()[:12]
-            client = chromadb.PersistentClient(path=str(chroma_dir))
-            client.delete_collection(name)
-        except Exception as exc:  # collection 不存在或库不可用
-            warnings.append(f"向量库清理跳过: {exc}")
-
-    # 2) checkpoints.sqlite 中该书的检查点（thread_id == novel_id）
-    if settings.checkpoint_db.exists():
-        try:
-            conn = sqlite3.connect(str(settings.checkpoint_db))
-            try:
-                for table in ("checkpoints", "writes"):
-                    try:
-                        conn.execute(
-                            f"DELETE FROM {table} WHERE thread_id = ?", (novel_id,))
-                    except sqlite3.OperationalError:
-                        pass    # 表不存在（尚未生成过）
-                conn.commit()
-            finally:
-                conn.close()
-        except Exception as exc:
-            warnings.append(f"checkpoint 清理跳过: {exc}")
-
-    # 3) 运行日志（Windows 下可能被日志句柄占用，失败不阻断）
-    log_file = settings.runtime_dir / "logs" / f"{novel_id}.log"
-    try:
-        log_file.unlink(missing_ok=True)
-    except OSError as exc:
-        warnings.append(f"日志清理跳过: {exc}")
-
-    return warnings
+# ---------- 删书（目录树 / 派生数据清理） ----------
+# P0 重构：_force_rmtree 与 _purge_derived_data 的实现已搬到
+# src/services/library.py（端点与墨师动作层共用），本文件顶部以 import 别名
+# re-export 同名符号，既有调用方与测试接口不变。
 
 
 # ---------- 上传路径校验（S1-4：收敛任意文件读取面） ----------
-
-UPLOAD_ROOTS_ENV = "INKFORGE_UPLOAD_ROOTS"
 
 
 def _resolve_upload_path(raw: str) -> Path:
@@ -1026,6 +1013,10 @@ def _is_within(path: Path, root: Path) -> bool:
 # ---------- FastAPI 应用 ----------
 
 def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
+    # 启动期模板自检（W1）：模板变量与渲染点参数不一致 → 启动即 ConfigError
+    from src.agents.prompt_loader import validate_templates
+
+    validate_templates()
     app = FastAPI(title="小说审阅系统 v1.0")
     hub = SessionHub(target_words)
     session = hub.get_or_create(novel_id)   # 默认书会话（兼容既有单书用法）
@@ -1062,69 +1053,32 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
 
     @app.get("/api/books")
     def books() -> JSONResponse:
-        """书架：枚举 novels_dir 下全部书目及进度元信息。"""
-        novels_dir = get_settings().novels_dir
-        active = hub.active_ids()
-        done_sessions = hub.done_ids()
-        items = []
-        ids = set()
-        if novels_dir.exists():
-            ids = {p.name for p in novels_dir.iterdir()
-                   if p.is_dir() and _NOVEL_ID_RE.match(p.name)}
-        ids.add(novel_id)   # 默认书未落盘也展示
-        for nid in sorted(ids):
-            # 书架列表是纯读路径：不挂 Git、不建骨架子目录（曾导致「列书架有写副作用」）
-            from src.memory.store_factory import open_store
+        """书架：枚举 novels_dir 下全部书目及进度元信息。
 
-            store = open_store(novels_dir / nid, writable=False)
-            title = nid
-            planned = 0
-            if store.exists("settings/outline.md"):
-                meta = store.read("settings/outline.md").metadata
-                title = meta.get("title") or nid
-                planned = sum(
-                    len(v.get("chapters", [])) for v in (meta.get("volumes") or [])
-                    if isinstance(v, dict)
-                )
-            elif store.exists("settings/story-overview.md"):
-                # 互动模式书无 outline.md，书名回落到已确认的故事概要
-                title = store.read("settings/story-overview.md").metadata.get(
-                    "book_title") or store.read(
-                    "settings/story-overview.md").metadata.get("title") or nid
-            interactive = (store.root / "interactive").is_dir()
-            chapters = store.list_chapters() if store.root.exists() else []
-            approved = sum(1 for c in chapters
-                           if c.metadata.get("status") == "approved")
-            is_active = nid in active
-            # 完结判定：本进程会话已跑完，或已定稿章数达到大纲计划章数（能扛重启）。
-            finished = (not is_active) and (
-                nid in done_sessions or (planned > 0 and approved >= planned)
-            )
-            items.append({
-                "novel_id": nid,
-                "title": title,
-                "chapters": len(chapters),
-                "approved": approved,
-                "active": is_active,
-                "finished": finished,
-                "interactive": interactive,
-                "is_default": nid == novel_id,
-            })
+        P0 重构：实现委托 src/services/library.list_books（与墨师 book_list 动作同源）。
+        """
+        items = _lib_list_books(novel_id, hub.active_ids(), hub.done_ids())
         return JSONResponse({"books": items})
 
     @app.post("/api/books")
     def create_book(body: BookCreateBody) -> JSONResponse:
-        """新建书：校验 slug 后创建空书目录骨架（后续经该书 /api/start 走 bootstrap）。"""
-        nid = body.novel_id.strip()
-        if not _NOVEL_ID_RE.match(nid):
-            raise HTTPException(400, f"非法书名标识：{nid!r}（仅限字母/数字/下划线/连字符）")
-        book_dir = get_settings().novels_dir / nid
-        if book_dir.exists():
-            raise HTTPException(409, f"书 {nid} 已存在")
-        for sub in ("chapters", "settings", "summaries", "reviews"):
-            (book_dir / sub).mkdir(parents=True, exist_ok=True)
+        """新建书：校验 slug 后创建空书目录骨架（后续经该书 /api/start 走 bootstrap）。
+
+        创作模式（`mode`）：
+        · `pipeline`（默认）＝自由创作：大纲 → 章节流水线；
+        · `interactive` ＝互动创作：只做世界观/人物设定（不产大纲），后续由剧情卡逐章推进。
+          落地方式就是建一个 `<书>/interactive/` 目录 —— `/api/books` 的 `interactive`
+          标志正是按这个目录是否存在计算的。
+
+        P0 重构：实现委托 src/services/library.create_book（与墨师 book_create 动作同源）。
+        """
+        try:
+            nid = _lib_create_book(body.novel_id, body.mode)
+        except _LibraryError as exc:
+            _library_error_to_http(exc)
         hub.get_or_create(nid)
-        return JSONResponse({"ok": True, "novel_id": nid})
+        _invalidate_workspace_index()
+        return JSONResponse({"ok": True, "novel_id": nid, "mode": body.mode})
 
     @app.delete("/api/books/{nid}")
     def delete_book(nid: str) -> JSONResponse:
@@ -1132,22 +1086,16 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
 
         保护规则：非法 ID 400；不存在 404；生成中 409；默认书 409
         （默认书是启动参数指定的兜底书，删除后书架仍会展示空壳，故禁删）。
-        """
-        if not _NOVEL_ID_RE.match(nid):
-            raise HTTPException(400, f"非法书名标识：{nid!r}（仅限字母/数字/下划线/连字符）")
-        if nid == novel_id:
-            raise HTTPException(409, f"书 {nid} 是默认书，不可删除")
-        if nid in hub.active_ids():
-            raise HTTPException(409, f"书 {nid} 正在生成中，请等生成结束后再删除")
-        book_dir = get_settings().novels_dir / nid
-        if not book_dir.is_dir():
-            raise HTTPException(404, f"书 {nid} 不存在")
 
-        hub.remove(nid)
-        _force_rmtree(book_dir)
-        warns = _purge_derived_data(nid)
-        if warns:
-            logger.warning("删书 %s 部分派生数据未清理: %s", nid, "; ".join(warns))
+        P0 重构：实现委托 src/services/library.delete_book（与墨师 book_delete 动作同源）。
+        """
+        try:
+            warns = _lib_delete_book(
+                nid, novel_id, hub.active_ids(), remove_session=hub.remove
+            )
+        except _LibraryError as exc:
+            _library_error_to_http(exc)
+        _invalidate_workspace_index()
         return JSONResponse({"ok": True, "novel_id": nid, "warnings": warns})
 
     # ---------- 自定义创作 Skill（全局，跨书复用） ----------
@@ -1417,6 +1365,11 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
             items.append(entry)
         return JSONResponse({"queue": items})
 
+    @app.post("/api/pause")
+    def pause_run(novel: str = "") -> JSONResponse:
+        """暂停生成（当前章写完即停在逐章确认关卡；已停在关卡则立即结束本轮）。"""
+        return JSONResponse(_sess(novel).request_pause())
+
     @app.post("/api/decision")
     def decision(body: Decision, novel: str = "") -> JSONResponse:
         payload = {"action": body.action}
@@ -1432,11 +1385,12 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
     @app.post("/api/demo")
     def demo_start(body: DemoBody, novel: str = "") -> JSONResponse:
         """发起设定 Demo 生成（先审后入库；重复调用即重新生成）。"""
-        if not body.brief.strip():
+        brief = _effective_brief(body.brief, body.brief_fields)
+        if not brief:
             raise HTTPException(400, "创作需求 brief 不能为空")
         try:
             _sess(novel).start_demo(
-                body.brief.strip(), body.chapters, body.feedback, body.skill_ids
+                brief, body.chapters, body.feedback, body.skill_ids
             )
         except RuntimeError as exc:
             raise HTTPException(409, str(exc))
@@ -1479,6 +1433,13 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
     def interactive_start(novel: str = "") -> JSONResponse:
         """启动/续跑互动会话（从 interactive/ 与章节目录恢复断点）。"""
         nid = novel or novel_id
+        # 隔离：只有「互动创作」模式的书能开剧情卡流程
+        if not (get_settings().novels_dir / nid / "interactive").is_dir():
+            raise HTTPException(
+                400,
+                "这本书是「自由创作」模式：请用章节流水线推进；互动创作仅对建书时选择"
+                "「互动创作」的书开放。",
+            )
         if nid in hub.active_ids():
             raise HTTPException(409, f"书 {nid} 正在全自动生成中，无法启动互动创作")
         try:
@@ -1524,9 +1485,20 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
 
     @app.post("/api/start")
     def start(body: StartBody, novel: str = "") -> JSONResponse:
+        # 隔离：互动创作模式的书不走章节流水线（剧情由作者逐章决定）
+        nid_guard = novel or novel_id
+        if (get_settings().novels_dir / nid_guard / "interactive").is_dir():
+            raise HTTPException(
+                400,
+                "这本书是「互动创作」模式：请在对话栏点「互动创作」，用剧情卡逐章推进；"
+                "章节流水线只服务「自由创作」模式的书。",
+            )
+        brief = _effective_brief(body.brief, body.brief_fields)
+        if not brief:
+            raise HTTPException(400, "创作需求 brief 不能为空")
         try:
             _sess(novel).start(
-                body.brief, body.chapters, body.parallel, body.workers, body.skill_ids
+                brief, body.chapters, body.parallel, body.workers, body.skill_ids
             )
         except RuntimeError as exc:
             raise HTTPException(409, str(exc))

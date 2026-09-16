@@ -31,7 +31,7 @@ const groups: { title: string; items: NavItem[] }[] = [
   {
     title: '配置',
     items: [
-      { id: 'bookshelf', icon: '📚', label: '书架', kind: 'dialog' },
+      { id: 'bookshelf', icon: '📚', label: '书架 / 新建作品', kind: 'dialog' },
       { id: 'styleForge', icon: '🧪', label: '风格工坊', kind: 'dialog' },
       { id: 'modelConfig', icon: '⚙️', label: '模型配置', kind: 'dialog' },
     ],

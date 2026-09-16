@@ -37,12 +37,17 @@ engine/data/custom_skills/
 engine/data/materials/
 engine/data/learning/
 engine/data/config/
+# 工作区会话（墨师全域总控的对话记录，属用户数据）
+engine/data/workspace/
 
 # ─────────── 测试与临时产物 ───────────
 e2e-shots/
 smoke-output/
 engine/smoke-reports/
 engine/.smoke/
+# 冒烟测试写出的临时文件（历史遗留：曾经把 e2e 日志写在仓库根内）
+engine/e2e.txt
+engine/smoke-state.json
 engine/smoke-state.json
 docs/_*.png
 docs/step*.png

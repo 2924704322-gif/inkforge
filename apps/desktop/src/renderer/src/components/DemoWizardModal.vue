@@ -1,15 +1,20 @@
 <script setup lang="ts">
 import { NInput, NSpin, useMessage } from 'naive-ui'
-import { onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 
 import { api, withNovel } from '../api'
-import type { DemoOutput, DemoSnapshot } from '../types'
+import type { BriefFields, DemoOutput, DemoSnapshot } from '../types'
 
 const props = defineProps<{
   novelId: string
   brief: string
+  briefFields?: BriefFields
   chapters: number
+  /** 创作模式：互动创作只审世界设定，不审（也不生成）剧情梗概/概要 */
+  mode?: 'pipeline' | 'interactive'
 }>()
+
+const isInteractive = computed(() => props.mode === 'interactive')
 
 const emit = defineEmits<{ confirmed: []; cancelled: [] }>()
 
@@ -55,6 +60,7 @@ async function regenerate(): Promise<void> {
   try {
     await api('POST', withNovel('/api/demo', props.novelId), {
       brief: props.brief,
+      brief_fields: props.briefFields ?? {},
       chapters: props.chapters,
       feedback: feedback.value.trim(),
     })
@@ -128,14 +134,21 @@ onUnmounted(() => {
           <span class="field-label">主题（一句话）</span>
           <NInput v-model:value="demo.theme" />
         </label>
-        <label class="field">
-          <span class="field-label">故事梗概</span>
-          <NInput v-model:value="demo.synopsis" type="textarea" :rows="3" />
-        </label>
-        <label class="field">
-          <span class="field-label">整体概要（开端 / 发展 / 高潮 / 结局）</span>
-          <NInput v-model:value="demo.overview" type="textarea" :rows="5" />
-        </label>
+        <!-- 互动创作：不显示也不生成本书剧情走向（由作者逐章用剧情卡决定） -->
+        <template v-if="!isInteractive">
+          <label class="field">
+            <span class="field-label">故事梗概</span>
+            <NInput v-model:value="demo.synopsis" type="textarea" :rows="3" />
+          </label>
+          <label class="field">
+            <span class="field-label">整体概要（开端 / 发展 / 高潮 / 结局）</span>
+            <NInput v-model:value="demo.overview" type="textarea" :rows="5" />
+          </label>
+        </template>
+        <div v-else class="muted" style="margin-bottom: 12px">
+          互动创作模式：这里只审「世界设定」（世界观 / 人物 / 主题）。
+          剧情走向不进设定 —— 每一章由你从剧情卡里挑方向。
+        </div>
 
         <div class="field">
           <div class="field-label row-between">
@@ -181,12 +194,22 @@ onUnmounted(() => {
         </div>
       </div>
 
+      <NInput
+        v-model:value="feedback"
+        type="textarea"
+        :rows="2"
+        placeholder="审核意见（点「打回 · 重新生成」时填写）：例如『主角动机再明确些；世界观删掉第 3 条』"
+      />
+
       <div class="wizard-foot">
         <span class="muted">确认后设定写入 settings/，正式生成时不再推翻。</span>
         <div class="row-gap">
           <button class="retry-btn" @click="emit('cancelled')">取消</button>
+          <button class="retry-btn reject" :disabled="confirming" @click="regenerate">
+            打回 · 重新生成
+          </button>
           <button class="primary-btn" :disabled="confirming" @click="confirmDemo">
-            {{ confirming ? '入库中…' : '同意设定并开始生成' }}
+            {{ confirming ? '入库中…' : isInteractive ? '同意设定，进入互动创作' : '同意设定并开始生成' }}
           </button>
         </div>
       </div>
@@ -309,6 +332,14 @@ onUnmounted(() => {
   border-radius: 8px;
   padding: 7px 16px;
   cursor: pointer;
+}
+.retry-btn.reject {
+  color: #b45309;
+  border-color: #fde68a;
+}
+.retry-btn.reject:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 .error-text {
   color: #dc2626;

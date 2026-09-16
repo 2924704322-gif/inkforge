@@ -1,3 +1,5 @@
+import { fileURLToPath } from 'node:url'
+
 import vue from '@vitejs/plugin-vue'
 import { defineConfig } from 'vite'
 
@@ -12,5 +14,15 @@ export default defineConfig({
     emptyOutDir: true,
     // 探针不需要压缩，便于肉眼核对产物
     minify: false,
+    rollupOptions: {
+      input: {
+        // 向导灰屏探针（原有）
+        index: fileURLToPath(new URL('./index.html', import.meta.url)),
+        // 人审关卡布局探针
+        review: fileURLToPath(new URL('./review.html', import.meta.url)),
+        // 对话框可用性探针
+        dialogs: fileURLToPath(new URL('./dialogs.html', import.meta.url)),
+      },
+    },
   },
 })

@@ -5,6 +5,7 @@ import { computed, ref, watch } from 'vue'
 import { api } from '../api'
 import { appStore, type SideWindowId } from '../store'
 import type {
+  ActionAuditRecord,
   AgentPreset,
   DashboardData,
   LearningItem,
@@ -138,13 +139,66 @@ async function removeMaterial(m: Material): Promise<void> {
 // ── 数据看板 ──
 const dashboard = ref<DashboardData | null>(null)
 const dashBook = computed(() => appStore.bookId)
+/** 墨师操作审计（P4 可视化）：与书无关，工程级记录，无书也能看。 */
+const auditRecords = ref<ActionAuditRecord[]>([])
+const dashTab = ref<'book' | 'audit'>('book')
 
 async function loadDashboard(): Promise<void> {
-  if (!dashBook.value) return
+  auditRecords.value = await api<{ records: ActionAuditRecord[] }>(
+    'GET',
+    '/api/actions/audit?limit=100',
+  )
+    .then((r) => r.records)
+    .catch(() => [])
+  if (!dashBook.value) {
+    dashboard.value = null
+    return
+  }
   dashboard.value = await api<DashboardData>(
     'GET',
     `/api/dashboard?novel=${encodeURIComponent(dashBook.value)}`,
   )
+}
+
+const AUDIT_LABEL: Record<string, string> = {
+  book_list: '列出书目',
+  book_stat: '书目进度',
+  doc_list: '设定清单',
+  doc_read: '读取设定',
+  chapter_list: '章节清单',
+  chapter_read: '读取章节',
+  outline_read: '读取大纲',
+  search_workspace: '跨书检索',
+  material_list: '素材清单',
+  skill_list: '技能包清单',
+  constraint_list: '约束清单',
+  model_config: '模型绑定',
+  book_create: '新建书',
+  book_select: '切换书目',
+  book_delete: '删除书',
+  book_bind_skills: '绑定约束',
+  gen_start: '启动生成',
+  gen_resume: '断点续跑',
+  gen_pause: '暂停生成',
+  gen_decide: '章节裁决',
+  demo_run: '生成设定',
+  demo_confirm: '设定入库',
+  interactive_start: '启动互动创作',
+  interactive_choose: '选定剧情卡',
+  material_create: '新增素材',
+  constraint_create: '新增约束',
+}
+
+function auditLabel(op: string): string {
+  return AUDIT_LABEL[op] ?? op
+}
+
+function fmtAuditTime(ts: number): string {
+  if (!ts) return '—'
+  const d = new Date(ts * 1000)
+  return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(
+    d.getMinutes(),
+  ).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`
 }
 
 // ── 导出中心 ──
@@ -302,9 +356,43 @@ watch(
           </div>
         </template>
 
-        <!-- 数据看板 -->
+        <!-- 数据看板（含「墨师操作」审计页：与书无关，工程级记录） -->
         <template v-else-if="which === 'dashboard'">
-          <div v-if="!dashBook" class="muted">请先在书架选择一部作品。</div>
+          <div class="dash-tabs">
+            <button class="dash-tab" :class="{ active: dashTab === 'book' }" @click="dashTab = 'book'">
+              📈 作品指标
+            </button>
+            <button class="dash-tab" :class="{ active: dashTab === 'audit' }" @click="dashTab = 'audit'">
+              🧭 墨师操作
+              <span v-if="auditRecords.length" class="muted">（{{ auditRecords.length }}）</span>
+            </button>
+          </div>
+
+          <template v-if="dashTab === 'audit'">
+            <div class="muted" style="margin: 6px 0 8px">
+              墨师通过对话执行过的动作都会留痕（含读取类）。写操作需你确认后才执行，未确认的不入账。
+            </div>
+            <div v-for="(r, i) in auditRecords" :key="i" class="row-card">
+              <div class="col-gap">
+                <span class="row-title">
+                  <span class="tag" :class="r.ok ? 'ok' : ''">{{ r.ok ? '成功' : '失败' }}</span>
+                  {{ auditLabel(r.op) }}
+                  <span class="muted">· {{ r.scope === 'write' ? '写' : '读' }}</span>
+                </span>
+                <span class="muted">
+                  {{ fmtAuditTime(r.ts) }} · {{ r.book || r.session || '工作区' }} · {{ r.elapsed_ms }}ms
+                </span>
+                <span v-if="r.summary" class="muted">{{ r.summary.slice(0, 90) }}</span>
+                <span v-else-if="r.error" class="muted">⚠ {{ r.error.slice(0, 90) }}</span>
+              </div>
+            </div>
+            <div v-if="auditRecords.length === 0" class="muted" style="padding: 4px 0">
+              暂无墨师操作记录——在对话框里让墨师查资料或建书试试。
+            </div>
+          </template>
+
+          <template v-else>
+          <div v-if="!dashBook" class="muted">尚未打开作品。可切到「墨师操作」查看工作区里的动作记录，或在书架打开/新建一部作品。</div>
           <template v-else-if="dashboard">
             <div class="metric-grid">
               <div class="metric-card">
@@ -343,6 +431,7 @@ watch(
               </span>
             </div>
           </template>
+          </template>
         </template>
 
         <!-- 导出中心 -->
@@ -380,6 +469,26 @@ export default { name: 'SideWindows' }
 </script>
 
 <style scoped>
+.dash-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.dash-tab {
+  padding: 5px 10px;
+  font-size: 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  background: #fff;
+  color: #475569;
+  cursor: pointer;
+}
+.dash-tab.active {
+  border-color: #2563eb;
+  color: #2563eb;
+  background: #eff6ff;
+  font-weight: 600;
+}
 .side-window {
   position: fixed;
   left: 184px;
