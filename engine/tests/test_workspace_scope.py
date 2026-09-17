@@ -15,7 +15,6 @@ import pytest
 from src.services import library, workspace
 from src.web.scope import WORKSPACE, chats_dir, is_workspace, resolve_book, workspace_dir
 
-
 # ---------- 作用域 ----------
 
 def test_scope_sentinel_and_default_semantics():

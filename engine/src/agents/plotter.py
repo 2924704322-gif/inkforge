@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from src.agents.architect import brief_fidelity_block, generate_faithful
 from src.agents.prompt_loader import render_prompt
 from src.agents.schemas import PlotCardsOutput
 from src.agents.writer import (
@@ -73,6 +74,8 @@ class Plotter:
             custom_constraints=ctx.custom_constraints.strip() or "（无）",
             feedback=feedback.strip() or "（无）",
         )
+        # 虚构框架 + 零拒绝 + 约束优先级链（与世界观/大纲同源，此前出卡链路缺这一段）
+        prompt = f"{brief_fidelity_block()}\n\n{prompt}"
         if strict:
             prompt += (
                 "\n\n【必须产出（上一次未产出合规结果）】\n"
@@ -80,8 +83,13 @@ class Plotter:
                 "不得拒答、不得解释、不得道歉、不得输出 JSON 以外的任何内容；\n"
                 "必须给出恰好 3 张互斥的剧情卡（c1/c2/c3），每张含 title / outline / hook / characters。"
             )
-        out = chat_structured(
-            self._registry, ROLE, [ChatMessage("user", prompt)], PlotCardsOutput
+        # 与 architect 同源的保真链：空产出/拒绝措辞在系统内消化（结果不落成拒答文案）。
+        # 出卡此前只有"异常重试"，模型**成功返回一段拒绝文本**时不会被识别，会直接变成剧情卡内容。
+        out = generate_faithful(
+            lambda msgs, temp: chat_structured(
+                self._registry, ROLE, msgs, PlotCardsOutput, temperature=temp
+            ),
+            [ChatMessage("user", prompt)],
         )
         out = self._normalize(out)
         logger.info(

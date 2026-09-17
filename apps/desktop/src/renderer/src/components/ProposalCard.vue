@@ -43,6 +43,10 @@ export interface Proposal {
   title: string
   summary: string
   target: { kind: string; key: string }
+  /** 服务端回报的"实际改的是哪份文稿"（可核对证据，回归：改大纲却动了第一章）。 */
+  targetPath?: string
+  targetTitle?: string
+  targetChars?: number
   status: 'pending' | 'accepting' | 'accepted' | 'rejected' | 'conflict' | 'error'
   statusMessage: string
   additions: number
@@ -181,6 +185,15 @@ function lineMark(type: DiffLine['type']): string {
           <span class="p-status" :class="`is-${proposal.status}`">{{ statusLabel }}</span>
         </div>
         <p class="p-summary">{{ proposal.summary }}</p>
+        <!-- 目标可核对证据：用户必须能一眼看出"这次改的是哪份文稿"。
+             回归依据：曾出现"选的是大纲、动的是第一章"且界面无从发现。 -->
+        <p v-if="proposal.targetPath" class="p-target" :title="proposal.targetPath">
+          目标文稿：<b>{{ proposal.targetTitle || proposal.target.key }}</b>
+          <span class="p-target-path">{{ proposal.targetPath }}</span>
+          <span v-if="proposal.targetChars !== undefined" class="p-target-chars">
+            原文 {{ proposal.targetChars }} 字
+          </span>
+        </p>
       </div>
       <div class="p-stats" :aria-label="`增加 ${proposal.additions} 行，删除 ${proposal.deletions} 行`">
         <span class="is-add">+{{ proposal.additions }}</span>
@@ -323,6 +336,35 @@ function lineMark(type: DiffLine['type']): string {
 .p-title-row strong {
   font-size: 13.5px;
   color: #26272b;
+}
+.p-target {
+  margin: 3px 0 0;
+  font-size: 11.5px;
+  color: #5c6470;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+}
+.p-target b {
+  color: #1d4ed8;
+  font-weight: 600;
+}
+.p-target-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  color: #8a8f99;
+  background: #f3f4f6;
+  border-radius: 4px;
+  padding: 0 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 260px;
+  white-space: nowrap;
+}
+.p-target-chars {
+  color: #9aa0aa;
+  font-size: 10.5px;
 }
 .p-status {
   font-size: 11px;

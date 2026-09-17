@@ -125,21 +125,63 @@ def _find_chapter(store: MdStore, chapter: int) -> Any | None:
 
 
 def _read_target(novel: str, target: dict) -> tuple[Any | None, str | None]:
-    """返回 (chapter_doc_or_None, settings_rel_or_None)；失败返回 (None, None)。"""
+    """返回 (chapter_doc_or_None, settings_rel_or_None)；失败返回 (None, None)。
+
+    kind 与 key 的形状**必须一致**（回归：用户报"我用改稿改大纲，改的却是第一章"）：
+      · kind=chapter  → key 必须是 ``ch-<整数>``；
+      · kind=settings → key 必须是 ``settings/**.md``。
+    不一致时返回 (None, None)，由 ``_generate`` 报 404，**绝不**"猜一个最像的目标"
+    （猜错就会把改动落到别的文稿上，且用户从 UI 看不出来）。
+    """
     store = _store_of(novel)
-    kind = target.get("kind")
-    key = str(target.get("key", ""))
+    kind = str(target.get("kind") or "").strip()
+    key = str(target.get("key") or "").strip()
     if kind == "chapter":
+        if not key.startswith("ch-"):
+            logger.warning("改稿目标形状不一致：kind=chapter 但 key=%r", key)
+            return None, None
         try:
-            chapter = int(str(key).removeprefix("ch-"))
+            chapter = int(key.removeprefix("ch-"))
         except ValueError:
             return None, None
         doc = _find_chapter(store, chapter)
         return doc, None
-    if kind == "settings" and key.startswith("settings/") and ".." not in key:
+    if kind == "settings":
+        if not (key.startswith("settings/") and key.endswith(".md")) or ".." in key:
+            logger.warning("改稿目标形状不一致：kind=settings 但 key=%r", key)
+            return None, None
         if store.exists(key):
             return None, key
+        return None, None
+    logger.warning("改稿目标 kind 非法：%r", kind)
     return None, None
+
+
+def _target_evidence(target: dict, doc: Any | None, rel: str | None,
+                     original: str) -> dict:
+    """目标"可核对证据"：提案回执与前端卡片都展示它，用户一眼能看出改的是哪份文稿。
+
+    存在的理由：改稿目标由前端 ``appStore.selection`` 决定，服务端原先**不回报**实际
+    落到哪份文稿上。一旦前端选中态与编辑器内容不同步（或 key 形状不符），
+    用户会遇到"我选的是大纲、动的却是第 1 章"且无从发现。现在把磁盘路径与字数钉在回执里。
+    """
+    if doc is not None:
+        path = f"chapters/…/{doc.doc_id}"
+        title = f"第 {doc.metadata.get('chapter')} 章 {doc.metadata.get('title', '')}".strip()
+        kind = "chapter"
+        key = f"ch-{doc.metadata.get('chapter')}"
+    else:
+        path = str(rel)
+        title = Path(str(rel)).stem
+        kind = "settings"
+        key = str(rel)
+    return {
+        "kind": kind,
+        "key": key,
+        "path": path,
+        "title": title,
+        "chars": len(original or ""),
+    }
 
 
 def _store_of(novel: str, writable: bool = False) -> MdStore:
@@ -259,7 +301,15 @@ def register_proposal_api(app: Any, hub: Any, default_novel: str) -> None:
         """按指令产出一版改稿提案（不落盘）：正文 + 行级 diff + 审校评分。"""
         doc, rel = _read_target(novel_id, target)
         if doc is None and rel is None:
-            raise HTTPException(404, "目标文档不存在")
+            kind = str(target.get("kind") or "")
+            key = str(target.get("key") or "")
+            want = ("`ch-<章号>`" if kind == "chapter" else
+                    "`settings/**.md`" if kind == "settings" else "`chapter` 或 `settings`")
+            raise HTTPException(
+                404,
+                f"改稿目标不存在或形状不符：kind={kind!r} key={key!r}（kind={kind or '?'} 时 key 必须是 {want}）。"
+                "请在右侧创作空间里**重新点选**要改的文稿后再发指令。",
+            )
 
         original = doc.content if doc is not None else _store_of(novel_id).read(rel).content
         target_title = (
@@ -312,6 +362,10 @@ def register_proposal_api(app: Any, hub: Any, default_novel: str) -> None:
             raise HTTPException(422, "智能体认为无需修改：返回内容与原文一致。")
 
         review, review_error = _review_proposal(novel_id, target_title, proposed)
+        evidence = _target_evidence(target, doc, rel, original)
+        logger.info("改稿提案目标：book=%s kind=%s key=%s path=%s chars=%d",
+                    novel_id, evidence["kind"], evidence["key"],
+                    evidence["path"], evidence["chars"])
         return {
             "id": "p-" + uuid.uuid4().hex[:10],
             "chat_id": cid,
@@ -321,6 +375,10 @@ def register_proposal_api(app: Any, hub: Any, default_novel: str) -> None:
             # 完整指令与打回意见都留档：打回重做要按原指令 + 新意见再来一版
             "instruction": instruction,
             "target": target,
+            # 目标可核对证据（面向前端展示与事后排障）
+            "targetPath": evidence["path"],
+            "targetTitle": evidence["title"],
+            "targetChars": evidence["chars"],
             "status": "pending",
             "statusMessage": "",
             "original": original,

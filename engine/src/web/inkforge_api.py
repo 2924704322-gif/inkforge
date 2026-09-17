@@ -27,19 +27,25 @@ from pydantic import BaseModel, Field
 from src.config.settings import get_settings
 from src.memory.md_store import MdStore
 from src.utils.logger import get_logger
+from src.web.actions import ACTIONS as _ACTION_REGISTRY
 from src.web.actions import (
     MAX_ACTIONS_PER_TURN,
     ActionContext,
     consume_preview,
-    execute as actions_execute,
     execute_pending,
     forget_preview,
-    manifest as actions_manifest_list,
+    is_placeholder_value,
+    normalize_args,
     normalize_op,
     read_audit,
     register_preview,
 )
-from src.web.actions import ACTIONS as _ACTION_REGISTRY
+from src.web.actions import (
+    execute as actions_execute,
+)
+from src.web.actions import (
+    manifest as actions_manifest_list,
+)
 from src.web.scope import WORKSPACE, chats_dir, is_workspace
 from src.web.scope import workspace_dir as workspace_data_dir
 
@@ -291,6 +297,39 @@ def _summary_from_results(results: list[dict]) -> str:
     return "\n".join(chunks)
 
 
+def _content_echo(reply: str, results: list[dict]) -> str:
+    """读类动作的正文"确定性回显"：模型只复述摘要、没把正文给用户时补上。
+
+    真实缺口（真机 F5 两次实测）：`learning_read` 成功、`data.content` 里就是全文，
+    但墨师只回了一句"学习仿写《ln-xxx》全文如下（共 2191 字）。"——**正文一个字没有**。
+    用户体感是"点开还是看不到内容"。这里不依赖模型自觉：凡是本次动作取回了长文本
+    （content 字段），而回复里没有**它的实质内容行**，就把正文拼在回复末尾。
+
+    判据用"内容的前几行是否出现在回复里"，而不是"前 40 字"：
+    标题行形如 `# 学习仿写：xxx`，会被"全文如下（xxx）"这种摘要句意外命中，
+    导致明明没给正文却判成已给（第一版就是这么漏的）。
+    """
+    chunks: list[str] = []
+    for r in results or []:
+        if r.get("status") != "ok":
+            continue
+        data = r.get("data")
+        if not isinstance(data, dict):
+            continue
+        content = data.get("content")
+        if not isinstance(content, str) or len(content) < 120:
+            continue
+        probes = [line.strip() for line in content.splitlines() if len(line.strip()) >= 20][:3]
+        if probes and any(p in (reply or "") for p in probes):
+            continue                    # 模型已经把正文实质内容带上了，不重复
+        label = str(data.get("title") or data.get("id") or r.get("op") or "")
+        chunks.append(f"【{label} 正文】\n{content}")
+    if not chunks:
+        return reply or ""
+    joined = "\n\n".join(chunks)
+    return f"{reply}\n\n{joined}".strip() if reply else joined
+
+
 def _action_response_text(results: list[dict]) -> str:
     """纯动作轮的确定性答复（不依赖模型二次改写，避免参数被改写走样）。"""
     if not results:
@@ -312,7 +351,9 @@ def _shrink_action_data(data: Any) -> Any:
         out = {}
         for key, value in data.items():
             if isinstance(value, str) and len(value) > 2000:
-                out[key] = value[:2000] + f"…（共 {len(value)} 字，已截断）"
+                out[key] = (value[:2000] +
+                            f"…（共 {len(value)} 字，界面只展示前 2000 字；"
+                            "需要继续看后半段请让我按段落继续读）")
             elif isinstance(value, (dict, list)):
                 out[key] = _shrink_action_data(value)
             else:
@@ -372,8 +413,12 @@ def _pending_verdict_payload(verdict: dict) -> tuple[str, list[dict], bool]:
         return (f"⚠ 已阻止执行 {op}：{verdict.get('reason', '')}。"
                 "请重新发起一次操作，我给出影响说明后再确认。"), [], False
     if kind == "executed" and result is not None:
-        text = (f"✅ 已执行 {op}：{result.summary}" if result.ok
-                else f"❌ {op} 执行失败：{result.error}")
+        if result.ok:
+            text = f"✅ 已执行 {op}：{result.summary}"
+        else:
+            # 确认后仍失败：必须让用户看清"什么都没落盘"，不能含糊成"已安排"
+            text = (f"❌ {op} 执行失败：{result.error}\n"
+                    "本次**没有写入任何数据**。请按上面的原因补充或更正参数后再说一次。")
         receipts = [{
             "op": result.op, "status": result.status, "ok": result.ok,
             "summary": result.summary, "error": result.error,
@@ -385,12 +430,83 @@ def _pending_verdict_payload(verdict: dict) -> tuple[str, list[dict], bool]:
 
 _IDENT_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,40}")
 
+#: 中文书名 → ASCII 标识的兜底前缀（书名标识必须是 ASCII，见 library.NOVEL_ID_RE）
+_NOVEL_SLUG_PREFIX = "novel"
+
+#: 从用户原话里抠"书名"的句式（书名本身可以是中文，标识另生成）
+_TITLE_PATTERNS = (
+    r"《([^》]{1,40})》",
+    r"书名\s*(?:就叫|叫做|叫|是|为|：|:)\s*[「『\"']?([^」』\"'\n，,。；;]{1,40})",
+    r"(?:写|做|开|建)(?:一)?本\s*[「『\"']?([^」』\"'\n，,。；;]{2,40}?)(?:[」』\"']|的?(?:书|小说)|，|,|$)",
+)
+
+
+def _looks_like_title(raw: str) -> bool:
+    r"""像书名吗：去语气词后含中日韩字符、或以书名号/引号包裹。
+
+    为什么要这道闸：`_TITLE_PATTERNS` 的第三条会把 `建一本叫 \`my-book\` 的书`
+    抠成"叫 `my-book`"，那是**标识**不是书名；拿它当书名会让确认卡显示错误信息。
+    因此这里先剥掉"叫/叫做/的书"这类语气与量词，剩纯 ASCII 且未被包裹 → 不算书名。
+    """
+    original = (raw or "").strip().strip("`\"' ")
+    value = original
+    for prefix in ("叫做", "叫", "名叫", "名为", "是", "为"):
+        if value.startswith(prefix):
+            value = value[len(prefix):].strip().strip("`\"' ：:》」』")
+            break
+    for suffix in ("的书", "小说", "这本书", "书"):
+        if value.endswith(suffix):
+            value = value[: -len(suffix)].strip().strip("`\"' ：:《「『»")
+            break
+    if not value:
+        return False
+    if any("\u4e00" <= ch <= "\u9fff" or "\u3040" <= ch <= "\u30ff"
+           or "\uac00" <= ch <= "\ud7af" for ch in value):
+        return True
+    # 全 ASCII：只接受"被书名号/引号包裹"的形态
+    stripped = original.strip()
+    return stripped[:1] in "《「『“" or stripped[-1:] in "》」』”"
+
+
+def _guess_title_from_user(message: str) -> str:
+    """从用户原话里抠出书名（可含中文；用于生成 ASCII 标识与确认卡展示）。"""
+    text = message or ""
+    for pat in _TITLE_PATTERNS:
+        m = re.search(pat, text)
+        if not m:
+            continue
+        raw = m.group(1)
+        if not _looks_like_title(raw):
+            continue
+        title = raw.strip().strip("`\"' ")
+        for prefix in ("叫做", "叫", "名叫", "名为"):
+            if title.startswith(prefix):
+                title = title[len(prefix):].strip().strip("`\"' ：:》」』")
+                break
+        for suffix in ("的书", "这本书", "小说"):
+            if title.endswith(suffix):
+                title = title[: -len(suffix)].strip().strip("`\"' ：:《「『»")
+                break
+        if title and not is_placeholder_value(title):
+            return title[:40]
+    return ""
+
+
+def _slug_from_title(title: str) -> str:
+    """中文/任意书名 → 可直接用作目录名的 ASCII 标识（稳定、可读、不冲突）。"""
+    ascii_part = re.sub(r"[^A-Za-z0-9]+", "-", (title or "").strip().lower()).strip("-")
+    ascii_part = ascii_part[:24].strip("-")
+    stamp = time.strftime("%y%m%d")
+    suffix = uuid.uuid4().hex[:4]
+    return f"{ascii_part}-{stamp}-{suffix}" if ascii_part else f"{_NOVEL_SLUG_PREFIX}-{stamp}-{suffix}"
+
 
 def _guess_novel_id(message: str) -> str:
     """从用户原话里猜书目标识（``书名标识就用 xxx`` / ``叫 xxx`` / 反引号包裹的 id）。
 
     只用于**建书**这一个动作的兜底：标识本来就是用户随手起的名字，
     猜测失败也没关系（会如实回执"缺少参数"），但猜中就能把整条链走通。
+    占位符（`novel_id` / `书名标识` 这类）一律不算猜中——它们永远是错的。
     """
     text = message or ""
     patterns = (
@@ -399,7 +515,7 @@ def _guess_novel_id(message: str) -> str:
     )
     for pat in patterns:
         m = re.search(pat, text)
-        if m:
+        if m and not is_placeholder_value(m.group(1)):
             return m.group(1)
     return ""
 
@@ -407,19 +523,51 @@ def _guess_novel_id(message: str) -> str:
 def _fallback_action_from_history(chat: dict, user_msg: str) -> list[dict]:
     """兜底：用户已确认但本轮没能拿到动作时，按上文尝试重建一个建书动作。
 
-    实测缺口：模型有时只在正文里说"我将按以下参数新建《X》"，既不输出动作块，
-    也不给出可解析的参数。用户回"确认"时若什么都不做，整条链就断在这里。
-    这里对**建书**（最常见的新起点操作）做确定性兜底：从用户原话取标识，
-    模式固定为 pipeline——写动作仍会走确认闸门，所以猜错也不会有副作用。
+    实测缺口两处（都在本轮修复）：
+      ① 模型只说"我将按以下参数新建《X》"、不给动作块 → 用户回"确认"时整条链断掉；
+      ② 判断只看字面量 ``book_create``，而模型写的是 ``create_book`` / ``new_book``
+         这类别名（别名表里有，但这行代码不查表）→ 兜底失效。
+    现在先把上文的动作名**过一遍别名折算**，再做判断。
     """
     recent = " ".join(str(m.get("content", ""))[:600]
                       for m in (chat.get("messages") or [])[-8:]
                       if m.get("role") == "assistant")
-    if "book_create" in recent or ("新建" in recent and "书目" in recent):
-        nid = _guess_novel_id(user_msg) or _guess_novel_id(recent)
-        if nid:
-            logger.info("用户确认但无待办：按上文兜底重建 book_create（novel_id=%s）", nid)
+    title = _guess_title_from_user(user_msg)
+    has_ascii_id = bool(_guess_novel_id(user_msg))
+    wants_create = any(
+        w in (user_msg or "") for w in ("建", "新建", "创建", "开一本", "写一本", "来一本",
+                                        "开书", "做一本", "弄一本", "起一本"))
+    # 兜底条件：① 明确的建书意图 + 给了可用的名字（中文书名或 ASCII 标识）；
+    #           ② 或虽没写"建"字，但**显式给了书名标识**（"书名标识就用 dark-crime"
+    #              本身就是建书特有的话术，用户不可能在问别的事）。
+    # 目的是既不把"建书流程怎么走？"变成建书卡，也不漏掉真机里出现过的那些写法。
+    wants_create = (wants_create and bool(title or has_ascii_id)) or has_ascii_id
+    # 把上文里出现过的动作写法折算成规范名后再判断（create_book → book_create）
+    mentioned = set()
+    for raw in re.findall(r"[A-Za-z][A-Za-z0-9_]{3,30}", recent):
+        canonical = normalize_op(raw)
+        if canonical in _ACTION_REGISTRY:
+            mentioned.add(canonical)
+    hinted = ("book_create" in mentioned
+              or ("新建" in recent and "书" in recent)
+              # ③ "再帮我建一本《雾都回响》"这类**只给中文书名、不给标识**的续写式请求，
+              #    模型有时整轮不输出动作块 → 建书动作根本没被登记（真机 E8 实测）。
+              #    此时以用户原话为第一事实源直接兜底；写动作仍走确认闸门，猜错可取消。
+              or wants_create)
+    if not hinted:
+        return []
+    # 顺序很关键：先信用户这一轮的原话，再退回上文里出现过的标识，
+    # 最后兜"中文书名 → 生成 ASCII 标识"。**占位符一律不算命中**——
+    # 否则会把提示词里的字面量 `novel_id` 建成一本真书（真实事故）。
+    for source in (user_msg, recent):
+        nid = _guess_novel_id(source) or _guess_arg_from_user("novel_id", source)
+        if nid and not is_placeholder_value(nid):
+            logger.info("用户原话/上文可确定书名标识：兜底重建 book_create（novel_id=%s）", nid)
             return [{"op": "book_create", "args": {"novel_id": nid, "mode": "pipeline"}}]
+    if title:
+        nid = _slug_from_title(title)
+        logger.info("用户只给了中文书名《%s》：兜底生成 ASCII 标识 %s 并登记建书", title, nid)
+        return [{"op": "book_create", "args": {"novel_id": nid, "mode": "pipeline"}}]
     return []
 
 
@@ -525,36 +673,61 @@ _ARG_VALUE_PATTERNS: dict[str, tuple[str, ...]] = {
 
 
 def _guess_arg_from_user(key: str, message: str) -> str:
-    """从用户原话里猜一个参数取值（目前只做 novel_id，建书最常见）。"""
+    r"""从用户原话里猜一个参数取值（目前只做 novel_id，建书最常见）。
+
+    真实缺口（真机 G1 实测）：用户写"书名**标识**就用 dark-crime"时，
+    旧正则把分隔符组写成可选（`\s*`），于是 `书名标识` 之后**没吃空格**就要求 `就用`，
+    整条匹配失败 → 拿不到标识 → 兜底登记不了建书动作。这里把分隔符组改成
+    "非空分隔符 + 可选空白"，并补两条更宽松的写法（`book id：x` / 全角括号包裹）。
+    """
     text = message or ""
     if key != "novel_id":
         return ""
-    m = re.search(
-        r"(?:书名标识|标识|novel_id|book_id|id)\s*(?:就用|用|是|为|叫|就叫|：|:)?\s*[`\"']?"
+    patterns = (
+        # 书名标识 / 标识 / novel_id / book id ... ：（分隔符可有可无，出现时必须吃到空白）
+        # 注意：多词变体排在前面（`book id` 在 `book` 之前），否则 `book id：x` 会先命中
+        # `book` 并把值抠成 "id"。
+        r"(?:书名标识|书目标识|novel_id|book_id|book\s*id|book\s*key|标识)\s*"
+        r"(?:[（(<\[][^）)\]>]{0,12}[）)\]>]\s*)?"      # 允许 `标识（book id）` 这类括注
+        r"(?:(?:就用|用|是|为|叫|就叫|设为|填|取名|：|:|＝|=|（|\()\s*)?[`\"']?"
         r"([A-Za-z][A-Za-z0-9_-]{2,40})",
-        text,
+        r"[`\"']([A-Za-z][A-Za-z0-9_-]{3,40})[`\"']",
     )
-    if m:
-        return m.group(1)
-    m = re.search(r"[`\"']([A-Za-z][A-Za-z0-9_-]{3,40})[`\"']", text)
-    return m.group(1) if m else ""
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if not m:
+            continue
+        value = m.group(1)
+        # "book id" 这类词被拆开后可能只剩下通用词，那不是标识
+        if is_placeholder_value(value) or value.strip().lower() in {
+                "book", "novel", "id", "key", "name", "title", "the", "and"}:
+            continue
+        return value
+    # 只给了中文书名（"帮我建一本《雨夜委托》"）→ 中文不能直接做标识，
+    # 生成 ASCII 标识，书名归书名。确认卡上会把两者都写清楚。
+    title = _guess_title_from_user(text)
+    return _slug_from_title(title) if title else ""
 
 
 def _backfill_from_user_message(actions: list[dict], user_msg: str) -> list[dict]:
     """补齐模型漏掉的必填参数（值从用户原话里取）。
 
-    实测：用户已经说"标识就用 xx"，模型仍会漏 ``novel_id``（或写成 title），
-    结果动作直接失败、用户点了确认却什么都没发生。这里做一层确定性补齐。
+    实测：用户已经说"标识就用 xx"，模型仍会漏 ``novel_id``（或写成 title/book_key/id），
+    结果动作直接失败、用户点了确认却什么都没发生。这里做一层确定性补齐，顺序：
+      ① 参数名折算已由 ``normalize_args`` 负责（book_key/id/title → novel_id）；
+      ② 这里负责**把空值填上**，来源是用户原话（含中文书名 → 生成 ASCII 标识）。
     """
     for item in actions:
         op = normalize_op(str(item.get("op") or ""))
         item["op"] = op
-        args = dict(item.get("args") or {})
-        if op == "book_create" and not str(args.get("novel_id") or "").strip():
-            guess = _guess_arg_from_user("novel_id", user_msg) or _guess_novel_id(user_msg)
-            if guess:
-                args["novel_id"] = guess
-                logger.info("规划结果漏了 novel_id，已从用户原话补齐：%s", guess)
+        args = normalize_args(op, item.get("args") or {})
+        if op == "book_create":
+            nid = str(args.get("novel_id") or "").strip()
+            if not nid or is_placeholder_value(nid):
+                guess = _guess_arg_from_user("novel_id", user_msg) or _guess_novel_id(user_msg)
+                if guess:
+                    args["novel_id"] = guess
+                    logger.info("规划结果缺少可用 novel_id，已从用户原话补齐：%s", guess)
         item["args"] = args
     return actions
 
@@ -620,7 +793,8 @@ def _decide_pending_action(chat: dict, message: str, ctx) -> dict | None:
         chat.pop(_ACTIONS_PENDING_KEY, None)
         return {"kind": "executed", "pending": pending, "result": result}
     if decision == "cancel":
-        forget_preview(ctx, str(pending.get("op") or ""))
+        forget_preview(ctx, str(pending.get("op") or ""),
+                       pending.get("args") if isinstance(pending.get("args"), dict) else None)
         chat.pop(_ACTIONS_PENDING_KEY, None)
         return {"kind": "cancelled", "pending": pending, "result": None}
     return None
@@ -1345,14 +1519,21 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
 
     # ══════════ 墨师动作（P2/P3）：确认 → 执行 → 审计 ══════════
 
-    def _action_ctx(scope_value: str, book: str) -> ActionContext:
-        return ActionContext(
+    def _action_ctx(scope_value: str, book: str, *, user_msg: str = "",
+                    title_hint: str = "") -> ActionContext:
+        ctx = ActionContext(
             hub=hub,
             default_novel=default_novel,
             active_novel=_active_novel,
             session_key=scope_value or default_novel,
             book=book,
         )
+        # 交付给动作层的"用户原话"侧信息（不进 args、不影响预览键）：
+        #   · title_hint：建书确认卡上展示的中文书名（从用户原话抠出来的）
+        #   · user_msg：确定性兜底用（模型漏参数时从原话补）
+        ctx.extra["title_hint"] = title_hint or (_guess_title_from_user(user_msg) if user_msg else "")
+        ctx.extra["user_msg"] = user_msg
+        return ctx
 
     def _actions_prompt(scope_value: str, book: str) -> str:
         """动作协议提示块（含当前书目，供墨师解析"这本书"）。"""
@@ -1360,13 +1541,15 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
         return f"{_ACTION_PROMPT_HEAD}\n\n当前上下文：{where}"
 
     def _run_actions(scope_value: str, book: str, actions: list[dict],
-                     *, confirmed: bool, dry_run: bool = False) -> list[dict]:
+                     *, confirmed: bool, dry_run: bool = False,
+                     user_msg: str = "") -> list[dict]:
         """执行墨师给出的动作清单。
 
         · dry_run=True（默认）：写动作只登记待确认，不落盘；
         · dry_run=False + confirmed=True：用户已确认，写动作直接执行。
+        · user_msg：用户原话（确定性兜底 + 建书确认卡展示中文书名用）。
         """
-        ctx = _action_ctx(scope_value, book)
+        ctx = _action_ctx(scope_value, book, user_msg=user_msg)
         out: list[dict] = []
         for item in actions[:MAX_ACTIONS_PER_TURN]:
             if not isinstance(item, dict):
@@ -1450,23 +1633,47 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
             if not actions:
                 return clean, []
 
+            # 统一规范化一次：参数名折算（book_key/id/title → novel_id）、枚举折算、
+            # 占位符过滤都会在此落地，后续"补建书标识/登记预览/执行"用的都是这一份。
+            actions = [{"op": normalize_op(str(a.get("op") or "")),
+                        "args": normalize_args(normalize_op(str(a.get("op") or "")),
+                                               a.get("args") or {})}
+                       for a in actions if isinstance(a, dict)]
+            actions = _backfill_from_user_message(actions, user_msg)
+
+            # 中文书名 → 自动生成 ASCII 标识（用户只说了《…》没给标识时的唯一出路）
+            for item in actions:
+                if item["op"] != "book_create":
+                    continue
+                if not str(item["args"].get("novel_id") or "").strip():
+                    title = _guess_title_from_user(user_msg)
+                    if title:
+                        item["args"]["novel_id"] = _slug_from_title(title)
+                        logger.info("用户只给了中文书名，已生成 ASCII 标识：%s（书名：%s）",
+                                    item["args"]["novel_id"], title)
+
             # 规划结果若"缺必填参数"而确定性兜底能给全（典型：模型只给模式、忘了 novel_id），
             # 用兜底版本替换——否则用户点了"确认"却只收到一条失败回执（实测反复踩到）。
+            # 判据只看"关键必填参数是否为空"，不再比键集合：折算后的 args 键集已规范化，
+            # 比集合会把"模型给了 mode、兜底也能给 mode"误判成缺参数。
             fallback = _fallback_action_from_history(chat, user_msg)
             for cand in fallback:
                 same = [a for a in actions
                         if isinstance(a, dict) and a.get("op") == cand["op"]]
                 if not same:
                     continue
-                cur = {k: v for k, v in (same[0].get("args") or {}).items() if v not in (None, "")}
-                need = {k: v for k, v in (cand.get("args") or {}).items()}
-                if set(need) > set(cur):
-                    logger.info("规划结果缺参数，改用确定性兜底：%s", cand)
-                    actions = [cand if a is same[0] else a for a in actions]
+                merged = dict(same[0].get("args") or {})
+                for k, v in (cand.get("args") or {}).items():
+                    if not str(merged.get(k) or "").strip():
+                        merged[k] = v
+                if merged != (same[0].get("args") or {}):
+                    logger.info("规划结果缺必填参数，已用确定性兜底值补齐：%s", merged)
+                    actions = [{**a, "args": merged} if a is same[0] else a for a in actions]
 
         # 用户刚确认过的回合：直接执行（不再登记待确认），否则用户点了确认却看到新卡。
         results = _run_actions(scope_value, book, actions,
-                               confirmed=confirmed_round, dry_run=not confirmed_round)
+                               confirmed=confirmed_round, dry_run=not confirmed_round,
+                               user_msg=user_msg)
         if confirmed_round and results:
             chat.pop(_ACTIONS_PENDING_KEY, None)
             return (_action_response_text(results) or clean), results
@@ -1492,6 +1699,16 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
             confirmed_round, [r["status"] for r in results], (pending or {}).get("op"),
         )
 
+        # 全失败轮：把"什么都没做成"钉死在回复里（不依赖模型自觉）。
+        # 实测缺口：模型会在正文里把失败写成"已安排/我来帮你建"，用户以为成了却没结果——
+        # 这里给一条确定性前缀，模型怎么改写都盖不掉。
+        all_failed = bool(results) and all(r["status"] == "failed" for r in results)
+        if all_failed:
+            fails = "；".join(f"{r['op']}：{r.get('error', '')}" for r in results)
+            warning = f"⚠ 本轮操作没有执行成功：{fails}"
+            clean = f"{clean}\n\n{warning}".strip() if clean else warning
+            return clean, results
+
         # 纯"待确认"轮：把确定性的影响说明固定附在回复末尾（不依赖模型改写它）。
         # 理由：这条消息会被反复读取（确认前后都在），内容必须稳定，
         # 否则前端确认卡看起来像挂在另一条消息上（用户会以为按钮没生效）。
@@ -1501,6 +1718,10 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
             if notice and notice not in (clean or ""):
                 clean = (f"{clean}\n\n{notice}").strip() if clean else notice
             return clean, results
+
+        # 读类动作取回的长文本必须真的到用户眼前（模型只复述摘要时补上确定性回显）
+        if any(r["status"] == "ok" for r in results):
+            clean = _content_echo(clean, results)
 
         # 结果回灌：让墨师用自然语言汇总（并在纯动作轮里给出可读答复）
         summarize = [
@@ -1558,26 +1779,32 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
         """直接执行一个动作（前端"确认"按钮走这里）。
 
         写动作必须带 ``confirm=true``——与对话确认语义一致；只读动作不走本通道。
+
+        参数一律先过 ``normalize_args``：预览登记的 args 与确认时比对的 args 必须是
+        **同一份规范化结果**，否则"模型写 mode=free、系统折算 pipeline"这类折算会让
+        两边不相等而拒绝确认（预览键由规范化参数派生，见 actions._preview_key）。
         """
         scope_value, book = _resolve_scope(novel)
-        op = body.op.strip()
+        op = normalize_op(body.op.strip())
         if not actions_is_write(op):
             raise HTTPException(400, f"动作 {op} 不是写动作，请走只读通道/对话")
+        args = normalize_args(op, body.args)
+        ctx = _action_ctx(scope_value, book)
         if not body.confirm:
-            result = actions_execute(op, body.args, ctx=_action_ctx(scope_value, book),
-                                     execute_write=False)
-            pending = register_preview(_action_ctx(scope_value, book), op, body.args,
-                                       result.summary)
-            return JSONResponse({"ok": True, "status": "pending_confirm", "pending": pending})
+            result = actions_execute(op, args, ctx=ctx, execute_write=False)
+            # 失败也照样登记预览：用户必须始终能看到"要做什么/为什么没成"的卡片，
+            # 而不是只刷新出一句报错（实测：失败回执不发卡，用户以为按钮坏了）。
+            pending = register_preview(ctx, op, args,
+                                       result.summary or result.error or "")
+            return JSONResponse({"ok": True, "status": "pending_confirm", "pending": pending,
+                                 "preview_status": result.status, "preview_error": result.error})
         # 确认必须对应一次真实预览（防"口头声称确认"直接落盘）
-        refusal = consume_preview(_action_ctx(scope_value, book),
-                                  {"op": op, "args": body.args, "token": body.token})
+        refusal = consume_preview(ctx, {"op": op, "args": args, "token": body.token})
         if refusal:
             raise HTTPException(409, refusal)
-        result = actions_execute(op, body.args, ctx=_action_ctx(scope_value, book),
-                                 execute_write=True)
+        result = actions_execute(op, args, ctx=ctx, execute_write=True)
         if result.ok and op == "book_select":
-            set_active_novel(str(body.args.get("novel_id") or ""))
+            set_active_novel(str(args.get("novel_id") or ""))
         return JSONResponse({
             "ok": result.ok,
             "status": result.status,
@@ -1626,7 +1853,8 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
         chat = _load_chat(scope_value, cid)
         pending = chat.pop(_ACTIONS_PENDING_KEY, None)
         if pending:
-            forget_preview(_action_ctx(scope_value, book), str(pending.get("op") or ""))
+            forget_preview(_action_ctx(scope_value, book), str(pending.get("op") or ""),
+                           pending.get("args") if isinstance(pending.get("args"), dict) else None)
         _save_chat(scope_value, chat)
         return JSONResponse({"ok": True, "cancelled": bool(pending)})
 

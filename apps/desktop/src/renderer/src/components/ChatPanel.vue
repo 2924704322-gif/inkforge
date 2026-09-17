@@ -3,7 +3,7 @@ import { computed, nextTick, onErrorCaptured, onMounted, onUnmounted, ref, watch
 
 import { api, withNovel } from '../api'
 import { useMessage } from 'naive-ui'
-import { appStore, inWorkspace, openWorkspace, scopeParam } from '../store'
+import { appStore, inWorkspace, openBook, openWorkspace, scopeParam } from '../store'
 import {
   type ActionReceipt,
   type ChatData,
@@ -158,7 +158,7 @@ const proposeTargetLabel = computed(() => {
   return sel.title
 })
 
-async function loadChats(): Promise<void> {
+async function loadChats(opts: { autoResume?: boolean } = {}): Promise<void> {
   // 工作区也允许对话（墨师全域）：无书时用哨兵值取工作区会话列表。
   try {
     const res = await api<{ chats: ChatSummary[] }>(
@@ -168,8 +168,10 @@ async function loadChats(): Promise<void> {
     const wantScope = inWorkspace() ? 'workspace' : 'book'
     const filtered = res.chats.filter((c) => (c.scope ?? 'book') === wantScope)
     chats.value = filtered
-    // 自动恢复最近会话（仅当前没有任何会话时；不打断进行中的对话）
-    if (!appStore.chatId && filtered.length > 0) {
+    // 自动恢复最近会话（仅当前没有任何会话时；不打断进行中的对话）。
+    // 「回到主对话」会显式关掉它（autoResume=false）——否则刚开的新会话又被旧会话顶掉，
+    // 用户会看到"点回主对话，旧上下文还在"。
+    if ((opts.autoResume ?? true) && !appStore.chatId && filtered.length > 0) {
       await openChat(filtered[0]!.id)
     }
   } catch {
@@ -275,6 +277,12 @@ async function send(text?: string): Promise<void> {
   }
   if (proposeMode.value && !proposeTarget.value) {
     message.warning('改稿模式需要在右侧打开一篇文档作为目标')
+    return
+  }
+  // 目标自查：选中态与右侧**实际加载**的正文必须一致。
+  // 否则改稿会把指令落到用户没在看的文稿上（曾出现"选的是大纲、动的是第一章"）。
+  if (proposeMode.value && !appStore.docAligned) {
+    message.warning('右侧正文还没跟上你选中的文档：请在创作空间里重新点一次要改的文稿，再发指令')
     return
   }
   if (!appStore.chatId) await newChat()
@@ -591,6 +599,34 @@ onMounted(() => {
   }, 2500)
 })
 
+/**
+ * 「回到主对话」：开一个全新的空白工作区会话。
+ *
+ * 为什么要一个显式信号（而不是复用 chatId=''）：`loadChats()` 会自动恢复最近的会话，
+ * 于是"切回工作区"实际上会被旧会话顶掉，用户看到的是——
+ * 想跟墨师说句不隶属任何书的话，结果又被书内上下文淹了。
+ * 旧会话**不删**：仍在「历史对话」面板中，点一下即可继续。
+ */
+watch(
+  () => appStore.chatResetToken,
+  async (token) => {
+    if (!token) return
+    const previous = appStore.lastMainChatId || appStore.chatId
+    messages.value = []
+    proposals.value = []
+    lastActions.value = []
+    pendingAction.value = null
+    appStore.chatId = ''
+    await newChat()
+    await loadChats({ autoResume: false })
+    if (previous) {
+      message.info('已回到主对话（工作区）。上一段对话在「🕘 历史对话」里，点开即可继续。')
+    } else {
+      message.success('已回到主对话（工作区）：这里的指令不隶属任何一本书。')
+    }
+  },
+)
+
 onUnmounted(() => {
   document.removeEventListener('mousedown', onDocClick)
   if (timer) clearInterval(timer)
@@ -610,6 +646,15 @@ onUnmounted(() => {
         <span v-if="inWorkspace()" class="chip workspace" title="未打开作品：墨师在全域工作台上工作，可建书/取资料/开写">
           🧭 工作区
         </span>
+        <!-- 工作区的对称入口：一句话切回最近打开的书（否则切到工作区后只能靠书架找回） -->
+        <button
+          v-if="inWorkspace() && appStore.lastBookId"
+          class="ghost-btn back-to-book"
+          title="回到你上一次打开的作品"
+          @click="openBook(appStore.lastBookId, appStore.lastBookTitle)"
+        >
+          ↩ 回到《{{ appStore.lastBookTitle || appStore.lastBookId }}》
+        </button>
         <span v-if="appStore.bookTitle" class="muted ctx-label">
           主上下文：{{ proposeTargetLabel === '未选择' ? appStore.bookTitle : proposeTargetLabel }}
         </span>

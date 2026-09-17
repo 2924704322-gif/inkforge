@@ -22,9 +22,10 @@ import hashlib
 import json
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import frontmatter
 
@@ -155,6 +156,38 @@ def read_audit(limit: int = 100) -> list[dict]:
             continue
     out.reverse()
     return out
+
+
+# ---------- 占位符哨兵（实测：模型会把提示词里的参数名当取值填进来） ----------
+# 由来（真实事故）：提示词里写 `book_create {novel_id, mode}`，模型直接把字面量
+# `novel_id` 当成书名标识提交，于是书架里真的多出一本叫 `novel_id` 的书。
+# 这类值**永远是错的**，必须在参数层拦掉：当作"没填"，走补齐/反问，绝不落盘。
+
+_PLACEHOLDER_VALUES = frozenset({
+    "novel_id", "book_id", "book_key", "novel", "id", "name", "title", "xxx", "xxxx",
+    "string", "value", "example", "示例", "书名", "书名标识", "书目标识", "标识",
+    "待定", "未知", "无", "none", "null", "n/a", "na", "tbd", "placeholder",
+    "<书名>", "<novel_id>", "{{novel_id}}", "${novel_id}",
+})
+
+
+def is_placeholder_value(value: Any) -> bool:
+    """该取值是否是"提示词占位符"而不是用户真实意图（大小写/尖括号/引号不敏感）。"""
+    text = str(value or "").strip().strip("<>[]{}`\"'“”‘’").strip().lower()
+    if not text:
+        return False
+    if text in _PLACEHOLDER_VALUES:
+        return True
+    # `novel-id` / `novel id` / `bookid` 这类变体一并按占位符处理
+    squeezed = re.sub(r"[\s_\-]+", "", text)
+    return squeezed in {"novelid", "bookid", "bookkey", "bookname", "booktitle"}
+
+
+def clean_arg_value(value: Any) -> Any:
+    """过滤占位符：命中占位符的取值一律折算为空串（= 没填）。"""
+    if isinstance(value, str) and is_placeholder_value(value):
+        return ""
+    return value
 
 
 # ---------- 参数工具 ----------
@@ -414,6 +447,17 @@ def _h_search_workspace(ctx: ActionContext, args: dict) -> ActionExec:
     return ActionExec("search_workspace", True, "ok", summary, {"keyword": keyword, "hits": hits})
 
 
+def _h_material_read(ctx: ActionContext, args: dict) -> ActionExec:
+    """读素材正文：list 只能给标题，用户问"某条素材讲了什么"必须能取到内容。"""
+    root = library.novels_root().parent / "materials"
+    mid, post = _read_by_id_or_title(root, _arg_str(args, "id"), _MATERIAL_ID_RE,
+                                     "素材", "mt-5e9d9fe7")
+    return ActionExec("material_read", True, "ok",
+                      f"素材《{post.metadata.get('title', mid)}》正文如下（编号 {mid}）。",
+                      {"id": mid, "title": str(post.metadata.get("title") or mid),
+                       "content": post.content})
+
+
 def _h_material_list(ctx: ActionContext, args: dict) -> ActionExec:
     d = library.novels_root().parent / "materials"
     items = []
@@ -421,25 +465,64 @@ def _h_material_list(ctx: ActionContext, args: dict) -> ActionExec:
         for path in sorted(d.glob("*.md")):
             post = frontmatter.load(str(path))
             items.append({"id": path.stem, "title": str(post.metadata.get("title") or path.stem)})
-    return ActionExec("material_list", True, "ok",
-                      f"素材库 {len(items)} 条：" +
-                      ("、".join(i["title"] for i in items) or "（空）"),
-                      {"materials": items})
+    if items:
+        lines = [f"- 第 {i + 1} 条：{it['title']}（编号 {it['id']}）"
+                 for i, it in enumerate(items)]
+        summary = f"素材库 {len(items)} 条：\n" + "\n".join(lines) + "\n（读正文用 material_read，id 填「编号」）"
+    else:
+        summary = "素材库为空。"
+    return ActionExec("material_list", True, "ok", summary, {"materials": items})
 
 
-def _h_material_read(ctx: ActionContext, args: dict) -> ActionExec:
-    """读素材正文：list 只能给标题，用户问"某条素材讲了什么"必须能取到内容。"""
-    mid = _arg_str(args, "id")
-    if not re.match(r"^mt-[a-f0-9]{8}$", mid):
-        raise ActionError(f"非法素材 ID：{mid!r}", status=400)
-    path = library.novels_root().parent / "materials" / f"{mid}.md"
-    if not path.exists():
-        raise ActionError(f"素材不存在：{mid}", status=404)
-    post = frontmatter.load(str(path))
-    return ActionExec("material_read", True, "ok",
-                      f"素材《{post.metadata.get('title', mid)}》正文如下。",
-                      {"id": mid, "title": str(post.metadata.get("title") or mid),
-                       "content": post.content})
+#: 读取类动作的 ID 正则（宽松：大小写不敏感；模型常写成 LN-XXXX 或带引号/空格）
+_LEARNING_ID_RE = re.compile(r"^(ln-[a-f0-9]{4,32})$", re.IGNORECASE)
+_MATERIAL_ID_RE = re.compile(r"^(mt-[a-f0-9]{4,32})$", re.IGNORECASE)
+
+
+def _normalize_id(raw: str) -> str:
+    """ID 容错：去掉包裹的引号/反引号/书名号与首尾空白（模型爱加这些）。"""
+    return (raw or "").strip().strip("`\"'“”‘’《》<>[]（）()").strip()
+
+
+def _read_by_id_or_title(root: Path, raw: str, pattern: re.Pattern[str],
+                         kind: str, id_example: str) -> tuple[str, Any]:
+    """按 ID 读一条 MD；ID 不认识时**按标题唯一命中**再兜一次。
+
+    实测缺口：用户说"看第 1 条的内容"时，模型常把列表里的**标题**当 ID 传过来，
+    于是「非法学习成果 ID」直接失败——用户看到的是"点开就报错"。
+    这里允许按 frontmatter title 精确匹配，**只在唯一命中时**放行（有歧义就报错，
+    不猜）。返回 (命中的 id, frontmatter post)。
+    """
+    value = _normalize_id(raw)
+    if not value:
+        raise ActionError(f"缺少参数 id（{kind}的编号）")
+    if pattern.match(value):
+        path = root / f"{value.lower()}.md"
+        if not path.exists():
+            # 大小写不敏感兜底：目录里可能是原始大小写
+            cands = [p for p in root.glob("*.md") if p.stem.lower() == value.lower()]
+            if not cands:
+                raise ActionError(f"{kind}不存在：{value}", status=404)
+            path = cands[0]
+        return path.stem, frontmatter.load(str(path))
+    # 按标题唯一命中
+    if root.exists():
+        hits = []
+        for path in root.glob("*.md"):
+            try:
+                post = frontmatter.load(str(path))
+            except Exception:  # noqa: BLE001 - 损坏文件跳过
+                continue
+            title = str(post.metadata.get("title") or path.stem)
+            if value == title or value == path.stem:
+                hits.append((path.stem, post))
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            raise ActionError(f"「{value}」匹配到多条{kind}，请用编号指定：" +
+                              "、".join(h[0] for h in hits[:5]), status=400)
+    raise ActionError(f"非法{kind} ID：{raw!r}（列表里的编号形如 {id_example}）；"
+                      "请用列表回执里给出的编号", status=400)
 
 
 def _h_learning_list(ctx: ActionContext, args: dict) -> ActionExec:
@@ -447,6 +530,7 @@ def _h_learning_list(ctx: ActionContext, args: dict) -> ActionExec:
 
     实测缺口：用户问"找出学习仿写里的历史内容"，墨师手上没有这个动作，
     只能回答"我查不到"——功能端点是有的（GET /api/learning），但没进动作清单。
+    回执里**必须带上"点开就用这个编号"的用法**，否则会出现"能列编号、点开失败"。
     """
     d = library.novels_root().parent / "learning"
     items: list[dict] = []
@@ -461,22 +545,25 @@ def _h_learning_list(ctx: ActionContext, args: dict) -> ActionExec:
                 "title": str(post.metadata.get("title") or path.stem),
                 "created": path.stat().st_mtime,
             })
-    summary = (f"学习仿写历史 {len(items)} 条：" +
-               "；".join(f"{i['title']}（{i['id']}）" for i in items)) if items \
-        else "学习仿写历史为空：还没有做过样本分析（可在「学习仿写」页粘贴样本生成）。"
-    return ActionExec("learning_list", True, "ok", summary, {"items": items})
+    if items:
+        lines = [f"- 第 {i + 1} 条：{it['title']}（编号 {it['id']}）"
+                 for i, it in enumerate(items)]
+        hint = (f"共 {len(items)} 条：\n" + "\n".join(lines) +
+                "\n（要看全文，用 learning_read 并把「编号」原样填进 id；"
+                "不要说改成 learning_get / learn_list 这类名字）")
+        return ActionExec("learning_list", True, "ok", hint, {"items": items})
+    return ActionExec("learning_list", True, "ok",
+                      "学习仿写历史为空：还没有做过样本分析（可在「学习仿写」页粘贴样本生成）。",
+                      {"items": []})
 
 
 def _h_learning_read(ctx: ActionContext, args: dict) -> ActionExec:
-    lid = _arg_str(args, "id")
-    if not re.match(r"^ln-[a-f0-9]{8}$", lid):
-        raise ActionError(f"非法学习成果 ID：{lid!r}", status=400)
-    path = library.novels_root().parent / "learning" / f"{lid}.md"
-    if not path.exists():
-        raise ActionError(f"学习成果不存在：{lid}", status=404)
-    post = frontmatter.load(str(path))
+    root = library.novels_root().parent / "learning"
+    lid, post = _read_by_id_or_title(root, _arg_str(args, "id"), _LEARNING_ID_RE,
+                                     "学习成果", "ln-8d30a9d7")
     return ActionExec("learning_read", True, "ok",
-                      f"学习仿写《{post.metadata.get('title', lid)}》全文如下。",
+                      f"学习仿写《{post.metadata.get('title', lid)}》全文如下"
+                      f"（编号 {lid}，共 {len(post.content)} 字）。",
                       {"id": lid, "title": str(post.metadata.get("title") or lid),
                        "content": post.content})
 
@@ -518,33 +605,86 @@ def _h_model_config(ctx: ActionContext, args: dict) -> ActionExec:
 
 # ---------- 写动作（一律先确认） ----------
 
+#: 模型把"创作模式"写成别的词时的折算表（命中即折算，不再失败）。
+#: 全部来自真实调用实测：`free` / `自由创作` / `长篇` / `互动模式` / `剧情卡` …
+#: 分两类：互动类 → interactive；其余（体裁/篇幅/产出形态描述）→ pipeline。
+_MODE_INTERACTIVE_WORDS = ("interactive", "互动", "剧情卡", "逐章", "卡片", "选卡", "分支")
+_MODE_PIPELINE_WORDS = (
+    "pipeline", "free", "流水", "大纲", "自由", "默认", "default", "auto",
+    # 体裁/篇幅/产出形态：用户说"长篇/网文/连载"，模型就把这个当成 mode 传了过来
+    "长篇", "短篇", "中篇", "微篇", "小说", "网文", "连载", "系列", "全书", "成书",
+    "novel", "series", "serial", "book", "长文", "标准",
+)
+
+
 def _normalize_mode(raw: str) -> str:
     """把模型写出的创作模式折算到规范值（pipeline / interactive）。
 
-    实测模型会自造 "free"、"自由创作"、"互动模式" 这类说法；它们语义明确，
-    直接失败让用户白等一轮没有意义，因此在**动作层**统一折算（与 op 别名同类）。
+    实测模型会自造各种说法；它们语义明确，直接失败让用户白等一轮没有意义，
+    因此在**动作层**统一折算（与 op 别名同类）。
+
+    真实事故（本批次真机复现）：用户说"建一本**长篇**"，模型把 `mode` 写成 `"长篇"`，
+    折算表没覆盖 → 确认卡带着"未知创作模式"出卡 → 用户点确认 → **什么都没落盘**。
+    因此这里的原则是：**宁可按默认的 pipeline 走，也不让建书卡在措辞上**；
+    真的判不出来时返回 pipeline 并记一条日志（用户的兜底永远是"确认卡 + 可改"）。
     """
     value = (raw or "").strip().lower()
     if value in library.CREATION_MODES:
         return value
-    if any(k in value for k in ("interactive", "互动", "剧情卡", "逐章")):
+    if any(k in value for k in _MODE_INTERACTIVE_WORDS):
         return "interactive"
-    if value in ("", "pipeline", "free", "自由", "自由创作", "流水线", "大纲", "默认"):
+    if any(k in value for k in _MODE_PIPELINE_WORDS):
         return "pipeline"
-    if any(k in value for k in ("自由", "流水", "大纲", "pipeline")):
-        return "pipeline"
-    return value
+    if value:
+        logger.info("创作模式取值无法判定（%r）→ 按默认 pipeline 处理，用户可在确认卡上纠正", raw)
+    return "pipeline"
 
 
 def _preview_book_create(ctx: ActionContext, args: dict) -> str:
-    nid = library.validate_novel_id(_arg_str(args, "novel_id"))
+    """建书预览：**必须把"目录标识"和"书名"分开写清楚**。
+
+    为什么强调：书名标识是 ASCII（决定 `data/novels/<id>/` 目录名），而用户想的是中文书名。
+    实测用户看到"将新建书目 novel-260917-a1f3"会以为书名被改坏了；
+    因此影响说明里同时给出两个字段，并说明书名可以后改。
+
+    书名来源（`ctx.extra["title_hint"]`）：由墨师网关从**用户原话**里抠出来（`《…》`/"就叫…"），
+    不经模型转述——模型转述过一层就会丢。书名本身不参与目录命名，所以它**不是**动作参数，
+    不会进入预览键（预览键只由 novel_id/mode 决定）。
+    """
+    raw_nid = _arg_str(args, "novel_id", required=False)
+    if is_placeholder_value(raw_nid) or not str(raw_nid).strip():
+        # ① 占位符（模型把参数名当取值，如 novel_id / <书名>）在参数层已被折算成空串；
+        # ② 真空值由 _backfill 兜底链负责补，到这一步说明兜底也没辙。
+        # 两种情况给同一条**可执行**的提示，而不是一句"缺少参数"。
+        raise ActionError(
+            "没有拿到可用的书名标识：请给一个真实的 ASCII 标识（如 my-book），"
+            "或直接说中文书名（我会自动生成 ASCII 标识）"
+        )
+    nid = library.validate_novel_id(raw_nid)
     mode = _normalize_mode(_arg_str(args, "mode", required=False, default="pipeline"))
     if mode not in library.CREATION_MODES:
         raise ActionError(f"未知创作模式：{mode!r}（pipeline / interactive）")
     if library.book_exists(nid):
-        raise ActionError(f"书 {nid} 已存在", status=409)
+        raise ActionError(f"书 {nid} 已存在（若要另建一本，请给一个不同的书名标识）", status=409)
     label = "自由创作（大纲→章节流水线）" if mode == "pipeline" else "互动创作（剧情卡逐章推进）"
-    return f"将新建书目 {nid}，创作模式：{label}；会创建 data/novels/{nid}/ 目录骨架。"
+    mode_raw = str((ctx.extra or {}).get("mode_raw") or args.get("mode_raw") or "").strip()
+    title_hint = str((ctx.extra or {}).get("title_hint") or "").strip()
+    lines = [
+        "将新建书目：",
+        f"  · 书名标识（目录名，ASCII）：`{nid}`",
+    ]
+    if title_hint:
+        lines.append(f"  · 书名：《{title_hint}》（中文书名不进目录名；生成大纲时用它作为作品名）")
+    mode_line = f"  · 创作模式：{label}"
+    if mode_raw:
+        # 模型原话与规范化结果不一致时如实并列：用户能当场发现"它把长篇理解错了"
+        mode_line += f"（我按你的说法「{mode_raw}」折算成 {mode}）"
+    lines.append(mode_line)
+    lines += [
+        f"  · 会创建 `data/novels/{nid}/` 目录骨架（chapters/settings/summaries/reviews）",
+        "确认后才会落盘；书名与标识后续都可以改。",
+    ]
+    return "\n".join(lines)
 
 
 def _run_book_create(ctx: ActionContext, args: dict) -> ActionExec:
@@ -856,13 +996,39 @@ def _register(op: str, scope: str, desc: str, args: tuple[str, ...],
 
 def _split(op: str, preview: Callable[..., str], run: Callable[..., ActionExec],
            scope: str, desc: str, args: tuple[str, ...]) -> None:
-    """写动作注册：执行器指向 _preview_*，真正执行时按 op 查 _RUN 表。"""
+    """写动作注册：执行器指向 _preview_*，真正执行时按 op 查 _RUN 表。
+
+    预览期异常**不再直接判 failed**：实测（master-live-final6 / 用户实测）里，
+    写动作缺参数时返回 `status=failed`，于是**根本不会登记待确认动作**，
+    用户既看不到确认卡也没有可点的按钮，只得到一句报错——"点了没反应"的直接来源。
+    现在统一转成 `pending_confirm` + 影响说明（含失败原因），让闸门始终可见：
+    参数补齐后确认才真正执行，没补齐则确认时如实报失败原因。
+    """
 
     def handler(ctx: ActionContext, a: dict, *, execute: bool = False):
         if execute:
             return run(ctx, a)
-        return ActionExec(op, True, "pending_confirm", preview(ctx, a),
-                          pending={"op": op, "args": a, "impact": preview(ctx, a)})
+        error = ""
+        try:
+            impact = preview(ctx, a)
+        except ActionError as exc:
+            error = exc.message
+            impact = (f"⚠ 这个写动作暂时无法执行：{error}\n"
+                      f"补齐参数后我再执行；若参数由我推断的部分不对，请直接纠正我。")
+        except library.LibraryError as exc:
+            error = exc.message
+            impact = f"⚠ 这个写动作暂时无法执行：{error}"
+        except (RuntimeError, FileNotFoundError) as exc:
+            error = str(exc)
+            impact = f"⚠ 这个写动作暂时无法执行：{error}"
+        pending = {"op": op, "args": a, "impact": impact}
+        if error:
+            pending["preview_error"] = error
+        result = ActionExec(op, True, "pending_confirm", impact, pending=pending)
+        if error:
+            # 回执里也带上原因，供墨师如实转述（不是"已安排"，而是"没成、缺什么"）
+            result.error = error
+        return result
 
     _register(op, scope, desc, args, handler)
 
@@ -904,7 +1070,7 @@ def _bootstrap_registry() -> None:
     _register_read("constraint_list", "列出自定义创作约束", (), _h_constraint_list)
     _register_read("model_config", "查看各角色模型绑定", (), _h_model_config)
 
-    _register_write("book_create", "新建书", ("novel_id", "mode"),
+    _register_write("book_create", "新建书", ("novel_id", "mode", "mode_raw"),
                     _preview_book_create, _run_book_create)
     _register_write("book_select", "切换工作台当前书目", ("novel_id",),
                     _preview_book_select, _run_book_select)
@@ -959,25 +1125,44 @@ OP_ALIASES: dict[str, str] = {
     "study_list": "learning_list",
     "read_learning": "learning_read",
     "get_learning": "learning_read",
+    # 实测缺口：模型把 learning_read 写成 learning_get / learn_list（审计日志里两次真实失败）
+    "learning_get": "learning_read",
+    "learn_read": "learning_read",
+    "learning_detail": "learning_read",
+    "learning_content": "learning_read",
+    "read_learn": "learning_read",
+    "learn_list": "learning_list",
+    "learnings": "learning_list",
+    "learning_index": "learning_list",
+    "list_learnings": "learning_list",
     "list_material": "material_list",
     "read_material": "material_read",
     "get_material": "material_read",
+    "material_get": "material_read",
+    "material_detail": "material_read",
     "list_chapters": "chapter_list",
     "chapters_list": "chapter_list",
+    "list_chapter": "chapter_list",
     "read_chapter": "chapter_read",
     "get_chapter": "chapter_read",
     "chapter_get": "chapter_read",
+    "chapter_detail": "chapter_read",
+    "read_book": "chapter_read",
     "read_doc": "doc_read",
     "get_doc": "doc_read",
     "doc_get": "doc_read",
+    "doc_detail": "doc_read",
+    "settings_read": "doc_read",
     "read_setting": "doc_read",
     "read_outline": "outline_read",
     "get_outline": "outline_read",
     "outline_get": "outline_read",
     "list_docs": "doc_list",
     "docs_list": "doc_list",
+    "setting_list": "doc_list",
     "stat_book": "book_stat",
     "get_book_stat": "book_stat",
+    "book_status": "book_stat",
     "list_materials": "material_list",
     "materials_list": "material_list",
     "list_skills": "skill_list",
@@ -986,34 +1171,58 @@ OP_ALIASES: dict[str, str] = {
     "constraints_list": "constraint_list",
     "get_model_config": "model_config",
     "search": "search_workspace",
+    "workspace_search": "search_workspace",
     # 写
     "create_book": "book_create",
     "new_book": "book_create",
+    "books_create": "book_create",
+    "add_book": "book_create",
     "select_book": "book_select",
     "switch_book": "book_select",
+    "open_book": "book_select",
+    "set_book": "book_select",
     "delete_book": "book_delete",
     "remove_book": "book_delete",
     "bind_skills": "book_bind_skills",
+    "skills_bind": "book_bind_skills",
     "start_generation": "gen_start",
     "start_generate": "gen_start",
+    "gen_start_writing": "gen_start",
+    "write_start": "gen_start",
     "resume_generation": "gen_resume",
+    "gen_continue": "gen_resume",
     "pause_generation": "gen_pause",
+    "gen_stop": "gen_pause",
     "decide": "gen_decide",
     "arbitrate": "gen_decide",
+    "review_decide": "gen_decide",
     "run_demo": "demo_run",
+    "demo_generate": "demo_run",
     "confirm_demo": "demo_confirm",
     "start_interactive": "interactive_start",
+    "interactive_run": "interactive_start",
     "choose_card": "interactive_choose",
+    "interactive_select": "interactive_choose",
     "select_card": "interactive_choose",
     "create_material": "material_create",
     "add_material": "material_create",
+    "material_add": "material_create",
     "create_constraint": "constraint_create",
     "add_constraint": "constraint_create",
+    "constraint_add": "constraint_create",
 }
 
 
 def normalize_op(op: str) -> str:
-    """把模型写出的动作名规范化到注册表里的 op（未知名字原样返回）。"""
+    """把模型写出的动作名规范化到注册表里的 op（未知名字原样返回）。
+
+    三级折算（实测模型自造名字的方式非常有规律，逐级兜）：
+      ① 逐字命中注册表  →  ② 归一化（小写/连字符/空格）后命中  →  ③ 别名表
+      → ④ **保守模糊匹配**：按 `_` 切词，命中唯一注册表 op 才折算。
+    第 ④ 级是新增的：实测模型把 `learning_read` 写成 `learning_get`、
+    `learning_list` 写成 `learn_list`，别名表穷举不完，而这类词干组合是可判定的。
+    **保守**体现在"必须唯一命中"——歧义时原样返回，由执行器如实报未知动作（不吞错）。
+    """
     value = (op or "").strip()
     if not value:
         return ""
@@ -1026,7 +1235,95 @@ def normalize_op(op: str) -> str:
         candidate = OP_ALIASES[lowered]
         if candidate in ACTIONS:
             return candidate
-    return value
+    guessed = _guess_op_by_tokens(lowered)
+    return guessed or value
+
+
+def _guess_op_by_tokens(lowered: str) -> str:
+    """按词干组合猜 op（唯一命中原生 op 才返回，否则返回空串）。
+
+    只处理两类可判定形态，不做通用相似度（避免把 `book_delete` 猜成 `book_select`）：
+      · 词序颠倒：`learning_get` / `get_learning` → `learning_read`
+        （"读"的同义词集合 {read,get,detail,show,view,open,content} 与
+          "列"的同义词集合 {list,ls,all,index} 统一折算）
+      · 单复数/缩写：`list_books` → `book_list`（别名表已覆盖，此处兜遗漏形态）
+    """
+    if not lowered:
+        return ""
+    parts = [p for p in lowered.split("_") if p]
+    if len(parts) < 2:
+        return ""
+    read_words = {"read", "get", "detail", "details", "show", "view", "open", "content", "load"}
+    list_words = {"list", "ls", "all", "index", "history"}
+    singular = {"books": "book", "chapters": "chapter", "docs": "doc", "materials": "material",
+                "skills": "skill", "constraints": "constraint", "outline": "outline"}
+    words = [singular.get(p, p) for p in parts]
+    verb = next((w for w in words if w in read_words or w in list_words), "")
+    if not verb:
+        return ""
+    want_read = verb in read_words
+    # 目标名词：去掉动词后剩下的词干（保序，取最长可匹配的）
+    stems = [w for w in words if w not in read_words and w not in list_words]
+    if not stems:
+        return ""
+    noun = "_".join(stems)
+    # 只在"名词词干确实出现在某个 op 里"时折算，且要求动作方向一致
+    candidates = []
+    for op_name, action in ACTIONS.items():
+        if action.scope == "write":
+            continue          # 只折算只读动作：写动作猜错方向代价太大
+        if noun not in op_name or op_name.startswith(noun):
+            continue
+        op_verb = op_name.replace(noun, "").strip("_")
+        if (op_verb in read_words and want_read) or (op_verb in list_words and not want_read):
+            candidates.append(op_name)
+    return candidates[0] if len(candidates) == 1 else ""
+
+
+#: 参数名折算表（op → {模型写的别名: 注册表里的规范名}）。
+#: 实测依据（全部来自真实运行日志，见 docs/HANDOFF 的修复记录）：
+#:   · `{"op":"book_create","args":{"id":"live-created","mode":"pipeline"}}` → 缺 novel_id
+#:   · 模型自述"书名标识（book_key）：live-created"
+#:   · `book_select` 写成 `{"novel": "2"}`（其它动作都用 novel，它跟着习惯写）
+#: 这些别名**语义明确**，折算比让用户白等一轮好；折算只做一次，预览与确认两边一致。
+ARG_ALIASES: dict[str, dict[str, str]] = {
+    "book_create": {
+        "novel": "novel_id", "book": "novel_id", "book_id": "novel_id",
+        "book_key": "novel_id", "id": "novel_id", "name": "novel_id",
+        "title": "novel_id", "key": "novel_id",
+        "creation_mode": "mode", "type": "mode",
+    },
+    "book_select": {"novel": "novel_id", "book": "novel_id", "book_id": "novel_id",
+                    "book_key": "novel_id", "id": "novel_id", "key": "novel_id"},
+    "book_delete": {"novel_id": "novel", "book": "novel", "id": "novel"},
+    "book_bind_skills": {"novel_id": "novel", "custom": "custom_skill_ids",
+                         "packs": "pack_ids", "skill_ids": "pack_ids"},
+    "gen_start": {"novel_id": "novel", "chapters_count": "chapters", "total_chapters": "chapters"},
+    "gen_resume": {"novel_id": "novel"},
+    "gen_pause": {"novel_id": "novel"},
+    "gen_decide": {"novel_id": "novel", "decision": "action", "verdict": "action",
+                   "comment": "feedback", "opinion": "feedback"},
+    "demo_run": {"novel_id": "novel"},
+    "demo_confirm": {"novel_id": "novel"},
+    "interactive_start": {"novel_id": "novel"},
+    "interactive_choose": {"novel_id": "novel", "card": "card_id", "cardId": "card_id",
+                           "text": "custom_text", "content": "custom_text"},
+}
+
+
+def _fold_arg_names(op: str, raw: dict) -> dict:
+    """把模型写的参数别名折算到规范名（规范名优先，别名不覆盖已填的规范名）。"""
+    table = ARG_ALIASES.get(op)
+    if not table:
+        return raw
+    out = dict(raw)
+    for alias, canonical in table.items():
+        if canonical in out and str(out.get(canonical) or "").strip():
+            out.pop(alias, None)
+            continue
+        if alias in out:
+            out[canonical] = out.pop(alias)
+    return out
 
 
 def normalize_args(op: str, args: dict | None) -> dict:
@@ -1036,14 +1333,36 @@ def normalize_args(op: str, args: dict | None) -> dict:
     都取同一份规范化结果，否则"模型写了 free、系统折算成 pipeline"或"模型自造了
     title 参数"都会让两边不相等，确认被拒（实测踩到过：用户点确认，卡还挂在那里）。
 
-    丢弃未声明键也顺带起到白名单作用：动作只会收到自己声明的参数。
+    丢未声明键顺带起到白名单作用。三步顺序固定：
+      ① 参数名折算（ARG_ALIASES）→ ② 白名单过滤 → ③ 取值折算（枚举/占位符/整数）。
     """
-    raw = dict(args or {})
+    raw = _fold_arg_names(op, dict(args or {}))
     allowed = ACTIONS[op].args if op in ACTIONS else tuple(raw)
-    out = {k: v for k, v in raw.items() if k in allowed}
-    if op == "book_create" and "mode" in out:
-        out["mode"] = _normalize_mode(str(out.get("mode") or ""))
+    out = {k: clean_arg_value(v) for k, v in raw.items() if k in allowed}
+    if op == "book_create":
+        # mode_raw = **模型原始说法**（供确认卡如实并列"你给的是『长篇』，按流水线处理"）。
+        # 必须在 clean_arg_value 之外单独保留：clean_arg_value 会把占位符/无关值折成空串。
+        raw_mode = str(raw.get("mode") or raw.get("mode_raw") or "").strip()
+        out["mode"] = _normalize_mode(raw_mode) if raw_mode else "pipeline"
+        out["mode_raw"] = raw_mode if raw_mode.lower() not in library.CREATION_MODES else ""
+        if "novel_id" in out:
+            out["novel_id"] = str(out.get("novel_id") or "").strip()
+    if op in ("chapter_read", "interactive_choose") and "chapter" in out:
+        out["chapter"] = _coerce_int(out.get("chapter"))
+    if op in ("gen_start", "demo_run") and "chapters" in out:
+        out["chapters"] = _coerce_int(out.get("chapters"))
     return out
+
+
+def _coerce_int(value: Any) -> Any:
+    """把"第 3 章"/"3章"/"３"这类写法折算成纯数字串（失败原样返回，由校验报错）。"""
+    if isinstance(value, int):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return text
+    m = re.search(r"-?\d+", text.translate(str.maketrans("０１２３４５６７８９", "0123456789")))
+    return int(m.group(0)) if m else text
 
 
 def known_ops() -> list[str]:
@@ -1052,8 +1371,10 @@ def known_ops() -> list[str]:
 
 #: 参数取值约束（供提示词/规划调用展示）。取值受限的关键参数必须写在提示词里，
 #: 否则模型会自造枚举值（实测把 mode 写成 free / 自由创作），导致动作直接失败。
+#: 尾部带"系统自动"字样的参数是**系统注入**的，模型不必也不应填。
 ARG_CONSTRAINTS: dict[str, str] = {
     "mode": "pipeline|interactive",
+    "mode_raw": "系统自动（留空即可）",
     "action": "approve|reject",
     "revision_mode": "targeted|rewrite",
     "card_id": "c1|c2|c3|custom",
@@ -1162,26 +1483,37 @@ _PREVIEWS: dict[str, dict] = {}
 PREVIEW_TTL_SECONDS = 15 * 60
 
 
-def _preview_key(ctx: ActionContext, op: str) -> str:
-    """预览登记键：按"动作作用域"而不是"会话维度"归并。
+def _preview_key(ctx: ActionContext, op: str, args: dict | None = None) -> str:
+    """预览登记键：**由规范化参数派生**，与会话状态、当前书目都无关。
 
-    为什么不用 ``session_key``（会话维度）：同一个写动作可能从工作区会话发起预览、
-    又在书内会话里确认（反之亦然），若按会话维度分会话就会互相找不到预览，
-    表现为"确认被拒、要重新预览"——用户看到的是"点了确认没反应"。
-    统一用 ``{目标书}::{op}``：预览说的是"对哪本书做什么"，与会话无关。
+    曾经的三版实现与各自的真实故障：
+      · 按 ``session_key`` 分会话 → 工作区预览、书内确认互相找不到（"确认被拒"）；
+      · 改成 ``{ctx.book or ctx.active_novel()}::{op}`` → 仍然读**可变状态**：
+        预览 `book_create` 时工作台还没选书（键 `__workspace__::book_create`），
+        而 `book_create` 成功后 ``set_active_novel(新书)`` 会立刻改掉这个值，
+        于是确认时算出的键变成 `<新书>::book_create` → 找不到登记 → 409、
+        零落盘、待办还挂着（master-live-final6 实测现场：3b 待确认态未清空）。
+      · 本版：键只由 ``{op} + 规范化 args`` 决定。预览与确认的 args 是**同一份**
+        规范化结果（见 ``execute`` 的 ``result.args``），因此两次算出的键必然相等，
+        且不受"期间又建了书 / 切了书 / 换了会话"影响。
+
+    兼容性：``args=None``（旧调用形态）时退化为按 op 归并，行为与旧版一致。
     """
-    target = ctx.book or ctx.active_novel() or ctx.default_novel
-    return f"{target}::{op}"
+    if args is None:
+        target = ctx.book or ctx.active_novel() or ctx.default_novel
+        return f"{target}::{op}"
+    payload = json.dumps(args, sort_keys=True, default=str, ensure_ascii=False)
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+    return f"{op}::{digest}"
 
 
 def register_preview(ctx: ActionContext, op: str, args: dict, impact: str,
                      token: str = "") -> dict:
     """登记一次写动作预览，返回可直接回给前端的 pending 结构。"""
     tk = token or hashlib.sha1(
-        f"{_preview_key(ctx, op)}::{json.dumps(args, sort_keys=True, default=str)}"
-        f"::{time.time()}".encode("utf-8")
+        f"{_preview_key(ctx, op, args)}::{time.time()}".encode()
     ).hexdigest()[:16]
-    _PREVIEWS[_preview_key(ctx, op)] = {
+    _PREVIEWS[_preview_key(ctx, op, args)] = {
         "token": tk, "args": args, "impact": impact, "at": time.time(),
     }
     return {"op": op, "args": args, "impact": impact, "token": tk}
@@ -1189,10 +1521,19 @@ def register_preview(ctx: ActionContext, op: str, args: dict, impact: str,
 
 def consume_preview(ctx: ActionContext, pending: dict) -> str:
     """校验并消费一次预览；返回空串表示通过，否则返回拒绝原因。"""
-    key = _preview_key(ctx, pending.get("op", ""))
+    op = str(pending.get("op") or "")
+    args = pending.get("args") if isinstance(pending.get("args"), dict) else {}
+    key = _preview_key(ctx, op, args)
     record = _PREVIEWS.get(key)
     if record is None:
-        logger.info("预览消费失败：没有登记（key=%s）", key)
+        # 兜底：按 op 归并的旧键（进程内从旧版本升级上来时的残留登记）
+        legacy = _preview_key(ctx, op)
+        record = _PREVIEWS.get(legacy)
+        if record is not None:
+            key = legacy
+            logger.info("预览消费命中旧键（兼容路径）：key=%s", key)
+    if record is None:
+        logger.info("预览消费失败：没有登记（key=%s op=%s）", key, op)
         return "该写动作没有经过预览登记：请先发起一次预览，确认后才会执行"
     if time.time() - float(record.get("at", 0)) > PREVIEW_TTL_SECONDS:
         _PREVIEWS.pop(key, None)
@@ -1211,6 +1552,18 @@ def consume_preview(ctx: ActionContext, pending: dict) -> str:
     return ""
 
 
-def forget_preview(ctx: ActionContext, op: str) -> None:
-    """取消预览登记（用户点"取消"时调用）。"""
+def forget_preview(ctx: ActionContext, op: str, args: dict | None = None) -> None:
+    """取消预览登记（用户点"取消"时调用）。
+
+    ``args`` 给出时按键精确删除；不给时清理该 op 的**全部**登记 ——
+    旧版按 `{目标书}::{op}` 归并，同一个 op 只可能有 1 条，按 op 删即可；
+    新键与 args 绑定（同一 op 可能有多条不同参数的登记），因此取消时若不带 args，
+    就把该 op 前缀下的所有登记一并作废（取消语义上没有问题且更安全）。
+    """
+    if args is not None:
+        _PREVIEWS.pop(_preview_key(ctx, op, args), None)
+        return
+    prefix = f"{op}::"
+    for key in [k for k in _PREVIEWS if k.startswith(prefix)]:
+        _PREVIEWS.pop(key, None)
     _PREVIEWS.pop(_preview_key(ctx, op), None)

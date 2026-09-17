@@ -1,18 +1,31 @@
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { computed, onMounted } from 'vue'
 
-import { appStore, type SideWindowId } from '../store'
+import { appStore, inWorkspace, resetToMainChat, type SideWindowId } from '../store'
 
-type NavId = Exclude<SideWindowId, null> | 'bookshelf' | 'styleForge' | 'modelConfig'
+type NavId = Exclude<SideWindowId, null> | 'bookshelf' | 'styleForge' | 'modelConfig' | 'mainChat'
 
 interface NavItem {
   id: NavId
   icon: string
   label: string
-  kind: 'window' | 'dialog'
+  kind: 'window' | 'dialog' | 'action'
+  title?: string
 }
 
 const groups: { title: string; items: NavItem[] }[] = [
+  {
+    title: '主对话',
+    items: [
+      {
+        id: 'mainChat',
+        icon: '💬',
+        label: '主对话（工作区）',
+        kind: 'action',
+        title: '回到不隶属任何一本书的主对话：开一个空白会话，可建书/查资料/切书；旧会话仍在「历史对话」里',
+      },
+    ],
+  },
   {
     title: '创作功能',
     items: [
@@ -38,14 +51,23 @@ const groups: { title: string; items: NavItem[] }[] = [
   },
 ]
 
+/** 主对话按钮的激活态：当前就在工作区作用域。 */
+const onMainChat = computed(() => inWorkspace())
+
 function open(item: NavItem): void {
   if (item.kind === 'dialog') {
     const key = item.id as 'bookshelf' | 'styleForge' | 'modelConfig'
     appStore.dialogs[key] = true
-  } else {
-    const wid = item.id as Exclude<SideWindowId, null>
-    appStore.sideWindow = appStore.sideWindow === wid ? null : wid
+    return
   }
+  if (item.kind === 'action') {
+    // 回到主对话：切工作区 + 开全新空白会话（旧会话保留在历史里）
+    resetToMainChat()
+    appStore.sideWindow = null
+    return
+  }
+  const wid = item.id as Exclude<SideWindowId, null>
+  appStore.sideWindow = appStore.sideWindow === wid ? null : wid
 }
 
 onMounted(() => {
@@ -78,7 +100,10 @@ onMounted(() => {
         v-for="item in group.items"
         :key="item.id"
         class="nav-btn"
-        :class="{ active: appStore.sideWindow === item.id }"
+        :class="{
+          active: appStore.sideWindow === item.id || (item.id === 'mainChat' && onMainChat),
+        }"
+        :title="item.title"
         @click="open(item)"
       >
         <span class="nav-icon">{{ item.icon }}</span>

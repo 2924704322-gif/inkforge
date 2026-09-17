@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable, Mapping
 from typing import Any, TypeVar
@@ -118,6 +119,31 @@ def brief_fidelity_block(book_title: str = "") -> str:
     return "\n\n".join([framing, BRIEF_FIDELITY_DIRECTIVE, CONSTRAINT_PRIORITY_CHAIN])
 
 
+def _output_text(out: Any) -> str:
+    """把一次模型产出折算成"用于判定空/拒绝"的文本。
+
+    为什么要容错（真实缺陷）：原实现直接 `out.model_dump_json()`，而自由文本链路
+    （`registry.chat_as` 返回 ``ChatResult``，只有 `.content`）**没有**这个方法 →
+    `AttributeError: 'ChatResult' object has no attribute 'model_dump_json'`。
+    该缺陷在把保真链铺到正文链路（writer）时立刻暴露，说明它此前从未被自由文本路径走到过。
+    """
+    if isinstance(out, str):
+        return out
+    for attr in ("model_dump_json", "model_dump"):
+        method = getattr(out, attr, None)
+        if callable(method):
+            try:
+                value = method()
+            except Exception:  # noqa: BLE001 - 序列化失败退回 content
+                break
+            return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False,
+                                                                 default=str)
+    content = getattr(out, "content", None)
+    if isinstance(content, str):
+        return content
+    return ""
+
+
 def generate_faithful(
     call: Callable[[list[ChatMessage], float | None], Any],
     messages: list[ChatMessage],
@@ -147,7 +173,7 @@ def generate_faithful(
         except Exception as exc:  # noqa: BLE001 - 失败原因用于下一次重试注入
             last_error = f"{type(exc).__name__}: {exc}"
             continue
-        text = out if isinstance(out, str) else out.model_dump_json()
+        text = _output_text(out)
         if text.strip() and not _looks_like_refusal(text):
             if attempt:
                 logger.info("brief 保真链第 %d 次尝试取得合格产出", attempt + 1)

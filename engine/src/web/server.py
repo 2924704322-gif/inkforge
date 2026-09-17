@@ -60,25 +60,39 @@ def _parse_estimated_words(content: str) -> tuple[str, int | None]:
 #
 # P0 重构：实现搬到 src/services/library.py（HTTP 端点与墨师动作层共用一份实现），
 # 此处保留同名薄包装与常量 re-export，既有调用方与测试接口逐字不变。
-from src.services.library import (  # noqa: E402 - 顶部导入块之后集中登记
-    BOOK_SUBDIRS as _BOOK_SUBDIRS,
-    CREATION_MODES as _CREATION_MODES,
-    CUSTOM_SKILLS_REL,
-    LibraryError,
-    LibraryError as _LibraryError,
+from src.services.library import (
     NOVEL_ID_RE as _NOVEL_ID_RE,
+)
+from src.services.library import (
     SKILL_ID_RE as _SKILL_ID_RE,
+)
+from src.services.library import (  # noqa: E402 - 顶部导入块之后集中登记
     UPLOAD_ROOTS_ENV,
+    LibraryError,
+)
+from src.services.library import (
     UPLOAD_SUFFIXES as _UPLOAD_SUFFIXES,
+)
+from src.services.library import (
+    LibraryError as _LibraryError,
+)
+from src.services.library import (
     apply_skills_to_store as _apply_skills_to_store,
+)
+from src.services.library import (
     compose_skill_constraints as _compose_skill_constraints,
+)
+from src.services.library import (
     create_book as _lib_create_book,
+)
+from src.services.library import (
     delete_book as _lib_delete_book,
-    force_rmtree as _force_rmtree,
+)
+from src.services.library import (
     list_books as _lib_list_books,
+)
+from src.services.library import (
     list_custom_skills as _list_custom_skills,
-    novel_dir as _novel_dir,
-    purge_derived_data as _purge_derived_data,
 )
 
 
@@ -100,7 +114,7 @@ def _effective_brief(brief: str, fields: BriefFieldsBody | None) -> str:
     return "\n\n".join(part for part in (structured, free) if part)
 
 
-def _library_error_to_http(exc: "LibraryError"):
+def _library_error_to_http(exc: LibraryError):
     """把服务层错误按 code 翻译为既有 HTTP 状态码与文案（行为保持逐字一致）。"""
     mapping = {"bad_request": 400, "not_found": 404, "conflict": 409}
     raise HTTPException(mapping.get(exc.code, 400), exc.message) from exc

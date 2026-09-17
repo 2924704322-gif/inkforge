@@ -1,7 +1,14 @@
-"""Writer：基于 RAG 上下文生成章节正文（自由文本，非结构化）。"""
+"""Writer：基于 RAG 上下文生成章节正文（自由文本，非结构化）。
+
+正文这条链路此前**没有** brief 保真链（生成重试 + 拒绝措辞识别）。
+`architect` 的 8 个调用点都有 `generate_faithful` 兜底，而正文/出卡/互动写章都没有：
+一旦模型偶发拒答或产出空串，缺陷会直接落到用户看到的稿子上。
+本模块把正文的三次模型调用（初稿 / 续写 / 压缩）统一包进保真链。
+"""
 
 from __future__ import annotations
 
+from src.agents.architect import generate_faithful
 from src.agents.prompt_loader import render_prompt
 from src.agents.schemas import NegotiationOutput, ReviewOutput
 from src.llm.base import ChatMessage, ChatResult
@@ -16,6 +23,14 @@ ROLE = "writer"
 DEFAULT_TARGET_WORDS = 5000
 DEFAULT_TOLERANCE = 500
 DEFAULT_MAX_CONTINUATION_ATTEMPTS = 1
+
+
+def _faithful_text(registry: ModelRegistry, prompt: str) -> ChatResult:
+    """带 brief 保真链的正文调用（空产出/拒绝措辞在系统内消化，重试上限见 architect）。"""
+    return generate_faithful(
+        lambda msgs, temp: registry.chat_as(ROLE, msgs, temperature=temp),
+        [ChatMessage("user", prompt)],
+    )
 
 
 def chapter_length(text: str) -> int:
@@ -169,7 +184,7 @@ class Writer:
         )
         mode = "重写" if revision_notes else "初稿"
         logger.info("Writer: 第 %d 章%s生成中 ...", ctx.chapter, mode)
-        result = self._registry.chat_as(ROLE, [ChatMessage("user", prompt)])
+        result = _faithful_text(self._registry, prompt)
 
         # Layer 2: 后处理字数核验 —— 超差时追加续写/压缩（上限可控）
         draft = result.content
@@ -186,9 +201,9 @@ class Writer:
                     f"【字数补充】上一稿 {actual} 字，距目标 {target} 字还差约 {target - actual} 字。"
                     f"紧接上一稿末尾自然续写以推进剧情，只输出新增正文，不得重复已有内容。"
                 )
-                extra = self._registry.chat_as(
-                    ROLE,
-                    [ChatMessage("user", f"{prompt}\n\n{note}\n\n## 上一稿正文（仅作续写衔接）\n{draft}")],
+                extra = _faithful_text(
+                    self._registry,
+                    f"{prompt}\n\n{note}\n\n## 上一稿正文（仅作续写衔接）\n{draft}",
                 )
                 draft = draft + "\n\n" + extra.content
             else:
@@ -201,9 +216,9 @@ class Writer:
                     f"删减冗余描写、重复表达与无关枝节，输出压缩后的完整正文，"
                     f"保留核心事件、关键对话与结尾钩子，不得省略情节。"
                 )
-                trimmed = self._registry.chat_as(
-                    ROLE,
-                    [ChatMessage("user", f"{prompt}\n\n{note}\n\n## 上一稿正文（在此基础上压缩）\n{draft}")],
+                trimmed = _faithful_text(
+                    self._registry,
+                    f"{prompt}\n\n{note}\n\n## 上一稿正文（在此基础上压缩）\n{draft}",
                 )
                 draft = trimmed.content
         result.content = draft

@@ -79,7 +79,7 @@ def test_book_create_requires_confirmation(act_ctx, sandbox: SimpleNamespace):
     pending = act.execute("book_create", {"novel_id": "newidea", "mode": "pipeline"},
                           ctx=act_ctx)
     assert pending.status == "pending_confirm" and pending.ok
-    assert "将新建书目 newidea" in pending.summary
+    assert "将新建书目" in pending.summary and "newidea" in pending.summary
     # 未确认 → 磁盘上不得有任何变化
     assert not (sandbox.novels / "newidea").exists()
 
@@ -91,9 +91,35 @@ def test_book_create_requires_confirmation(act_ctx, sandbox: SimpleNamespace):
     assert done.data["undo"]["op"] == "book_delete"
 
 
-def test_book_create_duplicate_is_conflict_before_confirm(act_ctx):
+def test_book_create_duplicate_is_visible_blocker(act_ctx):
+    """重名不再"静默失败"：仍出确认卡，但卡上写明原因（用户看得见、点得动）。
+
+    旧行为：预览期异常 → status=failed → **不登记待确认** → 用户既没卡也没得点。
+    """
     dup = act.execute("book_create", {"novel_id": "demo-web"}, ctx=act_ctx)
-    assert dup.status == "failed" and "已存在" in dup.error
+    assert dup.status == "pending_confirm" and dup.ok
+    assert "已存在" in dup.summary and dup.error and "已存在" in dup.error
+    assert dup.pending and "preview_error" in dup.pending
+    # 确认执行时仍必须失败（不能让重名把既有书覆盖掉）
+    forced = act.execute("book_create", {"novel_id": "demo-web"}, ctx=act_ctx,
+                         execute_write=True)
+    assert forced.status == "failed" and "已存在" in forced.error
+
+
+def test_preview_error_still_produces_confirm_card(act_ctx):
+    """写动作预览期出错时必须仍出确认卡（回归：用户实测"点了没反应"）。
+
+    旧行为：预览抛错 → status=failed → 不登记待确认 → 界面既没有卡也没有按钮。
+    """
+    # ① 目标不存在
+    ghost = act.execute("book_select", {"novel_id": "ghost"}, ctx=act_ctx)
+    assert ghost.status == "pending_confirm" and ghost.pending is not None
+    assert "不存在" in ghost.pending["impact"] and ghost.pending["preview_error"]
+
+    # ② 缺必填参数：卡上必须写明缺什么，且提示补齐后再执行
+    missing = act.execute("gen_start", {"novel": "demo-web"}, ctx=act_ctx)
+    assert missing.status == "pending_confirm"
+    assert "brief" in missing.summary and "补齐" in missing.summary
 
 
 def test_single_book_fallback_when_workspace(act_ctx):
@@ -121,20 +147,28 @@ def test_write_action_can_target_explicit_book(act_ctx):
 
 
 def test_book_delete_protects_default_and_active(act_ctx):
-    assert act.execute("book_delete", {"novel": "demo-web"}, ctx=act_ctx).status == "failed"
+    # 默认书不可删：仍出卡但卡上写明拒绝原因（不再静默 failed）
+    default = act.execute("book_delete", {"novel": "demo-web"}, ctx=act_ctx)
+    assert default.status == "pending_confirm" and "默认书" in default.summary
 
     library.create_book("doomed", "pipeline")
     act_ctx.hub.get_or_create("demo-web")
-    # 正在生成中的书（这里用会话 started 模拟不可行，改为直接验证不存在书的情况）
-    assert act.execute("book_delete", {"novel": "ghost"}, ctx=act_ctx).status == "failed"
+    ghost = act.execute("book_delete", {"novel": "ghost"}, ctx=act_ctx)
+    assert ghost.status == "pending_confirm" and "不存在" in ghost.summary
     assert act.execute("book_delete", {"novel": "doomed"}, ctx=act_ctx).status == "pending_confirm"
     done = act.execute("book_delete", {"novel": "doomed"}, ctx=act_ctx, execute_write=True)
     assert done.ok
+    # 默认书"强行确认"也必须删不掉
+    forced = act.execute("book_delete", {"novel": "demo-web"}, ctx=act_ctx, execute_write=True)
+    assert forced.status == "failed" and "默认书" in forced.error
 
 
 def test_gen_start_requires_brief_and_checks_running(act_ctx):
     missing = act.execute("gen_start", {"novel": "demo-web"}, ctx=act_ctx)
-    assert missing.status == "failed" and "brief" in missing.error
+    # 缺 brief：出确认卡 + 卡上写明缺什么（用户看得到"还差一步"）
+    assert missing.status == "pending_confirm" and "brief" in missing.summary
+    assert act.execute("gen_start", {"novel": "demo-web"}, ctx=act_ctx,
+                       execute_write=True).status == "failed"
 
     pending = act.execute(
         "gen_start",
@@ -145,9 +179,10 @@ def test_gen_start_requires_brief_and_checks_running(act_ctx):
     assert "卷级并行" in pending.summary
 
 
-def test_gen_decide_without_pending_is_failed(act_ctx):
+def test_gen_decide_without_pending_is_visible_blocker(act_ctx):
+    """没有待裁决项时：出卡并写明原因（而不是一句 failed 让用户无从下手）。"""
     res = act.execute("gen_decide", {"novel": "demo-web", "action": "approve"}, ctx=act_ctx)
-    assert res.status == "failed" and "没有待裁决项" in res.error
+    assert res.status == "pending_confirm" and "没有待裁决项" in res.summary
 
 
 def test_select_and_clear_pending_via_execute_pending(act_ctx):
@@ -380,7 +415,222 @@ def test_pending_gate_no_pending_is_none(act_ctx):
     assert _decide_pending_action({}, "确认", act_ctx) is None
 
 
-# ---------- 动作 HTTP 通道 ----------
+# ---------- 参数名折算 / 占位符 / 别名（用户实测"对话建不了书"的回归） ----------
+
+def test_arg_alias_folding_for_book_create(act_ctx):
+    """模型把 novel_id 写成 id / book_key / title / novel 都要能折算（真实日志里全出现过）。
+
+    实测现场（master-live 系列 JSON）：
+      · `{"op":"book_create","args":{"id":"live-created","mode":"pipeline"}}` → 缺 novel_id；
+      · 模型自述"书名标识（book_key）：live-created"。
+    """
+    assert act.normalize_args("book_create", {"id": "a-book"})["novel_id"] == "a-book"
+    assert act.normalize_args("book_create", {"book_key": "b-book"})["novel_id"] == "b-book"
+    assert act.normalize_args("book_create", {"novel": "c-book"})["novel_id"] == "c-book"
+    assert act.normalize_args("book_create", {"title": "d-book"})["novel_id"] == "d-book"
+    # 声明参数不存在时补默认模式，保证确认卡文案有内容
+    assert act.normalize_args("book_create", {"id": "e-book"})["mode"] == "pipeline"
+    # 规范名优先：别名不得覆盖已填好的规范名
+    folded = act.normalize_args("book_create", {"novel_id": "real", "title": "fake"})
+    assert folded["novel_id"] == "real"
+    # 其它写动作的同类漂移
+    assert act.normalize_args("book_select", {"novel": "demo-web"})["novel_id"] == "demo-web"
+    assert act.normalize_args("gen_decide", {"novel": "demo-web", "decision": "reject",
+                                             "comment": "太快"})["action"] == "reject"
+    assert act.normalize_args("gen_decide", {"novel": "demo-web", "decision": "reject",
+                                             "comment": "太快"})["feedback"] == "太快"
+
+
+def test_placeholder_values_are_rejected(act_ctx, sandbox: SimpleNamespace):
+    """提示词占位符不是书名标识：必须当"没填"处理，绝不建出一本叫 novel_id 的书。
+
+    真实事故：审计日志里有 `已创建书目 novel_id` —— 模型把参数名当取值提交，
+    而当时参数层不校验，书架里就真的多了一本占位符书名的书。
+    """
+    for value in ("novel_id", "<书名>", "书名标识", "BOOK_ID", "novel-id"):
+        assert act.is_placeholder_value(value), value
+    assert not act.is_placeholder_value("live-created")
+    assert act.normalize_args("book_create", {"novel_id": "novel_id"})["novel_id"] == ""
+
+    res = act.execute("book_create", {"novel_id": "novel_id"}, ctx=act_ctx)
+    # 必须出确认卡（用户看得见）＋ 卡上写清"没拿到可用的标识"，且**绝不落盘**
+    assert res.status == "pending_confirm" and "没有拿到可用的书名标识" in res.summary
+    assert not (sandbox.novels / "novel_id").exists()
+
+
+def test_op_alias_and_fuzzy_matching():
+    """别名扩表 + 保守模糊匹配：实测模型自造的 learning_get / learn_list 必须命中。"""
+    # 实测失败名（审计日志里两次真实失败）
+    assert act.normalize_op("learning_get") == "learning_read"
+    assert act.normalize_op("learn_list") == "learning_list"
+    # 同义词与词序
+    assert act.normalize_op("get_learning") == "learning_read"
+    assert act.normalize_op("learning_detail") == "learning_read"
+    assert act.normalize_op("list_learnings") == "learning_list"
+    assert act.normalize_op("chapter_detail") == "chapter_read"
+    assert act.normalize_op("material_get") == "material_read"
+    assert act.normalize_op("read_book") == "chapter_read"
+    # 保守性：歧义/无关名一律原样返回（由执行器如实报"未知动作"，不猜）
+    assert act.normalize_op("mark_book") == "mark_book"
+    assert act.normalize_op("book_export") == "book_export"
+    assert act.normalize_op("nonsense_op") == "nonsense_op"
+
+
+def test_learning_read_tolerates_model_id_shapes(act_ctx, sandbox: SimpleNamespace):
+    """ID 容错：大小写/引号/标题写法都要能读（用户报"能列编号、点开就失败"）。"""
+    import frontmatter
+
+    d = sandbox.novels.parent / "learning"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "ln-abcdef12.md").write_text(
+        frontmatter.dumps(frontmatter.Post("## 文风学习\n短句为主", title="样本拆解")),
+        encoding="utf-8",
+    )
+    for raw in ("ln-abcdef12", "LN-ABCDEF12", "`ln-abcdef12`", " ln-abcdef12 "):
+        res = act.execute("learning_read", {"id": raw}, ctx=act_ctx)
+        assert res.ok, raw
+        assert "文风学习" in res.data["content"]
+
+    # 模型把标题当 id 传：唯一命中时允许（有歧义才报错）
+    by_title = act.execute("learning_read", {"id": "样本拆解"}, ctx=act_ctx)
+    assert by_title.ok and by_title.data["id"] == "ln-abcdef12"
+    # 不存在的编号：如实失败，并提示"用列表里的编号"
+    missing = act.execute("learning_read", {"id": "ln-00000000"}, ctx=act_ctx)
+    assert missing.status == "failed" and "不存在" in missing.error
+
+
+def test_learning_list_tells_model_how_to_open(act_ctx, sandbox: SimpleNamespace):
+    """列表回执必须写清"要看全文就用这个编号"——否则用户会得到"能列编号、点不开"。"""
+    import frontmatter
+
+    d = sandbox.novels.parent / "learning"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "ln-abcdef12.md").write_text(
+        frontmatter.dumps(frontmatter.Post("正文", title="样本拆解")), encoding="utf-8"
+    )
+    listed = act.execute("learning_list", {}, ctx=act_ctx)
+    assert listed.ok
+    assert "learning_read" in listed.summary and "ln-abcdef12" in listed.summary
+
+
+def test_book_create_mode_folding_never_blocks(act_ctx, sandbox: SimpleNamespace):
+    """创作模式写歪了也必须能建书（真机复现：模型把「长篇」当 mode 传，确认后零落盘）。
+
+    真实现场（本批次 smoke_master_converse --with-llm）：
+      pending.args = {"novel_id": "live-conv", "mode": "长篇"} → 确认卡带"未知创作模式" →
+      用户点确认 → `book_create 执行失败：未知创作模式：'长篇'`，目录始终不存在。
+    """
+    for raw in ("长篇", "短篇", "网文", "连载", "long", "novel", "series", "标准", "随便"):
+        args = act.normalize_args("book_create", {"novel_id": "m1", "mode": raw})
+        assert args["mode"] == "pipeline", raw
+        # 模型原话留在 mode_raw，确认卡上要如实并列展示
+        assert args.get("mode_raw") == raw, raw
+
+    for raw in ("互动创作", "剧情卡", "逐章推进", "interactive", "分支"):
+        assert act.normalize_args("book_create", {"novel_id": "m2", "mode": raw})["mode"] == \
+            "interactive", raw
+
+    # 完全判不出来也不许卡死：走默认 pipeline（用户可在确认卡上纠正）
+    assert act.normalize_args("book_create", {"novel_id": "m3", "mode": "xxooxx"})["mode"] == \
+        "pipeline"
+
+    # 确认卡必须把"我按你的说法折算成 pipeline"写出来
+    act_ctx.extra["title_hint"] = "雾都回响"
+    res = act.execute("book_create", {"novel_id": "wudu", "mode": "长篇"}, ctx=act_ctx)
+    assert res.status == "pending_confirm"
+    assert "长篇" in res.summary and "pipeline" in res.summary
+    done = act.execute("book_create", {"novel_id": "wudu", "mode": "长篇"}, ctx=act_ctx,
+                       execute_write=True)
+    assert done.ok and (sandbox.novels / "wudu" / "settings").is_dir()
+
+
+def test_guess_novel_id_and_title_from_user_phrases():
+    """从用户原话抠标识/书名：真机里出现过的写法逐条锁定。
+
+    真机缺口（G1）：`"书名标识就用 dark-crime"` 旧正则抠不出标识 →
+    兜底登记不了建书动作 → 用户被告知"需要确认两点"却拿不到确认卡。
+    """
+    from src.web.inkforge_api import _guess_arg_from_user, _guess_title_from_user
+
+    cases = [
+        ("帮我新建一本自由创作的书，书名标识就用 live-created。", "live-created", "自由创作"),
+        ("帮我建一本赛博修仙的长篇，书名就叫《雨夜委托》，书名标识就用 live-conv。",
+         "live-conv", "雨夜委托"),
+        ("帮我建一本黑暗犯罪题材的书，书名标识就用 dark-crime，要写死刑犯视角的暴力与堕落。",
+         "dark-crime", "黑暗犯罪题材"),
+        ("书名标识（book id）：dark-crime", "dark-crime", ""),
+        ("book key: abc-def", "abc-def", ""),
+        ("建一本叫 `my-book` 的书", "my-book", ""),      # 反引号里是标识，不是书名
+        ("建书流程怎么走？", "", ""),                     # 提问不该被当成建书
+        ("帮我写一本关于末法剑修的长篇，书名《枯剑纪元》，标识就用 rotten-sword",
+         "rotten-sword", "枯剑纪元"),
+    ]
+    for text, want_id, want_name in cases:
+        assert _guess_arg_from_user("novel_id", text) == want_id, text
+        assert _guess_title_from_user(text) == want_name, text
+    # 只给中文书名 → 生成 ASCII 标识（不是空、也不是占位符）
+    slug = _guess_arg_from_user("novel_id", "再帮我建一本《雾都回响》。")
+    assert slug.startswith("novel-") and slug.isascii()
+
+
+def test_fallback_action_covers_create_intent_without_action_block():
+    """模型整轮不给动作块时，用户原话就是第一事实源（真机 E8 / G1 回归）。"""
+    from src.web.inkforge_api import _fallback_action_from_history
+
+    chat = {"messages": [{"role": "user", "content": "帮我建一本《雾都回响》。"}]}
+    acts = _fallback_action_from_history(chat, "再帮我建一本《雾都回响》。")
+    assert acts and acts[0]["op"] == "book_create"
+    assert acts[0]["args"]["novel_id"].isascii()
+
+    acts2 = _fallback_action_from_history(chat, "书名标识就用 dark-crime，写死刑犯视角。")
+    assert acts2 and acts2[0]["args"]["novel_id"] == "dark-crime"
+
+    # 纯提问不兜底（否则会把"建书流程怎么走"变成一张建书卡）
+    assert _fallback_action_from_history({}, "建书流程怎么走？") == []
+
+
+# ---------- 预览键稳定性（确认被无端拒绝的根因） ----------
+
+def test_preview_key_is_independent_of_active_book(act_ctx, sandbox: SimpleNamespace):
+    """预览键只由（op + 规范化 args）决定，不受"期间又建了书/切了书"影响。
+
+    真实故障（master-live-final6 现场）：预览 book_create 时工作台还没选书
+    （键 `__workspace__::book_create`），而建书成功会立刻 `set_active_novel(新书)`，
+    于是确认时算出的键变成 `<新书>::book_create` → 找不到登记 → 409、零落盘、
+    待办还挂着。用户的体感是"点了确认，什么都没发生"。
+    """
+    args = {"novel_id": "keyprobe", "mode": "pipeline"}
+    pending = act.register_preview(act_ctx, "book_create", args, "将新建书目 keyprobe")
+
+    # 模拟"预览之后，工作台当前书目被改成别的书"
+    act_ctx.extra["_state"]["active"] = "demo-web"
+    assert act.consume_preview(act_ctx, pending) == ""
+
+    # 换个会话维度/换本书也一样能确认（键与会话无关）
+    act_ctx.book = ""
+    act_ctx.session_key = WORKSPACE
+    pending2 = act.register_preview(act_ctx, "book_create", args, "将新建书目 keyprobe")
+    act_ctx.extra["_state"]["active"] = ""
+    assert act.consume_preview(act_ctx, pending2) == ""
+
+
+def test_preview_args_mismatch_still_refused(act_ctx):
+    """键变稳了也不能放过参数被改的情况：参数不同 = 不同的键，必须拒绝。"""
+    pending = act.register_preview(act_ctx, "book_create",
+                                   {"novel_id": "keep", "mode": "pipeline"}, "将新建 keep")
+    tampered = {**pending, "args": {"novel_id": "swap", "mode": "pipeline"}}
+    assert act.consume_preview(act_ctx, tampered) != ""
+
+
+def test_forget_preview_clears_all_variants(act_ctx):
+    """取消时把该 op 的所有登记清掉（新键与 args 绑定，可能有多条）。"""
+    a = act.register_preview(act_ctx, "book_create", {"novel_id": "f1"}, "将新建 f1")
+    b = act.register_preview(act_ctx, "book_create", {"novel_id": "f2"}, "将新建 f2")
+    act.forget_preview(act_ctx, "book_create")
+    assert act.consume_preview(act_ctx, a) != ""
+    assert act.consume_preview(act_ctx, b) != ""
+
+
 
 def test_actions_endpoints(app_client, sandbox: SimpleNamespace):
     client, _ = app_client

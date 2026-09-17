@@ -35,9 +35,32 @@ export const appStore = reactive({
   sideWindow: null as SideWindowId,
   /** 右侧编辑器选中的文档。 */
   selection: null as DocSelection,
+  /**
+   * 右侧正文是否已与选中态对齐（由 EditorPane 维护）。
+   *
+   * 用途：改稿目标取自 `selection`，而正文是异步拉取的。两者不同步时发改稿指令，
+   * 会把改动落到用户没在看的文稿上（曾出现"选的是大纲、动的是第一章"）。
+   * 因此发送改稿前必须先确认对齐；未对齐则拦下并提示重新点选。
+   */
+  docAligned: false,
+  /** 已对齐正文的标识，形如 `<bookId>|<ch-3 / settings/outline.md>`。 */
+  loadedDocKey: '',
   /** 当前对话会话（空 = 未加载）。 */
   chatId: '',
   chatAgent: 'chat',
+  /**
+   * 「回到主对话」信号：自增即表示用户主动要一个**全新的空白工作区会话**。
+   *
+   * 为什么不用 chatId='' 代替：`loadChats()` 会自动恢复最近一个会话，
+   * 于是切回工作区时旧上下文又被拉回来（实测体感："初始对话结束后就进了书的会话里"）。
+   * 自增信号让 ChatPanel 明确区分"普通切书"与"我要开一个新的主对话"。
+   */
+  chatResetToken: 0,
+  /** 上一次主对话的会话 id：仅用于在历史面板里提示"旧会话还在，可点开"。 */
+  lastMainChatId: '',
+  /** 最近打开过的书：工作区顶部「回到《X》」用它，避免切走后回不去。 */
+  lastBookId: '',
+  lastBookTitle: '',
   /** 资源树刷新信号（章节/设定变更后自增）。 */
   treeVersion: 0,
 })
@@ -56,6 +79,10 @@ export function inWorkspace(): boolean {
 }
 
 export function openBook(novelId: string, title = ''): void {
+  if (novelId) {
+    appStore.lastBookId = novelId
+    appStore.lastBookTitle = title || novelId
+  }
   appStore.bookId = novelId
   appStore.bookTitle = novelId ? (title || novelId) : ''
   appStore.selection = null
@@ -69,4 +96,20 @@ export function openBook(novelId: string, title = ''): void {
 /** 回到工作区（无书）状态：清空当前书与右侧编辑器选中。 */
 export function openWorkspace(): void {
   openBook('')
+}
+
+/**
+ * 回到**主对话**（工作区作用域）并开一个全新空白会话。
+ *
+ * 语义（用户确认）：
+ *   · 切到工作区作用域（不隶属任何书）→ 后续指令不再被某本书的上下文污染；
+ *   · 开新会话，不自动恢复旧会话；
+ *   · **旧会话不删**：仍在「历史对话」面板里，随时可点开继续。
+ */
+export function resetToMainChat(): void {
+  if (!appStore.bookId && appStore.chatId) {
+    appStore.lastMainChatId = appStore.chatId
+  }
+  openWorkspace()
+  appStore.chatResetToken += 1
 }

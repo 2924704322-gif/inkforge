@@ -38,6 +38,15 @@ ENGINE_DIR = Path(__file__).resolve().parent
 if str(ENGINE_DIR) not in sys.path:
     sys.path.insert(0, str(ENGINE_DIR))
 
+# Windows 控制台默认 GBK：`check()` 里的中文/emoji 一旦落到 GBK 编不出的字符，
+# print 会抛 UnicodeEncodeError 并**中断整轮验收**（docs/07 §5.3 记录的真实故障）。
+# 统一把标准输出改成 UTF-8 + 替换错误字节，保证验收脚本不会因为"打不出来"而假失败。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001 - 非 TTY / 已重定向时忽略
+        pass
+
 TOKEN = "smoke-" + os.urandom(16).hex()
 
 
@@ -94,8 +103,26 @@ class Suite:
         line = f"  [{mark}] {case}"
         if detail:
             line += f"  — {detail}"
-        print(line, flush=True)
+        try:
+            print(line, flush=True)
+        except UnicodeEncodeError:
+            # 兜底：即便 reconfigure 失效（被外部重定向成 GBK 流），也不许因"打不出来"中断验收
+            print(line.encode("utf-8", "replace").decode("utf-8", "replace"), flush=True)
         return bool(ok)
+
+    def check_no_failed_actions(self, case: str, body: dict) -> bool:
+        """断言"本轮动作没有一个是失败的"。
+
+        由来（真实教训）：``smoke_master_live.py`` 原先只断言"存在某个动作"，
+        于是 ``{"op":"book_create","status":"failed","error":"缺少参数 novel_id"}``
+        也被判 PASS —— 用户实测的"对话建不了书"就是这样在验收里全绿溜过去的。
+        凡是把墨师动作回执纳入验收的地方，都要显式区分 failed / pending_confirm / ok。
+        """
+        failed = [a for a in (body or {}).get("actions") or []
+                  if str(a.get("status")) == "failed"]
+        detail = ("；".join(f"{a.get('op')}: {a.get('error')}" for a in failed)
+                  if failed else "动作无失败项")
+        return self.check(case, not failed, detail)
 
     @property
     def passed(self) -> int:

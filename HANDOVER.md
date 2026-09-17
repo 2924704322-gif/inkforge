@@ -46,8 +46,8 @@ cd apps/desktop && npm run typecheck && npm run build
 | 跟踪文件 | 142 |
 | Python | 3.13.12（conda env `langchain1.2`） |
 | 引擎路由数 | 76（基线 74 + `/api/ping` + `/api/history`） |
-| 回归测试 | 248 例 / 210 个用例函数 / 5 个文件 |
-| 真实冒烟 | 84 项 / 12 套件 |
+| 回归测试 | 336 例 / 5 个文件（2026-09-17 批次：320 → 336） |
+| 真实冒烟 | 84 项 / 12 套件（+ 2026-09-17 新增 `smoke_master_converse.py`：37 项零 LLM / 58 项含真机） |
 | 前端 | Electron 42.5.0 + Vue 3.5.39 + Naive UI 2.44.1 |
 
 ### 提交历史（provenance）
@@ -204,6 +204,60 @@ cd apps/desktop && npm run typecheck && npm run build
 ---
 
 ## §5 ⚠ 行为契约变更（**必须遵守**，违反会引入 bug）
+
+### 5.A 2026-09-17 批次新增契约（用户实测五问修复）
+
+> 详细取证与验证见 `docs/STATUS.md` §三、`docs/11-对话链路修复报告-20260917.md`。
+
+**(1) 写动作"预览期异常"不再等于失败**
+
+```python
+# actions._split 的 handler：
+#   预览抛 ActionError / LibraryError / RuntimeError / FileNotFoundError
+#   → 一律返回 status="pending_confirm"，把原因写进 pending["preview_error"] 与 impact
+```
+
+- **不要**再把写动作的预览异常改成 `status="failed"`：那会让闸门**不登记待确认**，
+  用户既看不到确认卡也没有可点的按钮（"点了没反应"的直接来源，真实缺陷）。
+- 真正执行（`execute_write=True`）时仍走 `_run_*`，失败照常 `status="failed"`。
+
+**(2) 预览键由"规范化参数"派生，禁止再读可变状态**
+
+```python
+_preview_key(ctx, op, args)  # = f"{op}::{sha1(规范化 args)[:16]}"
+```
+
+- **禁止**在键里再引入 `ctx.book` / `ctx.active_novel()` / `session_key`：
+  建书成功会 `set_active_novel(新书)`，而预览发生在建书之前 —— 键一变，
+  确认就找不到登记 → 409、零落盘、待办还挂着（真实故障，`master-live-final6` 现场）。
+- `consume_preview` 保留了一条"按 op 归并的旧键"兼容分支，新代码不要依赖它。
+
+**(3) 参数名与取值折算集中在 `normalize_args`，且只做一次**
+
+- `ARG_ALIASES`：写动作的参数名漂移（`book_create` 的 `id/book_key/title/novel/name` → `novel_id` …）。
+- 占位符哨兵：`is_placeholder_value()` —— 模型把参数名当取值（`novel_id` / `<书名>`）时折成空串，
+  绝不落盘（真实事故：曾建出一本名为 `novel_id` 的书）。
+- `mode` 折算扩表 + 判不出来按默认 `pipeline`；**原话保留在 `mode_raw`**，确认卡上并列展示。
+- **新增写动作时**：先想清楚"模型可能怎么写歪"，把它加进 `ARG_ALIASES` / 折算表，
+  而不是让用户在确认卡上吃一个失败回执。
+
+**(4) 对话里的长文本必须真的送达用户**
+
+- `_content_echo()`：读类动作 `data.content` ≥120 字且回复里没有其开头片段时，
+  **确定性追加**在回复末尾。禁止只把正文留在动作回执里（用户看不到）。
+
+**(5) 改稿目标必须可核对**
+
+- `_read_target` 强校验 kind/key 形状（`chapter`↔`ch-N`、`settings`↔`settings/**.md`），
+  不符即 404，**绝不"猜一个最像的目标"**。
+- 提案必须带 `targetPath` / `targetTitle` / `targetChars`，UI 必须展示；
+  前端 `EditorPane` 维护 `appStore.docAligned`，选中态与已加载正文不同步时**拦截改稿**。
+
+**(6) 主对话入口与会话作用域**
+
+- `store.resetToMainChat()`（左侧「💬 主对话」）→ 切工作区 + 开全新空白会话。
+- `loadChats({autoResume:false})`：**禁止**在用户主动回主对话后自动恢复旧会话；
+  旧会话保留在「历史对话」面板，不做删除。
 
 ### 5.0 墨师全域化（P0–P4）：作用域哨兵 / 动作层 / 确认闸门
 
@@ -426,6 +480,12 @@ def test_memory_rule(make_memory):       # (MdStore, MemoryManager)，用 FakeIn
 | 19 | 用户说"确认"时按普通回合再规划一次 | 用户已经同意过，却又被挂成一张新的待确认卡（"点了确认，卡还在"） | 命中确认词 → 该轮标记 `confirmed_round`，动作**直接执行**（`dry_run=False`）并立即返回，绝不再登记待办 |
 | 20 | 指望模型把用户原话里的参数填进动作 | 用户明说"标识就用 xx"，模型仍漏 `novel_id`（或写成 `title`）→ 动作失败、确认后什么都没发生 | 规划结果过一遍 `_backfill_from_user_message`：`book_create` 缺 `novel_id` 时从用户原话确定性补齐（`_guess_arg_from_user`） |
 | 21 | 模型在正文里说"这个功能我查不到" | 其实清单里有对应工具（如 `learning_list`），它却把用户话术（"学习仿写"）匹配到了别的工具 | 规划提示词加"用户话术 → 工具对照表"；执行前用 `_topic_ops` 做"答非所问"判定，命中就丢弃模型自选动作、改走补漏规划 |
+| 22 | **把"动作失败"当成"动作存在"来断言** | 验收全绿但用户手上是坏的：`smoke_master_live.py` 原先只断言"存在 book_create 动作"，于是 `{"status":"failed","error":"缺少参数 novel_id"}` 也 PASS —— 用户报的"对话建不了书"就是这样溜过去的 | 凡把动作回执纳入断言，必须区分 `ok` / `pending_confirm` / `failed`；`Suite.check_no_failed_actions()` 已提供现成断言 |
+| 23 | 以为"预览成功"和"确认时"算的是同一把键 | 键里读了 `ctx.active_novel()` 这类**可变状态**，建书成功会 `set_active_novel` → 确认时键变了 → 409「没有经过预览登记」、零落盘、待办还挂着 | 预览键**只由 op + 规范化 args 派生**；`test_preview_key_is_independent_of_active_book` 锁定 |
+| 24 | 以为模型写歪参数"反正会报错，用户会重说" | 模型把 `novel_id` 写成 `id`/`book_key`，而 `normalize_args` 只保留**声明过的键** → 参数被静默丢弃 → 用户看到"缺少参数 novel_id"、反复重说也没用 | 加 `ARG_ALIASES` 参数名折算表；新增写动作时同步想清楚"模型会怎么写歪" |
+| 25 | 以为"模型返回了长正文"就等于"用户看到了" | 墨师只复述摘要（"全文如下（共 2191 字）"）而正文一个字没带 → 用户体感"点开没内容" | `_content_echo()`：读类动作的长文本在回复缺失时**确定性追加**，不依赖模型自觉 |
+| 26 | 以为 `generate_faithful` 什么产出都能吃 | 它直接 `out.model_dump_json()`，而自由文本链路返回的 `ChatResult` 只有 `.content` → 一把保真链铺到正文就 `AttributeError`（说明此前从未被自由文本路径走到过） | 走 `_output_text()` 兼容 str / pydantic / `ChatResult`；铺新的链路前先跑一次真机 |
+| 27 | 用小样本真机跑一次就以为"覆盖到了" | `mode="长篇"` 这类**体裁词当枚举值**的写法第一次真机才暴露（此前测试都喂规范值） | `smoke_master_converse.py` 专测"模型会怎么写歪"（参数别名/占位符/模式词/名字别名），真机与零 LLM 两层都跑 |
 
 ---
 

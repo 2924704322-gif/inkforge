@@ -20,6 +20,36 @@ const saving = ref(false)
 const dirty = ref(false)
 const chapters = ref<ChapterSummary[]>([])
 
+/**
+ * 当前正文是"由哪一次选中"加载出来的（格式：`<bookId>|<key>`）。
+ *
+ * 为什么要记：改稿目标取自 `appStore.selection`，而右侧正文是异步拉取的
+ * （`loadSelection`）。两者一旦不同步（选中态已切到大纲、正文还停在第 1 章），
+ * 改稿就会把指令作用到用户没在看的文稿上——用户看到的是"我明明选的是大纲"。
+ * 现在把它作为"服务端目标自查"的判据暴露出去（见 `selectionMismatch`）。
+ */
+const loadedFrom = ref('')
+const currentSelectionKey = computed(() => {
+  const sel = appStore.selection
+  if (!sel || !appStore.bookId) return ''
+  const key = sel.kind === 'chapter' ? `ch-${sel.chapter}` : sel.rel
+  return `${appStore.bookId}|${key}`
+})
+/** 选中态与已加载正文不一致（非空即不一致）。 */
+const selectionMismatch = computed(
+  () => currentSelectionKey.value !== '' && loadedFrom.value !== currentSelectionKey.value,
+)
+
+// 把对齐状态同步到全局：改稿发送前要用它做最后一道自查（见 store.docAligned）
+watch(
+  [loadedFrom, currentSelectionKey],
+  () => {
+    appStore.loadedDocKey = loadedFrom.value
+    appStore.docAligned = loadedFrom.value !== '' && loadedFrom.value === currentSelectionKey.value
+  },
+  { immediate: true },
+)
+
 const wordCount = computed(() => (doc.value ? doc.value.content.replace(/\s/g, '').length : 0))
 const isMarkdown = computed(() => doc.value?.kind === 'settings')
 const crumbKind = computed(() => {
@@ -47,8 +77,10 @@ async function loadSelection(): Promise<void> {
   const sel = appStore.selection
   if (!sel || !appStore.bookId) {
     doc.value = null
+    loadedFrom.value = ''
     return
   }
+  const wantKey = currentSelectionKey.value
   const base = encodeURIComponent(appStore.bookId)
   try {
     if (sel.kind === 'chapter') {
@@ -77,6 +109,7 @@ async function loadSelection(): Promise<void> {
     }
     dirty.value = false
     mode.value = 'read'
+    loadedFrom.value = wantKey
   } catch (err) {
     doc.value = {
       kind: sel.kind === 'chapter' ? 'chapter' : 'settings',
@@ -86,6 +119,8 @@ async function loadSelection(): Promise<void> {
       content: `加载失败：${err instanceof Error ? err.message : String(err)}`,
       savedContent: '',
     }
+    // 加载失败时**不**标记为"已对齐"：改稿目标自查必须拦住这种状态下发指令
+    loadedFrom.value = ''
   }
 }
 
@@ -170,6 +205,13 @@ function switchChapter(ch: number): void {
           <span v-else-if="doc.status === 'draft'" class="status-tag draft">草稿</span>
         </div>
         <span class="muted">{{ dirty ? '未保存' : '已保存到本机' }}</span>
+      </div>
+
+      <!-- 选中态与已加载正文不同步时显式告警：改稿目标取自选中态，
+           不对齐就可能把改动落到用户没在看的文稿上（曾出现"选大纲、动第一章"）。 -->
+      <div v-if="selectionMismatch" class="align-warn">
+        ⚠ 右侧正文还没跟上你选中的文档：改稿前请在创作空间里重新点一次目标文稿
+        <button class="align-retry" @click="loadSelection">重新加载</button>
       </div>
 
       <!-- 章节 Tab（DeepWrite 的横向小节标签） -->
@@ -265,6 +307,28 @@ function switchChapter(ch: number): void {
 .status-tag.draft {
   background: #fef3c7;
   color: #92400e;
+}
+.align-warn {
+  margin: 0 16px 6px;
+  padding: 5px 9px;
+  border-radius: 6px;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  color: #9a3412;
+  font-size: 11.5px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.align-retry {
+  margin-left: auto;
+  border: 1px solid #fdba74;
+  background: #fff;
+  color: #9a3412;
+  border-radius: 5px;
+  font-size: 11px;
+  padding: 1px 8px;
+  cursor: pointer;
 }
 .chapter-tabs {
   display: flex;

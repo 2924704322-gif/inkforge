@@ -13,7 +13,6 @@ from types import SimpleNamespace
 from src.agents.action_prompt import actions_block_for, master_actions_block
 from src.web.scope import WORKSPACE
 
-
 # ---------- 动作说明注入 ----------
 
 def test_master_gets_action_block_others_do_not():
