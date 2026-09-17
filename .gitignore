@@ -63,3 +63,7 @@ Thumbs.db
 # �ύ��Ϣ��ʱ�ļ�
 COMMIT_MSG_TMP.txt
 .git/COMMIT_MSG_TMP
+# ─────────── 本地内部文档 ───────────
+# docs/ 是本地内部文档（架构/状态/测试报告/历史分析），**不随公开仓库分发**。
+# 注意：scripts/check_doc_paths.py 已适配——该目录不存在时自动跳过相关引用校验。
+docs/

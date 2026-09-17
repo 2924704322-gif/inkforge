@@ -20,7 +20,15 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-TARGETS = ["README.md", "docs/ARCHITECTURE.md"]
+
+# 只校验**当前检出里确实存在**的文档：
+# `docs/` 是本地内部文档（不入公开仓库），在 fresh clone / CI 上不存在 ——
+# 若把它写死进 TARGETS，CI 会因"文档本身不存在"直接判红（假失败）。
+TARGETS = [t for t in ("README.md", "docs/ARCHITECTURE.md") if (REPO / t).exists()]
+
+# 本地内部文档目录：该目录不存在时，跳过所有指向它的引用校验（同理，避免假失败）。
+LOCAL_DOCS_PREFIX = "docs/"
+_HAS_LOCAL_DOCS = (REPO / "docs").exists()
 
 # 文档里的相对路径可能相对于仓库根、engine/ 或 apps/desktop/
 RESOLVE_ROOTS = [Path("."), Path("engine"), Path("apps/desktop"), Path("apps/desktop/src")]
@@ -66,6 +74,8 @@ def _candidates(text: str) -> list[str]:
             continue
         if raw.startswith(("http://", "https://")):
             continue
+        if raw.startswith(LOCAL_DOCS_PREFIX) and not _HAS_LOCAL_DOCS:
+            continue          # docs/ 为本地内部文档，公开检出里没有：不校验、不报错
         if not raw.endswith(PATH_EXTENSIONS):
             continue
         out.append(raw)
@@ -76,6 +86,8 @@ def _candidates(text: str) -> list[str]:
             continue
         raw = raw.split("#", 1)[0]  # 去掉锚点
         if not raw or not raw.endswith(PATH_EXTENSIONS):
+            continue
+        if raw.startswith(LOCAL_DOCS_PREFIX) and not _HAS_LOCAL_DOCS:
             continue
         out.append(raw)
     return out

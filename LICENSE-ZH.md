@@ -32,20 +32,6 @@
 需要商用、二次开发、分发或集成到自己的产品时，请先取得**书面授权**——
 在 GitHub 上开一个 Issue 说明用途即可（<https://github.com/2924704322-gif/inkforge/issues>）。
 
-## 本仓库**不包含**的内容
-
-为避免误会，明确说明本仓库**刻意不含**以下内容（均由 `.gitignore` 排除）：
-
-- **任何小说作品数据**：`engine/data/` 整体不入库，包括 `novels/`（章节正文、大纲、人物卡、
-  摘要、伏笔、会话）、`workspace/`、`materials/`、`learning/`、`skills/`、`custom_skills/`、`config/`。
-  仓库里出现的"小说相关内容"只有 `engine/smoke_test.py` 等测试夹具中**自造的示例文本**，
-  与任何真实作品无关。
-- **任何密钥**：`.env`（`DEEPSEEK_API_KEY` / `EMBEDDING_API_KEY` 等）从不入库，
-  仓库只提供 `engine/.env.example` 占位模板；`configs/models.yaml` 中的密钥一律写作
-  `${ENV_VAR}`，由使用者在本机环境变量或 `.env` 中提供。
-- 运行时派生数据与构建产物：`engine/data/runtime/`、`engine/smoke-reports/`、
-  `apps/desktop/out/`、`node_modules/`。
-
 ## 免责
 
 在法律允许的最大范围内，本软件按"现状"提供，不含任何担保；作者不对使用本软件产生的

@@ -1,6 +1,9 @@
 # Inkforge 修改交接清单（HANDOVER）
 
 > **给后续 agent 的阅读说明**：这是 2026-09-14「S1 止血 + S2 质量基座」升级批次的完整交接文档。
+> **注意 `docs/` 是本地内部文档，不随公开仓库分发**（已被 `.gitignore` 排除）：
+> 本文中所有 `docs/xxx.md` 的引用都指**本地检出**中的文件；在 fresh clone / CI 上不存在，
+> `scripts/check_doc_paths.py` 已适配为"该目录不存在时跳过相关引用校验"。
 > 文档结构与 `docs/STATUS.md`（进度真源）、`docs/SMOKE_TEST_REPORT.md`（测试证据）配套。
 > **先读 §0 和 §5**：§0 让你 30 秒内知道怎么验证，§5 列的是**改动了行为契约、不遵守就会出 bug** 的条目。
 

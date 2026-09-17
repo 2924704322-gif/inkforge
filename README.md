@@ -7,7 +7,7 @@ Inkforge 既有**全自动生产线**（大纲 → 写作 → 四维审校 → �
 > **指标口径说明（重要）**：本项目 README 只陈述**本项目实测**过的数据。
 > 母项目（novel_agent2.1）的验收结论「30 章完本、一次通过率 100%、伏笔回收率 100%」
 > 属于**继承资产的能力声明**，不是本项目在桌面端复现过的结果。
-> 本项目当前实测覆盖见 [docs/SMOKE_TEST_REPORT.md](docs/SMOKE_TEST_REPORT.md) 与 [docs/STATUS.md](docs/STATUS.md)。
+> 本项目当前实测覆盖记录在本地 `docs/`（内部文档，不随本仓库分发）。
 
 ## 架构一图流
 
@@ -28,7 +28,7 @@ Inkforge 既有**全自动生产线**（大纲 → 写作 → 四维审校 → �
 
 - 继承自 **DeepWrite**：三栏产品形态、安全边界（Renderer 无 Node/文件系统/密钥，Main 校验一切跨边界请求）、系统对话框授权模式、引擎子进程监督与自动重启。
 - 继承自 **novel_agent2.1**：生成流水线与提示词资产、Editor 四维评分 + 分级打回 + 磋稿协商、三层记忆、NDS 蒸馏、书架多书管理、按角色绑定模型。
-- 详见 `docs/ARCHITECTURE.md` 与 `docs/STATUS.md`（逐里程碑的真实完成度）。
+- 架构与逐里程碑完成度的详细文档在本地 `docs/`（内部文档，不随本仓库分发）。
 
 > **接手开发请先读 [HANDOVER.md](HANDOVER.md)**：修改交接清单，含验证命令、行为契约变更（必须遵守）、环境变量总表、CI 门禁、已知坑与待办优先级。
 
@@ -45,7 +45,7 @@ inkforge/
 │   └── data/            #   用户数据：novels（MD 事实源）、skills（技能包）、custom_skills
 ├── .github/workflows/   # CI：lint + 测试 + 依赖一致性 + 密钥扫描
 ├── scripts/             # 仓库级守卫脚本（依赖清单比对 / 文档路径校验）
-└── docs/                # 架构文档、状态表、测试报告
+└── docs/                # 本地内部文档（架构/状态/测试报告；不入本仓库）
 ```
 
 ## 快速开始
@@ -141,7 +141,7 @@ python scripts/verify_env.py --optional
 | 密钥 | `.env` 不入库；CI 扫描明文密钥模式 |
 
 > 仍未闭合：.env 目前以明文存放在工作区，且 UI 允许把明文 API Key 写入 `configs/models.yaml`。
-> 缓解计划见 [docs/STATUS.md](docs/STATUS.md) 的「已知缺口」段。
+> 缓解计划见本地 `docs/` 状态表的「已知缺口」段。
 
 ## 蒸馏溯源（本项目从哪里来）
 
@@ -172,13 +172,3 @@ python scripts/verify_env.py --optional
 - 需要商用或二次开发 → 到 Issues 取得书面授权。
 
 中文说明见 [`LICENSE-ZH.md`](LICENSE-ZH.md)（正式条款以 `LICENSE` 为准）。
-
-### 本仓库刻意**不含**的内容
-
-- **任何小说作品数据**：`engine/data/` 整体不入库（`novels/` 章节正文·大纲·人物卡·摘要·会话、
-  `workspace/`、`materials/`、`learning/`、`skills/`、`custom_skills/`、`config/` 全部排除）。
-  仓库里与小说有关的文本只有测试夹具中**自造的示例内容**，与任何真实作品无关。
-- **任何密钥**：`.env` 从不入库，只提供 [`engine/.env.example`](engine/.env.example)；
-  `configs/models.yaml` 里的密钥一律写作 `${ENV_VAR}`，由使用者在本机提供。
-- 运行时派生数据与构建产物：`engine/data/runtime/`、`engine/smoke-reports/`、
-  `apps/desktop/out/`、`node_modules/`。
