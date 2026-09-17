@@ -136,17 +136,6 @@ python scripts/verify_env.py --optional
 | 外部链接 | `shell.openExternal` 仅放行 `http:` / `https:` |
 | 密钥 | `.env` 不入库；CI 扫描明文密钥模式 |
 
-> 仍未闭合：.env 目前以明文存放在工作区，且 UI 允许把明文 API Key 写入 `configs/models.yaml`。
-> 缓解计划见本地 `docs/` 状态表的「已知缺口」段。
-
-## 蒸馏溯源（本项目从哪里来）
-
-| 能力 | 来源 |
-| --- | --- |
-| 三栏工作台、引擎监督、IPC 白名单、系统对话框授权 | DeepWrite（重写为精简版） |
-| LangGraph 流水线、四维审校、分级打回、磋稿协商、三层记忆、NDS 蒸馏、Skill 框架、书架、模型角色绑定 | novel_agent2.1（引擎主体保留） |
-| 设定 Demo 审核向导、审阅卡（评分 + diff + 通过/打回）、指标看板、提案-审阅流、对话智能体编排 | 两者融合的新实现 |
-
 ## 许可（License）
 
 **源码可见，仅供非商业使用；不得再分发，也不得修改后发布。**

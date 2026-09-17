@@ -17,7 +17,7 @@ cd E:\zcode-test\inkforge
 # 1) 引擎依赖自检（5 秒，确认环境可跑）
 python engine/scripts/verify_env.py
 
-# 2) 引擎回归测试（248 例，约 27 秒，零真实 LLM 调用）
+# 2) 引擎回归测试（350 例，约 37 秒，零真实 LLM 调用）
 cd engine && python -m pytest -q && cd ..
 
 # 3) 真实冒烟测试（84 项，真实进程 + 真实 HTTP，约 30 秒）
@@ -49,7 +49,7 @@ cd apps/desktop && npm run typecheck && npm run build
 | 跟踪文件 | 142 |
 | Python | 3.13.12（conda env `langchain1.2`） |
 | 引擎路由数 | 76（基线 74 + `/api/ping` + `/api/history`） |
-| 回归测试 | 336 例 / 5 个文件（2026-09-17 批次：320 → 336） |
+| 回归测试 | 350 例 / 11 个测试文件（2026-09-17 两批次：320 → 336 → 350） |
 | 真实冒烟 | 84 项 / 12 套件（+ 2026-09-17 新增 `smoke_master_converse.py`：37 项零 LLM / 58 项含真机） |
 | 前端 | Electron 42.5.0 + Vue 3.5.39 + Naive UI 2.44.1 |
 
