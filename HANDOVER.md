@@ -205,6 +205,39 @@ cd apps/desktop && npm run typecheck && npm run build
 
 ## §5 ⚠ 行为契约变更（**必须遵守**，违反会引入 bug）
 
+### 5.A2 2026-09-17 批次二：生成约束与逐章字数（用户三问修复）
+
+**(1) `brief` 是书内事实源，不是运行参数**
+
+- 位置 `settings/brief.md`；写入点：`POST /api/demo`、`POST /api/start`（`server._persist_brief`，
+  **写失败只告警、不阻断生成**）；读取点：`MemoryManager.retrieve_context` 第 ⑧ 步直读。
+- `ChapterContext.brief` 与 `custom_constraints` **同级并列**（都是"作者指定"，全量直读、不经检索/裁剪）。
+- **新增/改动模板时必须同步三处**：模板加 `{{brief}}` → 渲染调用传 `brief=` →
+  `prompt_loader._KNOWN_PARAMS` 登记；漏第三处会在**引擎启动期** Fail-Fast（这是刻意的，不是 bug）。
+- 缺 brief.md 的旧书读到空串 → 模板渲染成"（未提供）"，**不得报错、不得跳过生成**。
+
+**(2) 大纲打回走"定向修订"，禁止从零重生成**
+
+- 打回 → `outline_feedback` + `outline_feedback_mode`（新增 state 字段）→ `architect_node`：
+  `mode != "rewrite"` 且已有 outline 时**必须**调 `Architect.revise_outline(原大纲, 意见, mode, brief…)`。
+- `targeted` 契约：**未点名的章节其 title/outline/characters/章号逐字保留**（真机验证 10/10）。
+- 把意见**拼进 brief 字符串**是旧写法（只在 `rewrite` 分支保留）：那会让"人工意见冒充作者需求"，
+  与 brief 保真条款冲突，且模型看不到原稿 → 整篇漂移（问题②根因）。
+- 并行路径同构：`parallel_runner.ensure_outline` 也走 `revise_outline`，并把"上一版"推进为修订基线。
+
+**(3) 逐章预期字数：单一目标，三处共用**
+
+- 数据流：`ChapterPlan.target_words`（大纲阶段产出）→ `resolve_chapter_target(plan, 全局默认)`
+  （**唯一解析入口**）→ `state.chapter_target_words` → writer `target_words_override` /
+  editor `target_words=` / 字数门禁。
+- 可改入口**只有两个**：逐章确认关卡（`chapter_gate` 的 `target_words`）与章节审阅卡打回时
+  （`decision.target_words`）。其余地方不得各自解释目标字数。
+- **写死一条**：`generation.tolerance_for(target)` = `max(word_count_tolerance, target*ratio)`；
+  门禁判据与 `length_revision_note` 的"允许误差"必须用**同一个** tolerance，否则出现
+  "模型按 ±500 写、门禁按 ±750 判"的互相打架。
+- 目标字数落**章节 frontmatter `target_words`**（事实源：重启/看板/续跑都读它）。
+- 串行/并行/互动**共用同一解析入口**，不得各写一份。
+
 ### 5.A 2026-09-17 批次新增契约（用户实测五问修复）
 
 > 详细取证与验证见 `docs/STATUS.md` §三、`docs/11-对话链路修复报告-20260917.md`。

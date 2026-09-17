@@ -41,6 +41,12 @@ class ChapterPlan(BaseModel):
     title: str
     outline: str = Field(description="本章大纲 80-150 字：核心事件/冲突/结尾钩子")
     characters: list[str] = Field(description="本章出场角色名")
+    # 预期字数（问题3）：大纲阶段就给出每章的**篇幅预算**，人审时可改，
+    # 生成时作为该章的唯一目标（写作/评分/字数门禁三者口径一致）。
+    target_words: int | None = Field(
+        default=None,
+        description="本章预期字数（2000-6000 的整数；按本章信息量与节奏给出，全书均值贴近单章目标字数）",
+    )
 
 
 class VolumePlan(BaseModel):

@@ -53,6 +53,9 @@
 ## 世界观规则（与近期剧情相关）
 {{worldview_rules}}
 
+## ⚠ 作者创作需求（brief · 作者原话，最高优先级：剧情卡方向不得违背）
+{{brief}}
+
 ## 自定义创作约束（用户 Skill 预设，最高优先级）
 {{custom_constraints}}
 

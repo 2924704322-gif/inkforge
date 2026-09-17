@@ -21,7 +21,7 @@ from src.agents.editor import Editor, negotiate_revision, verdict_of
 from src.agents.writer import chapter_length, length_deviation, length_revision_note
 from src.config.app_config import GenerationConfig, get_app_config
 from src.memory.memory_manager import ChapterContext
-from src.orchestrator.state import NovelState, chapter_plans
+from src.orchestrator.state import NovelState, chapter_plans, resolve_chapter_target
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -97,7 +97,10 @@ def draft_chapter(pipe, plan: dict, ctx: ChapterContext,
     chapter = plan["chapter"]
     volume = plan["volume"]
     gen = generation_config(pipe)
-    target = getattr(pipe.writer, "target_words", None)
+    # 逐章预期字数（问题3）：与主图同一解析入口（大纲预算优先 → 全局默认）；
+    # 并行路径此前只用管线级 target，导致"大纲里写了 5000、并行写出来按 3000 判"。
+    target = resolve_chapter_target(plan, getattr(pipe.writer, "target_words", None))
+    tolerance = gen.tolerance_for(target) if target else gen.word_count_tolerance
     attempt = start_attempt
     draft_text = previous_text
     partial_retries = 0
@@ -109,7 +112,8 @@ def draft_chapter(pipe, plan: dict, ctx: ChapterContext,
 
     while True:
         result = pipe.writer.write_chapter(
-            ctx, revision_notes=revision_notes, previous_text=draft_text or None
+            ctx, revision_notes=revision_notes, previous_text=draft_text or None,
+            target_words_override=target,
         )
         attempt += 1
         draft_text = result.content
@@ -121,6 +125,7 @@ def draft_chapter(pipe, plan: dict, ctx: ChapterContext,
             "characters": plan.get("characters", []),
             "status": "draft",
             "attempt": attempt,
+            "target_words": target,
             "model": f"{result.provider_name}/{result.model}",
             "used_fallback": result.used_fallback,
         }
@@ -140,8 +145,8 @@ def draft_chapter(pipe, plan: dict, ctx: ChapterContext,
         length_note = ""
         if target is not None and gen.length_gate_enabled:
             actual = chapter_length(draft_text)
-            if length_deviation(actual, target) > gen.word_count_tolerance:
-                length_note = length_revision_note(target, actual)
+            if length_deviation(actual, target) > tolerance:
+                length_note = length_revision_note(target, actual, tolerance)
 
         if verdict == "pass":
             if length_note and length_retries < gen.max_length_retries:

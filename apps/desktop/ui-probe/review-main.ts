@@ -11,7 +11,7 @@
 import { createApp } from 'vue'
 
 import App from '../src/renderer/src/App.vue'
-import { appStore } from '../src/renderer/src/store'
+import { appStore, rememberBook } from '../src/renderer/src/store'
 import '../src/renderer/src/styles.css'
 
 /** 自造填充段落（探针用，与任何真实作品无关） */
@@ -149,9 +149,13 @@ const NOW = Math.floor(Date.now() / 1000)
 
 const CHAT_SUMMARY = {
   chats: [
-    { id: 'probe-chat', agent: 'master', agent_label: '主智能体 · 墨师', title: '大纲改稿', updated: NOW },
+    { id: 'probe-chat', agent: 'master', agent_label: '主智能体 · 墨师', title: '大纲改稿', updated: NOW, scope: 'book', novel: 'probe-review' },
   ],
 }
+
+/** 「回到主对话」会 POST /api/chats 建一个空白工作区会话——桩要能记下来。 */
+const workspaceChats: Array<Record<string, unknown>> = []
+let chatSeq = 0
 
 const CHAT_DATA = {
   id: 'probe-chat',
@@ -177,6 +181,11 @@ const PROPOSALS = {
       title: 'outline · 改稿提案',
       summary: '把第二卷的核心冲突前移，并在第一卷末埋入钟声伏笔。',
       target: { kind: 'settings', key: 'settings/outline.md' },
+      // 引擎侧新增的"目标可核对证据"（2026-09-17）：卡片必须显示改的是哪份文稿。
+      // 回归依据：曾出现"选的是大纲、动的是第一章"且界面无从发现。
+      targetPath: 'settings/outline.md',
+      targetTitle: '大纲',
+      targetChars: 1180,
       status: 'pending',
       statusMessage: '',
       additions: 6,
@@ -230,6 +239,7 @@ const PROPOSALS = {
 function route(method: string, path: string): { status: number; data: unknown } {
   calls.push(`${method} ${path}`)
   const p = path.split('?')[0] ?? path
+  const query = path.includes('?') ? path.slice(path.indexOf('?')) : ''
   if (p === '/api/status') return { status: 200, data: STATUS }
   if (p === '/api/books') return { status: 200, data: BOOKS }
   if (p === '/api/chapters') return { status: 200, data: CHAPTERS }
@@ -247,6 +257,11 @@ function route(method: string, path: string): { status: number; data: unknown } 
     }
   }
   if (p === '/api/settings/tree') return { status: 200, data: { items: [] } }
+  // 设定文档一律 404：既模拟"文件不存在"，也用来触发 EditorPane 的
+  // 「选中态与已加载正文不同步」告警（加载失败 → loadedFrom 归空 → 不一致）。
+  if (p === '/api/settings/doc') {
+    return { status: 404, data: { detail: '文档不存在：探针未提供该设定文档' } }
+  }
   if (p === '/api/interactive/state') {
     return {
       status: 200,
@@ -264,11 +279,27 @@ function route(method: string, path: string): { status: number; data: unknown } 
     }
   }
   if (p === '/api/outline') return { status: 200, data: { html: null } }
-  if (p === '/api/chats') return { status: 200, data: WITH_PROPOSAL ? CHAT_SUMMARY : { chats: [] } }
+  if (p === '/api/chats' && method === 'POST') {
+    chatSeq += 1
+    const chat = {
+      id: `probe-ws-${chatSeq}`, agent: 'master', title: '', created: NOW,
+      messages: [], scope: 'workspace', novel: '',
+    }
+    workspaceChats.push(chat)
+    return { status: 200, data: { ok: true, chat } }
+  }
+  if (p === '/api/chats') {
+    // 作用域隔离：工作区请求（novel=__workspace__）只返回工作区会话；
+    // 书内请求只返回该书的会话。这与引擎 /api/chats 的行为一致。
+    const inWorkspace = query.includes('__workspace__')
+    const chats = inWorkspace ? workspaceChats : (WITH_PROPOSAL ? CHAT_SUMMARY.chats : [])
+    return { status: 200, data: { chats } }
+  }
   if (p === '/api/chats/probe-chat') return { status: 200, data: CHAT_DATA }
   if (p === '/api/chats/probe-chat/proposals') {
     return { status: 200, data: WITH_PROPOSAL ? PROPOSALS : { proposals: [] } }
   }
+  if (p === '/api/book-select') return { status: 200, data: { ok: true, novel_id: '', exists: false } }
   return { status: 200, data: { ok: true } }
 }
 
@@ -290,7 +321,11 @@ function route(method: string, path: string): { status: number; data: unknown } 
   exportManuscript: async () => ({ ok: false, message: '' }),
 }
 
-// 预置作品，避免书架对话框自动弹出遮挡布局
+// 预置作品，避免书架对话框自动弹出遮挡布局。
+// **必须走 rememberBook**：生产的启动路径（App.vue::syncActiveBook）会调用它来记住
+// "最近打开过的书"，工作区顶栏的「↩ 回到《X》」靠它渲染。探针直接赋值 bookId 会绕过它，
+// 于是按钮永远不出现——而线上若也绕过（这正是 2026-09-17 修掉的缺陷）同样不出现。
+rememberBook('probe-review', '探针样板书')
 appStore.bookId = 'probe-review'
 appStore.bookTitle = '探针样板书'
 
@@ -306,4 +341,9 @@ appStore.selection = { kind: 'chapter', chapter: 1 }
   calls,
   ready: true,
   rawHits: () => rawHits,
+  // 2026-09-17 新增断言所需的观测点
+  docAligned: () => appStore.docAligned,
+  loadedDocKey: () => appStore.loadedDocKey,
+  chatResetToken: () => appStore.chatResetToken,
+  workspaceChatCount: () => workspaceChats.length,
 }

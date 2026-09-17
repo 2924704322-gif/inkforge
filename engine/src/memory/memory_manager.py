@@ -28,6 +28,47 @@ STYLE_REL = "settings/style.md"
 # 自定义创作 Skill（用户约束）：向导选定的 Skill 合并落盘，仿 style.md 直读注入
 CUSTOM_SKILLS_REL = "settings/custom-skills.md"
 
+# 作者创作需求（brief）：**唯一事实源**。此前 brief 只在架构阶段被消费一次
+# （世界观/人物/大纲/文风都是从它蒸馏出来的产物），**正文写作链路完全看不到原始需求**——
+# 一旦蒸馏有偏差或后续章节偏离，没有任何"作者原话"能把它拉回来。
+# 这就是"用户指令约束力不足"的结构性根因，故把 brief 落盘为书内事实源并逐章直读注入。
+BRIEF_REL = "settings/brief.md"
+
+
+def read_brief(store: MdStore) -> str:
+    """直读作者创作需求 settings/brief.md 正文（与 read_custom_constraints 同源同逻辑）。
+
+    文件不存在返回空串（旧书向后兼容：调用方渲染成"（未提供）"，不报错、不阻塞）。
+    frontmatter 里的结构化字段（brief_fields）已在落盘时渲染进正文，此处只取正文。
+    """
+    if not store.exists(BRIEF_REL):
+        return ""
+    return store.read(BRIEF_REL).content.strip()
+
+
+def write_brief(store: MdStore, brief: str, fields: dict | None = None) -> bool:
+    """把作者需求写入书内事实源；已有内容且未变化时不重复写（幂等，避免噪声提交）。
+
+    `fields`：结构化 brief 字段（X1）。落盘时**逐项原样**渲染进正文，
+    使"写入"与"读取"路径都保留作者原文，不经任何摘要。
+    """
+    from src.agents.architect import render_brief_fields
+
+    text = (brief or "").strip()
+    structured = render_brief_fields(fields) if fields else ""
+    body = "\n\n".join(p for p in (structured, text) if p).strip()
+    if not body:
+        return False
+    if store.exists(BRIEF_REL) and store.read(BRIEF_REL).content.strip() == body:
+        return False
+    store.write(
+        BRIEF_REL,
+        body,
+        metadata={"title": "作者创作需求（brief）", "brief_fields": fields or {}},
+        commit_message="记录作者创作需求（brief）",
+    )
+    return True
+
 
 def read_custom_constraints(store: MdStore) -> str:
     """直读项目级约束 settings/custom-skills.md 正文（W5 传参唯一读取口）。
@@ -78,6 +119,7 @@ class ChapterContext:
     state_board: list[dict] = field(default_factory=list)       # ⑤实体状态板（硬事实，直读）
     style_guide: str = ""                                        # ⑥文风指纹（style.md 直读）
     custom_constraints: str = ""                                 # ⑦自定义 Skill 约束（custom-skills.md 直读）
+    brief: str = ""                                              # ⑧作者创作需求（brief.md 直读，最高优先级）
 
 
 class MemoryManager:
@@ -226,6 +268,11 @@ class MemoryManager:
 
         # ⑦ 自定义 Skill 约束：全量直读 custom-skills.md 正文（向导选定，人工可编辑）
         ctx.custom_constraints = read_custom_constraints(self.store)
+
+        # ⑧ 作者创作需求（brief）：全量直读 brief.md 正文。
+        # 与 ⑦ 同级并列（都是"作者指定"），同样**不经向量检索/摘要/裁剪**——
+        # 这是问题1 的修法：让每一章生成都能看到作者原话，而不是只看蒸馏物。
+        ctx.brief = read_brief(self.store)
 
         return ctx
 

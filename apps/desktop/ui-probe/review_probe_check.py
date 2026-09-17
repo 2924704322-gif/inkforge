@@ -188,6 +188,9 @@ def main() -> int:
     SHOTS.mkdir(parents=True, exist_ok=True)
     base, httpd = serve(DIST)
     reports: list[dict] = []
+    # 断言收集器必须在浏览器块**之前**定义：2026-09-17 新增的主对话/改稿目标/告警条
+    # 三组断言在 `with sync_playwright()` 内部就会写入，晚定义会 UnboundLocalError。
+    failures: list[str] = []
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
@@ -279,6 +282,146 @@ def main() -> int:
                             f"（msg2 底 {second_bottom} / 卡 {flow['proposal']['y']} / msg3 顶 {third_top}）"
                         )
 
+            # ── 2026-09-17 新增：主对话入口 / 改稿目标展示 / 选中态不同步告警 ──
+            # 为什么用真实内核而不是 DOM 断言：这三条都属于"元素在代码里存在、
+            # 但可能从不渲染或高度为 0"的类型（同 README 坑位 6/10 的教训）。
+            mx = browser.new_page(viewport={"width": 1600, "height": 1000})
+            mx.goto(f"{base}/review.html#proposal", wait_until="networkidle")
+            mx.wait_for_selector(".proposal-card", timeout=15000)
+            mx.wait_for_timeout(400)
+
+            # (1) 提案卡必须显示"本次改的是哪份文稿"（路径 + 原文字数）
+            tgt = mx.locator(".p-target")
+            if tgt.count() == 0:
+                failures.append("mainchat/proposal: 提案卡缺少目标文稿行（.p-target）")
+            else:
+                box = tgt.first.bounding_box()
+                text = (tgt.first.inner_text() or "").replace("\n", " ")
+                bh = box["height"] if box else 0
+                print(f"[1600x1000/proposal] 目标文稿行：h={bh} | {text[:80]}")
+                if bh < 14:
+                    failures.append(
+                        f"proposal: 目标文稿行被压扁（h={bh}px，元素存在但读不到）"
+                    )
+                if "settings/outline.md" not in text:
+                    failures.append(f"proposal: 目标文稿行未显示真实路径（实际 {text[:80]!r}）")
+                if "1180" not in text:
+                    failures.append(f"proposal: 目标文稿行未显示原文字数（实际 {text[:80]!r}）")
+
+            # (2) 选中态与已加载正文不同步 → 页内必须出现告警条
+            mx.evaluate(
+                "() => { window.__store.selection = {kind:'settings',"
+                " rel:'settings/outline.md', title:'大纲'}; }"
+            )
+            mx.wait_for_timeout(500)
+            warn = mx.locator(".align-warn")
+            aligned = mx.evaluate("() => window.__probe.docAligned()")
+            wbox = warn.first.bounding_box() if warn.count() else None
+            wh = wbox["height"] if wbox else 0
+            print(
+                f"[1600x1000/proposal] 选中态不同步：docAligned={aligned} | "
+                f"告警条 {'h=' + str(wh) if wbox else '未出现'}"
+            )
+            if aligned is not False:
+                failures.append(f"mainchat/proposal: 正文加载失败后 docAligned 仍为 {aligned}（应为 False）")
+            if wh < 16:
+                failures.append(
+                    f"proposal: 选中态不同步时告警条未渲染/被压扁（h={wh}px）"
+                )
+            mx.screenshot(path=str(SHOTS / "review-align-warn.png"))
+
+            # (3) 主对话入口：点一下必须切到工作区 + 开全新空白会话
+            before_token = mx.evaluate("() => window.__probe.chatResetToken()")
+            nav = mx.get_by_role("button", name="主对话（工作区）")
+            if nav.count() == 0:
+                failures.append("mainchat: 左侧功能导航没有「主对话（工作区）」按钮")
+            else:
+                nav.first.click()
+                mx.wait_for_timeout(900)
+                after_token = mx.evaluate("() => window.__probe.chatResetToken()")
+                state = mx.evaluate(
+                    """() => ({
+                        bookId: window.__store.bookId,
+                        chatId: window.__store.chatId,
+                        scope: window.__store.bookId || '__workspace__',
+                        workspaceChip: document.querySelectorAll('.chip.workspace').length,
+                        welcome: document.querySelectorAll('.welcome').length,
+                        bubbles: document.querySelectorAll('.msg.assistant, .msg.user').length,
+                        backBtn: document.querySelector('.back-to-book')?.textContent?.trim() || '',
+                        wsChats: window.__probe.workspaceChatCount(),
+                    })"""
+                )
+                print(
+                    f"[1600x1000/mainchat] 切工作区：bookId={state['bookId']!r} "
+                    f"chatId={state['chatId']!r} 工作区徽标={state['workspaceChip']} "
+                    f"空会话欢迎页={state['welcome']} 消息气泡={state['bubbles']} "
+                    f"回书按钮={state['backBtn']!r} 工作区会话数={state['wsChats']}"
+                )
+                mx.screenshot(path=str(SHOTS / "review-mainchat.png"))
+                if after_token <= before_token:
+                    failures.append(
+                        f"mainchat: 点击后 chatResetToken 未自增（{before_token}→{after_token}）"
+                    )
+                if state["bookId"]:
+                    failures.append(f"mainchat: 未切到工作区（bookId 仍为 {state['bookId']!r}）")
+                if state["workspaceChip"] == 0:
+                    failures.append("mainchat: 顶部未出现「🧭 工作区」徽标")
+                if state["welcome"] == 0 or state["bubbles"] != 0:
+                    failures.append(
+                        f"mainchat: 未开成空白会话（欢迎页 {state['welcome']}，"
+                        f"残留消息气泡 {state['bubbles']}）"
+                    )
+                if state["wsChats"] == 0:
+                    failures.append("mainchat: 未为工作区新建空白会话（POST /api/chats 未被调用）")
+                if not state["backBtn"]:
+                    failures.append(
+                        "mainchat: 工作区顶栏没有「回到《X》」入口（lastBookId 未记录）"
+                    )
+                elif "探针样板书" not in state["backBtn"]:
+                    failures.append(f"mainchat: 回书按钮书名不对（{state['backBtn']!r}）")
+
+                # (4) 作用域隔离 + 旧会话可回到：工作区不显示书内会话；点回书后能看到
+                hist_ws = mx.evaluate(
+                    "() => Array.from(document.querySelectorAll('.history-item .h-title'))"
+                    ".map(e => e.textContent)"
+                )
+                if any("大纲改稿" in str(t) for t in hist_ws):
+                    failures.append("mainchat: 工作区历史里出现了书内会话（作用域未隔离）")
+                mx.get_by_role("button", name="历史对话").click()
+                mx.wait_for_timeout(200)
+                ws_titles = mx.evaluate(
+                    "() => Array.from(document.querySelectorAll('.history-item .h-title'))"
+                    ".map(e => e.textContent)"
+                )
+                print(f"[1600x1000/mainchat] 工作区历史会话：{ws_titles}")
+
+                if state["backBtn"]:
+                    mx.locator(".back-to-book").first.click()
+                    mx.wait_for_timeout(900)
+                    back = mx.evaluate(
+                        """async () => {
+                            const btns = Array.from(document.querySelectorAll('.ghost-btn'));
+                            const h = btns.find(b => (b.textContent || '').includes('历史对话'));
+                            if (h) h.click();
+                            return null;
+                        }"""
+                    )
+                    mx.wait_for_timeout(300)
+                    book_titles = mx.evaluate(
+                        "() => Array.from(document.querySelectorAll('.history-item .h-title'))"
+                        ".map(e => e.textContent)"
+                    )
+                    print(
+                        f"[1600x1000/mainchat] 回到《探针样板书》后历史会话：{book_titles}"
+                        f"（back={back}）"
+                    )
+                    if not any("大纲改稿" in str(t) for t in book_titles):
+                        failures.append(
+                            "mainchat: 回到该书后仍看不到原会话（旧会话应可在对应历史里继续）"
+                        )
+                    mx.screenshot(path=str(SHOTS / "review-mainchat-back.png"))
+            mx.close()
+
             # 互动出卡：页面必须仍然可点（本轮真实 bug：出卡后整页卡死）
             ia = browser.new_page(viewport={"width": 1600, "height": 1000})
             ia.goto(f"{base}/review.html#interactive", wait_until="networkidle")
@@ -365,7 +508,8 @@ def main() -> int:
     report_path.write_text(json.dumps(reports, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[报告] {report_path}\n")
 
-    failures: list[str] = []
+    # failures 已在浏览器块之前初始化（新增断言会提前写入），此处**不能**重置，
+    # 否则会把主对话/改稿目标/告警条的失败清空。
     # 已知缺陷（单独跟踪，不计入退出码）：见 README「已知缺陷」一节
     known: list[str] = []
     for r in reports:

@@ -36,7 +36,7 @@ from src.memory.memory_manager import (
 )
 from src.orchestrator.finalize import finalize_chapter
 from src.orchestrator.scheduler import generation_config
-from src.orchestrator.state import NovelState, plan_for_chapter
+from src.orchestrator.state import NovelState, plan_for_chapter, resolve_chapter_target
 from src.skills.memory_bus import EVENT_OUTLINE_APPROVED, MemoryBus
 from src.utils.logger import get_logger
 
@@ -95,17 +95,35 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
 
     def architect_node(state: NovelState) -> dict:
         feedback = state.get("outline_feedback", "")
+        mode = str(state.get("outline_feedback_mode") or "targeted")
+        existing = _load_outline_md(pipe.store)
         # 无打回意见时优先复用既有 outline.md（含人工在资料库页编辑保存的版本），
         # 与并行模式 ensure_outline 语义一致，避免覆盖用户改稿。
         if not feedback:
-            existing = _load_outline_md(pipe.store)
             if existing is not None:
                 logger.info("检测到既有大纲《%s》，复用（跳过 Architect 重新生成）",
                             existing.get("book_title", ""))
                 pipe.memory.rebuild_index()
                 return {"outline": existing, "outline_feedback": ""}
+        elif existing is not None and mode != "rewrite":
+            # ★ 打回走**定向修订**：把原大纲交给模型，只改意见涉及处。
+            # 原实现把意见拼进 brief 后从零重生成 → 用户感受"重写稿与描述相差很大"（问题2）。
+            logger.info("大纲打回 → 定向修订（mode=%s，意见 %d 字）",
+                        mode, len(str(feedback)))
+            revised = pipe.architect.revise_outline(
+                existing,
+                feedback,
+                brief=state.get("brief", ""),
+                revision_mode=mode,
+                custom_constraints=read_custom_constraints(pipe.store),
+                total_chapters=state.get("total_chapters") or 0,
+            )
+            pipe.memory.rebuild_index()
+            return {"outline": revised.model_dump(), "outline_feedback": "",
+                    "outline_feedback_mode": "targeted"}
         brief = state["brief"]
-        if feedback:
+        if feedback and mode == "rewrite":
+            # 仅"整体重写"才把意见并入需求（定向修订走上面的结构化修订路径）
             brief = f"{brief}\n\n【人工审阅打回意见，必须落实】\n{feedback}"
         # 项目级约束（settings/custom-skills.md）与 brief 同处送达设定/大纲渲染（W5）
         outline = pipe.architect.generate_settings(
@@ -134,10 +152,15 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
                 })
             return {
                 "outline_feedback": "",
+                "outline_feedback_mode": "targeted",
                 "current_chapter": 1,
             }
-        logger.info("大纲被人工打回：%s", decision.get("feedback", ""))
-        return {"outline_feedback": decision.get("feedback", "请改进大纲")}
+        logger.info("大纲被人工打回（mode=%s）：%s",
+                    decision.get("revision_mode", "targeted"), decision.get("feedback", ""))
+        return {
+            "outline_feedback": decision.get("feedback", "请改进大纲"),
+            "outline_feedback_mode": str(decision.get("revision_mode") or "targeted"),
+        }
 
     def assemble_context_node(state: NovelState) -> dict:
         chapter = state["current_chapter"]
@@ -174,6 +197,11 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
         return {
             "chapter_ctx": asdict(ctx),
             "current_volume": plan["volume"],
+            # 本章预期字数（问题3）：优先取大纲里该章的预算，缺失则回落全局默认。
+            # 入 state 后成为本章**唯一**目标——写作、评分、字数门禁三者口径一致。
+            "chapter_target_words": resolve_chapter_target(
+                plan, getattr(pipe.writer, "target_words", None)
+            ),
             "attempt": 0,
             "partial_retries": 0,
             "full_retries": 0,
@@ -188,10 +216,13 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
     def writer_node(state: NovelState) -> dict:
         ctx = ChapterContext(**state["chapter_ctx"])
         revision_notes = state.get("revision_notes")
+        target = state.get("chapter_target_words")
         result = pipe.writer.write_chapter(
             ctx,
             revision_notes=revision_notes,
             previous_text=state.get("draft_text") or None,
+            # 逐章目标字数：覆盖管线默认值（问题3 的核心接线点）
+            target_words_override=target,
         )
         attempt = state.get("attempt", 0) + 1
         # 每稿即落盘（人工可随时查看），状态 draft
@@ -207,6 +238,8 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
                 "characters": plan.get("characters", []),
                 "status": "draft",
                 "attempt": attempt,
+                # 目标字数落 frontmatter = 事实源：断点续跑/看板/后续章节都读得到
+                "target_words": target,
                 "model": f"{result.provider_name}/{result.model}",
                 "used_fallback": result.used_fallback,
             },
@@ -223,7 +256,9 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
     def editor_node(state: NovelState) -> dict:
         ctx = ChapterContext(**state["chapter_ctx"])
         gen = generation_config(pipe)
-        target = getattr(pipe.writer, "target_words", None)
+        # 逐章目标（问题3）：与 writer 用同一个值，评分口径才与写作口径一致
+        target = state.get("chapter_target_words") or getattr(pipe.writer, "target_words", None)
+        tolerance = gen.tolerance_for(target) if target else gen.word_count_tolerance
         review = pipe.editor.review_chapter(
             ctx, state["draft_text"], state["attempt"], target_words=target,
         )
@@ -234,8 +269,8 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
         length_note = ""
         if target is not None and gen.length_gate_enabled:
             actual = chapter_length(state["draft_text"])
-            if length_deviation(actual, target) > gen.word_count_tolerance:
-                length_note = length_revision_note(target, actual)
+            if length_deviation(actual, target) > tolerance:
+                length_note = length_revision_note(target, actual, tolerance)
 
         if verdict == "partial_rewrite":
             if state.get("partial_retries", 0) < gen.max_partial_retries:
@@ -305,6 +340,10 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
                 "review": state.get("review", {}),
                 "retry_exceeded": state.get("retry_exceeded", False),
                 "attempt": state.get("attempt", 1),
+                # 本章预期字数（问题3）：审阅卡上显示"目标/实际/偏差"，人工打回时
+                # 也可带新目标字数（decision.target_words）→ 下一稿按新目标写。
+                "target_words": state.get("chapter_target_words"),
+                "actual_length": chapter_length(state["draft_text"]),
                 "model": state.get("model"),
                 "used_fallback": state.get("used_fallback", False),
             }
@@ -316,6 +355,16 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
             }
         feedback = decision.get("feedback", "")
         mode = decision.get("revision_mode", "targeted")
+        # 人工在审阅卡上改了预期字数 → 下一稿按新目标写（写作/评分/门禁同一口径）
+        new_target = decision.get("target_words")
+        target_update: dict = {}
+        if new_target not in (None, ""):
+            resolved = resolve_chapter_target({"target_words": new_target},
+                                              state.get("chapter_target_words"))
+            if resolved and resolved != state.get("chapter_target_words"):
+                logger.info("第 %d 章人工调整预期字数：%s → %s", state["current_chapter"],
+                            state.get("chapter_target_words"), resolved)
+                target_update["chapter_target_words"] = resolved
         logger.info("第 %d 章被人工打回（%s）：%s", state["current_chapter"], mode, feedback)
         return {
             "first_review_passed": False if first_time else state["first_review_passed"],
@@ -324,6 +373,7 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
             "partial_retries": 0,
             "full_retries": 0,
             "retry_exceeded": False,
+            **target_update,
         }
 
     def route_after_human(state: NovelState) -> str:
@@ -353,18 +403,34 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
         与 human_review 用同一套 interrupt/resume 机制（前端通过 /api/decision
         或对话框里的「继续」指令放行）。这是刻意的产品行为：一章一章来，
         不让流水线自己往下跑。
+
+        **预期字数（问题3）**：关卡上把"下一章"的预期字数一并报给前端（来自大纲预算，
+        缺失则回落全局默认），用户可原样放行、也可带着新的 `target_words` 放行——
+        这就是"生成新章节之前先定预期字数"的落点。
         """
+        next_chapter = state["current_chapter"]
+        planned = plan_for_chapter(state, next_chapter) or {}
+        default_target = resolve_chapter_target(
+            planned, getattr(pipe.writer, "target_words", None)
+        )
         decision = interrupt(
             {
                 "type": "chapter_gate",
-                "approved_chapter": state["current_chapter"] - 1,
-                "next_chapter": state["current_chapter"],
+                "approved_chapter": next_chapter - 1,
+                "next_chapter": next_chapter,
+                "target_words": default_target,
+                "planned_target_words": default_target,
             }
         )
         if decision.get("action") == "approve":
-            logger.info("用户指示继续：开始生成第 %d 章", state["current_chapter"])
-            return {}
-        logger.info("用户选择暂不继续：第 %d 章待写", state["current_chapter"])
+            # 用户在关卡上改过字数就用新的（唯一的"生成前设定"入口）
+            chosen = resolve_chapter_target(
+                {"target_words": decision.get("target_words")}, default_target
+            )
+            logger.info("用户指示继续：开始生成第 %d 章（预期字数 %s）",
+                        next_chapter, chosen)
+            return {"chapter_target_words": chosen} if chosen else {}
+        logger.info("用户选择暂不继续：第 %d 章待写", next_chapter)
         return {"done": True}
 
     def route_after_writeback(state: NovelState) -> str:

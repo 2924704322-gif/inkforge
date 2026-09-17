@@ -43,17 +43,21 @@ def length_deviation(actual: int, target: int) -> int:
     return abs(actual - target)
 
 
-def length_revision_note(target: int, actual: int) -> str:
-    """字数门禁打回指令（客观约束，不协商）。"""
+def length_revision_note(target: int, actual: int, tolerance: int = DEFAULT_TOLERANCE) -> str:
+    """字数门禁打回指令（客观约束，不协商）。
+
+    `tolerance` 可传（问题3）：容差现在按目标字数比例算，指令里的"允许误差"必须
+    与实际门禁用的同一个数，否则模型按 ±500 写、门禁按 ±750 判，来回打架。
+    """
     if actual < target:
         return (
-            f"【字数修正】当前正文 {actual} 字，少于目标 {target} 字（允许误差 ±500 字）。"
+            f"【字数修正】当前正文 {actual} 字，少于目标 {target} 字（允许误差 ±{tolerance} 字）。"
             f"请在原稿基础上自然扩充约 {target - actual} 字：深化场景细节、补足对话与心理层次，"
             f"不得注水或重复，保持结尾钩子不变。"
         )
     return (
         f"【字数修正】当前正文 {actual} 字，超出目标 {target} 字约 {actual - target} 字。"
-        f"请删减冗余描写与无关枝节，压缩至目标附近（允许误差 ±500 字），"
+        f"请删减冗余描写与无关枝节，压缩至目标附近（允许误差 ±{tolerance} 字），"
         f"保留全部核心事件、关键对话与结尾钩子。"
     )
 
@@ -167,6 +171,9 @@ class Writer:
                 )
         prompt = render_prompt(
             "writer_chapter",
+            # 作者创作需求（brief）：与 custom_constraints 同级并列的**最高优先级输入**。
+            # 缺它是"用户指令约束力不足"的结构性根因——正文此前只看到大纲/文风等蒸馏物。
+            brief=ctx.brief.strip() or "（未提供）",
             target_words=target,
             tolerance=self._tolerance,
             revision_section=revision_section,

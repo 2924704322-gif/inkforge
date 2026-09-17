@@ -435,6 +435,76 @@ class Architect:
 
     # ---------- 大纲 + 伏笔 ----------
 
+    def revise_outline(
+        self,
+        original: dict,
+        feedback: str,
+        brief: str = "",
+        revision_mode: str = "targeted",
+        custom_constraints: str = "",
+        total_chapters: int = 0,
+    ) -> OutlineOutput:
+        """**大纲定向修订**（人工打回后走这条路，而不是从零重生成）。
+
+        为什么必须单开一条路（问题2 的根因）：
+        原实现把打回意见**拼进 brief 字符串**后重新调用 `generate_settings()`——
+        ① 模型**看不到原大纲**，等于凭空再写一版；
+        ② 没被告知"只改点名处"，于是整篇重排（用户感受：重写稿与描述相差很大）；
+        ③ 意见被塞进 brief，而 brief 受"逐项保真"约束 → 语义冲突；
+        ④ `revision_mode`（targeted/rewrite）在大纲路径**完全没用上**（只有章节路径用了）。
+        对比：章节打回走 `human_revision_notes` + **携带上一稿正文**，所以章节打回尚可、大纲打回很糟。
+
+        契约：`targeted` 下，**未被意见点名的章节计划必须逐字保留**（title/outline/characters/章号），
+        只允许改动意见涉及处；`rewrite` 才允许重构（并由调用方显式请求）。
+        """
+        mode = "rewrite" if str(revision_mode).strip().lower() == "rewrite" else "targeted"
+        original_json = json.dumps(original or {}, ensure_ascii=False, indent=1)
+        detect = ("\n".join(f"- 卷{v.get('volume')}《{v.get('title', '')}》"
+                            f"第{v['chapters'][0]['chapter']}-{v['chapters'][-1]['chapter']}章"
+                            for v in (original or {}).get("volumes", []) if v.get("chapters"))
+                  if isinstance(original, dict) else "")
+        logger.info("Architect: 大纲定向修订（mode=%s）意见=%s", mode, str(feedback)[:80])
+        prompt = render_prompt(
+            "architect_outline_revise",
+            brief=brief or "（未提供）",
+            original_outline=original_json,
+            revision_notes=str(feedback or "").strip() or "（未提供意见）",
+            revision_mode=mode,
+            worldview_digest=detect,
+            character_digest="",
+            total_chapters=total_chapters or self._chapter_count_dict(original),
+            custom_constraints=custom_constraints.strip() or "（无）",
+            brief_fidelity=brief_fidelity_block(),
+        )
+        out = generate_faithful(
+            lambda msgs, temp: chat_structured(
+                self._registry, ROLE, msgs, OutlineOutput, temperature=temp
+            ),
+            [ChatMessage("user", prompt)],
+        )
+        # 修订后章节总数必须与原大纲一致（字数/章号是下游依赖的硬结构）
+        want = total_chapters or self._chapter_count_dict(original)
+        got = self._chapter_count(out)
+        if want and got != want:
+            logger.warning("大纲修订后章节数 %d ≠ 原 %d，携差异重试一次", got, want)
+            out = generate_faithful(
+                lambda msgs, temp: chat_structured(
+                    self._registry, ROLE, msgs, OutlineOutput, temperature=temp
+                ),
+                [ChatMessage("user", f"{prompt}\n\n## 修正要求（上一次不合格）\n"
+                                     f"上次产出了 {got} 章，但必须与原大纲一致：恰好 {want} 章，"
+                                     f"章号从 1 连续编号到 {want}，不得增删章节。")],
+            )
+        self.save_outline(out)
+        return out
+
+    @staticmethod
+    def _chapter_count_dict(outline: dict) -> int:
+        if not isinstance(outline, dict):
+            return 0
+        return sum(len(v.get("chapters", [])) for v in outline.get("volumes", [])
+                   if isinstance(v, dict))
+
     def _generate_outline(
         self,
         brief: str,

@@ -111,6 +111,8 @@ export interface ChapterPlanInfo {
   title: string
   outline: string
   characters: string[]
+  /** 本章预期字数（大纲阶段给出，生成前可改）——写作/评分/字数门禁共用同一目标 */
+  target_words?: number | null
 }
 
 export interface VolumePlanInfo {
@@ -141,6 +143,9 @@ export type PendingItem =
       type: 'chapter_gate'
       approved_chapter: number
       next_chapter: number
+      /** 下一章预期字数（大纲预算；生成前可在关卡上改） */
+      target_words?: number | null
+      planned_target_words?: number | null
     } & Record<string, unknown>)
   | ({
       type: 'chapter_review'
@@ -150,6 +155,10 @@ export type PendingItem =
       review: ChapterReview
       retry_exceeded?: boolean
       attempt: number
+      /** 本章预期字数（写作/评分/门禁同一目标）；打回时改它会按新目标重写 */
+      target_words?: number | null
+      /** 本章实际字数（引擎侧统计，与目标并列展示"偏差"） */
+      actual_length?: number | null
       model?: string
       used_fallback?: boolean
       previous_draft?: string

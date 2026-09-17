@@ -3,7 +3,7 @@ import { NConfigProvider, NDialogProvider, NMessageProvider, zhCN, dateZhCN } fr
 import { onMounted, ref } from 'vue'
 
 import { api } from './api'
-import { appStore } from './store'
+import { appStore, rememberBook } from './store'
 import BookshelfDialog from './components/BookshelfDialog.vue'
 import ChatPanel from './components/ChatPanel.vue'
 import EditorPane from './components/EditorPane.vue'
@@ -72,6 +72,9 @@ async function syncActiveBook(): Promise<void> {
     if (res?.novel_id && res.exists !== false) {
       appStore.bookId = res.novel_id
       appStore.bookTitle = res.novel_id
+      // 也要记住"最近打开过的书"：工作区顶栏的「↩ 回到《X》」靠它渲染。
+      // 这里只记录、不调用 openBook()——启动同步不该触发选中/会话重置。
+      rememberBook(res.novel_id, res.novel_id)
     }
     await api('PUT', '/api/book-select', { novel_id: appStore.bookId }).catch(
       () => undefined,

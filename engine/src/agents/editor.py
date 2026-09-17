@@ -98,6 +98,8 @@ class Editor:
             foreshadowing=_fmt_foreshadowing(ctx.unresolved_foreshadowing),
             style_guide=ctx.style_guide.strip() or "（无）",
             custom_constraints=ctx.custom_constraints.strip() or "（无）",
+            # 作者创作需求：审查侧必须能看到"作者到底要什么"，否则无法判断约束是否落实
+            brief=ctx.brief.strip() or "（未提供）",
             chapter_text=chapter_text,
             target_words=target_words if target_words is not None else "未指定",
             actual_length=actual,

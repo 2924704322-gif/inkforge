@@ -160,6 +160,25 @@ python scripts/verify_env.py --optional
 - **密钥管理**：尚未接入 `safeStorage`，`.env` 明文存放；
 - **契约**：TS 与 Python 两侧类型仍为手写双份，JSON Schema 单一真源待落地。
 
-## License
+## 许可（License）
 
-私人项目，未附加开源许可证。
+**源码可见，仅供非商业使用；不得再分发，也不得修改后发布。**
+
+本项目采用 [**PolyForm Strict License 1.0.0**](LICENSE)（SPDX：`PolyForm-Strict-1.0.0`）：
+
+- ✅ 阅读 / 学习 / 研究 / 在本机原样运行实验 / 个人业余用途；学校、科研、政府等机构的非商业使用；
+- ❌ **二传再分发**（拷贝、上传、打包、转给他人）、**商用**（任何有商业预期的场景）、
+  **修改后发布衍生作品**；
+- 需要商用或二次开发 → 到 Issues 取得书面授权。
+
+中文说明见 [`LICENSE-ZH.md`](LICENSE-ZH.md)（正式条款以 `LICENSE` 为准）。
+
+### 本仓库刻意**不含**的内容
+
+- **任何小说作品数据**：`engine/data/` 整体不入库（`novels/` 章节正文·大纲·人物卡·摘要·会话、
+  `workspace/`、`materials/`、`learning/`、`skills/`、`custom_skills/`、`config/` 全部排除）。
+  仓库里与小说有关的文本只有测试夹具中**自造的示例内容**，与任何真实作品无关。
+- **任何密钥**：`.env` 从不入库，只提供 [`engine/.env.example`](engine/.env.example)；
+  `configs/models.yaml` 里的密钥一律写作 `${ENV_VAR}`，由使用者在本机提供。
+- 运行时派生数据与构建产物：`engine/data/runtime/`、`engine/smoke-reports/`、
+  `apps/desktop/out/`、`node_modules/`。

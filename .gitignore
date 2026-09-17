@@ -39,6 +39,8 @@ engine/data/learning/
 engine/data/config/
 # 工作区会话（墨师全域总控的对话记录，属用户数据）
 engine/data/workspace/
+# ★ 兜底：整个 engine/data/ 一律不入库（将来新增子目录也自动排除，防泄露用户作品或密钥）
+engine/data/
 
 # ─────────── 测试与临时产物 ───────────
 e2e-shots/
@@ -58,6 +60,6 @@ docs/step*.png
 .DS_Store
 Thumbs.db
 
-# �ύ��Ϣ��ʱ�ļ�
+# �ύ��Ϣ��ʱ�ļ�
 COMMIT_MSG_TMP.txt
 .git/COMMIT_MSG_TMP

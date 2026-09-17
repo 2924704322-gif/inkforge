@@ -68,16 +68,29 @@ def ensure_outline(pipe, brief: str, total_chapters: int,
         return existing
 
     feedback = ""
+    revision_mode = "targeted"
     while True:
-        effective_brief = brief
-        if feedback:
-            effective_brief = f"{brief}\n\n【人工审阅打回意见，必须落实】\n{feedback}"
-        outline_out = pipe.architect.generate_settings(
-            effective_brief, total_chapters,
-            custom_constraints=read_custom_constraints(pipe.store),
-        )
+        if feedback and existing is not None and revision_mode != "rewrite":
+            # 与主图同构：打回走**定向修订**（带原大纲），不从零重生成
+            revised = pipe.architect.revise_outline(
+                existing,
+                feedback,
+                brief=brief,
+                revision_mode=revision_mode,
+                custom_constraints=read_custom_constraints(pipe.store),
+                total_chapters=total_chapters,
+            )
+            outline = revised.model_dump()
+        else:
+            effective_brief = brief
+            if feedback:
+                effective_brief = f"{brief}\n\n【人工审阅打回意见，必须落实】\n{feedback}"
+            outline_out = pipe.architect.generate_settings(
+                effective_brief, total_chapters,
+                custom_constraints=read_custom_constraints(pipe.store),
+            )
+            outline = outline_out.model_dump()
         pipe.memory.rebuild_index()
-        outline = outline_out.model_dump()
         decision = outline_cb({"type": "outline_review", "outline": outline})
         if decision.get("action") == "approve":
             logger.info("大纲人审通过，进入卷级并行章节循环")
@@ -88,7 +101,9 @@ def ensure_outline(pipe, brief: str, total_chapters: int,
                 })
             return outline
         feedback = decision.get("feedback", "请改进大纲")
-        logger.info("大纲被人工打回：%s", feedback)
+        revision_mode = str(decision.get("revision_mode") or "targeted")
+        existing = outline   # 修订基线推进为"上一版"
+        logger.info("大纲被人工打回（mode=%s）：%s", revision_mode, feedback)
 
 
 # ---------- 跨卷一致性审查（R2） ----------

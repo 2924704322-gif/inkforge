@@ -55,6 +55,28 @@ def _parse_estimated_words(content: str) -> tuple[str, int | None]:
     cleaned = _ESTIMATED_WORDS_RE.sub("", content).rstrip()
     return cleaned, int(m.group(1))
 
+
+def _persist_brief(novel: str, brief: str, fields: object = None) -> None:
+    """把作者创作需求写入书内事实源 `settings/brief.md`（问题1：约束力不足的修法）。
+
+    为什么必须有这一步：brief 原先只作为**运行参数**存在（`graph.invoke({"brief": ...})`），
+    正文写作链路的 `ChapterContext` 里根本没有它——作者原话只在架构阶段被消费一次，
+    后续章节只看到大纲/文风等蒸馏物。落盘后 `MemoryManager.retrieve_context` 逐章直读，
+    作者原话重新参与每一次生成。
+
+    **写失败不阻断生成**（记 warning 继续）：需求落盘是"增强约束力"，不能反过来成为新的失败点。
+    """
+    try:
+        from src.memory.memory_manager import write_brief
+        from src.memory.store_factory import open_store
+
+        store = open_store(get_settings().novels_dir / novel, writable=True)
+        fields_dict = fields.model_dump() if hasattr(fields, "model_dump") else (fields or None)
+        if write_brief(store, brief, fields_dict):
+            logger.info("已记录作者创作需求到 %s（%d 字）", novel, len(brief))
+    except Exception as exc:  # noqa: BLE001 - 落盘失败不得阻断生成
+        logger.warning("作者创作需求落盘失败（不阻断生成）：%s", exc)
+
 # 自定义创作 Skill（约束型）：全局存于 data/custom_skills/，向导选定后
 # 合并写入该书 settings/custom-skills.md。
 #
@@ -1402,6 +1424,10 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
         brief = _effective_brief(body.brief, body.brief_fields)
         if not brief:
             raise HTTPException(400, "创作需求 brief 不能为空")
+        # 作者需求落盘为书内事实源：后续每一章生成都直读它（问题1 的修法）。
+        # 放在这里而不是"生成开始时"，是因为 Demo 阶段就是作者输入需求的那一刻，
+        # 中途失败也能保住需求原文，不必让用户重打一遍。
+        _persist_brief(novel, brief, body.brief_fields)
         try:
             _sess(novel).start_demo(
                 brief, body.chapters, body.feedback, body.skill_ids
@@ -1510,6 +1536,8 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
         brief = _effective_brief(body.brief, body.brief_fields)
         if not brief:
             raise HTTPException(400, "创作需求 brief 不能为空")
+        # 直接点"开始生成"（跳过 Demo 向导）时也要落盘需求，否则正文链路看不到作者原话
+        _persist_brief(novel, brief, body.brief_fields)
         try:
             _sess(novel).start(
                 brief, body.chapters, body.parallel, body.workers, body.skill_ids

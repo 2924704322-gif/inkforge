@@ -77,13 +77,13 @@ _KNOWN_PARAMS: dict[str, frozenset[str]] = {
     "plotter_cards": frozenset(
         {"chapter", "story_overview", "recent_summaries", "related_summaries",
          "character_states", "state_board", "foreshadowing", "due_foreshadowing",
-         "worldview_rules", "custom_constraints", "feedback"}
+         "worldview_rules", "custom_constraints", "feedback", "brief"}
     ),
     "writer_chapter": frozenset(
         {"target_words", "tolerance", "revision_section", "chapter", "outline",
          "recent_summaries", "related_summaries", "character_states",
          "foreshadowing", "due_foreshadowing", "worldview_rules", "state_board",
-         "style_guide", "custom_constraints"}
+         "style_guide", "custom_constraints", "brief"}
     ),
     "writer_negotiate": frozenset(
         {"chapter", "outline", "issues", "comment", "chapter_text",
@@ -92,7 +92,14 @@ _KNOWN_PARAMS: dict[str, frozenset[str]] = {
     "editor_review": frozenset(
         {"chapter", "outline", "recent_summaries", "character_states",
          "worldview_rules", "foreshadowing", "style_guide", "custom_constraints",
-         "chapter_text", "target_words", "actual_length", "tolerance"}
+         "chapter_text", "target_words", "actual_length", "tolerance", "brief"}
+    ),
+    # 大纲**定向修订**（打回重写专用）：带原大纲 JSON + 意见 + 修订模式，
+    # 与"从零生成大纲"是两个模板——这是问题2（打回漂移）的修法核心。
+    "architect_outline_revise": frozenset(
+        {"brief", "original_outline", "revision_notes", "revision_mode",
+         "worldview_digest", "character_digest", "total_chapters",
+         "custom_constraints", "brief_fidelity"}
     ),
     "editor_arbitrate": frozenset(
         {"chapter", "issues", "responses", "custom_constraints"}

@@ -63,6 +63,8 @@ class Plotter:
         prompt = render_prompt(
             "plotter_cards",
             chapter=chapter,
+            # 作者创作需求：出卡是"本章走向"的第一道决策，必须服从作者原话
+            brief=ctx.brief.strip() or "（未提供）",
             story_overview=self._story_overview(),
             recent_summaries=_fmt_list(ctx.recent_summaries),
             related_summaries=_fmt_list(ctx.related_summaries),

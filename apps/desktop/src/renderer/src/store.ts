@@ -78,11 +78,22 @@ export function inWorkspace(): boolean {
   return !appStore.bookId
 }
 
+/**
+ * 记住"最近打开过的书"（供工作区顶栏「↩ 回到《X》」使用）。
+ *
+ * 为什么要单独抽出来：`openBook()` 会重置选中/会话/资源树，而**启动时的书目同步**
+ * （`App.vue::syncActiveBook`）只需要记录、不能触发重置，于是它原先直接赋值
+ * `appStore.bookId` —— 结果 `lastBookId` 始终为空，工作区顶栏永远不显示"回到某本书"
+ * （UI 探针断言直接抓到：按钮在代码里存在，实际从不渲染）。
+ */
+export function rememberBook(novelId: string, title = ''): void {
+  if (!novelId) return
+  appStore.lastBookId = novelId
+  appStore.lastBookTitle = title || novelId
+}
+
 export function openBook(novelId: string, title = ''): void {
-  if (novelId) {
-    appStore.lastBookId = novelId
-    appStore.lastBookTitle = title || novelId
-  }
+  rememberBook(novelId, title)
   appStore.bookId = novelId
   appStore.bookTitle = novelId ? (title || novelId) : ''
   appStore.selection = null

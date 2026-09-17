@@ -4,6 +4,7 @@ import {
   NButton,
   NDivider,
   NInput,
+  NInputNumber,
   NModal,
   NRadio,
   NRadioGroup,
@@ -14,7 +15,7 @@ import {
   NTag,
   useMessage,
 } from 'naive-ui'
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 
 import { api, scoreColor, withNovel } from '../api'
 import type { PendingItem, StatusSnapshot } from '../types'
@@ -39,9 +40,71 @@ const chapter = computed(() =>
 /** 逐章确认关卡：上一章已定稿，等用户在对话框发指令才写下一章。 */
 const gate = computed(() =>
   props.pending.type === 'chapter_gate'
-    ? (props.pending as unknown as { next_chapter: number; approved_chapter: number })
+    ? (props.pending as unknown as {
+        next_chapter: number
+        approved_chapter: number
+        target_words?: number | null
+        planned_target_words?: number | null
+      })
     : null,
 )
+
+/**
+ * 预期字数（生成前可改）：
+ * · 关卡上 = 下一章的预期字数（来自大纲预算，可改）；
+ * · 审阅卡上 = 本章目标字数，打回时改它 → 下一稿按新目标写。
+ * 单一入口：写作、评分、字数门禁读的都是这一个值（引擎侧 state.chapter_target_words）。
+ */
+const gateTarget = ref<number | null>(null)
+const chapterTarget = ref<number | null>(null)
+watch(
+  () => gate.value?.next_chapter ?? null,
+  () => {
+    const t = gate.value?.target_words ?? gate.value?.planned_target_words ?? null
+    gateTarget.value = typeof t === 'number' && t > 0 ? t : null
+  },
+  { immediate: true },
+)
+watch(
+  () => [chapter.value?.chapter ?? null, chapter.value?.attempt ?? null],
+  () => {
+    const t = chapter.value?.target_words
+    chapterTarget.value = typeof t === 'number' && t > 0 ? t : null
+  },
+  { immediate: true },
+)
+
+/** 目标 vs 实际：把"字数是否达标"从模型自评分变成可核对的两个数字。 */
+const lengthStat = computed(() => {
+  const target = chapterTarget.value
+  const actual = chapter.value?.actual_length
+  if (!target || typeof actual !== 'number') return null
+  const dev = actual - target
+  const ratio = Math.round((dev / target) * 100)
+  return { target, actual, dev, ratio }
+})
+
+/** 关卡上"按此字数开写"：把字数随决策一起提交，之后照常按「继续」放行。 */
+async function startWithTarget(): Promise<void> {
+  if (submitting.value) return
+  submitting.value = true
+  try {
+    await api('POST', withNovel('/api/decision', props.novelId), {
+      action: 'approve',
+      target_words: gateTarget.value,
+    })
+    message.success(
+      gateTarget.value
+        ? `已开始写第 ${gate.value?.next_chapter} 章（预期 ${gateTarget.value} 字）`
+        : `已开始写第 ${gate.value?.next_chapter} 章`,
+    )
+    emit('decided')
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : String(err))
+  } finally {
+    submitting.value = false
+  }
+}
 
 const feedback = ref('')
 const revisionMode = ref<'targeted' | 'rewrite'>('targeted')
@@ -97,6 +160,8 @@ async function decide(action: 'approve' | 'reject'): Promise<void> {
       action,
       feedback: feedback.value.trim(),
       revision_mode: revisionMode.value,
+      // 打回时若改了预期字数，一并带上 → 下一稿按新目标写
+      target_words: chapterTarget.value,
     })
     if (action === 'approve') {
       message.success('已通过')
@@ -125,6 +190,22 @@ async function decide(action: 'approve' | 'reject'): Promise<void> {
       <div class="muted">
         在对话框里发一句指令（例如「继续写下一章」）即可开始生成第
         {{ gate.next_chapter }} 章；也可以停在这里，想写时再说。
+      </div>
+      <!-- 预期字数：**生成之前**就能定（来自大纲预算，可改）→ 写作/评分/字数门禁同一目标 -->
+      <div class="target-row">
+        <span class="target-label">预期字数</span>
+        <NInputNumber
+          v-model:value="gateTarget"
+          size="small"
+          :min="500"
+          :max="20000"
+          :step="500"
+          style="width: 130px"
+        />
+        <span class="muted">字（大纲预算，可改）</span>
+        <button class="mini-btn primary" :disabled="submitting" @click="startWithTarget">
+          按此字数开写第 {{ gate.next_chapter }} 章
+        </button>
       </div>
     </template>
 
@@ -185,6 +266,21 @@ async function decide(action: 'approve' | 'reject'): Promise<void> {
           {{ dimensionLabel(d) }} {{ chapter.review[d] }}
         </NTag>
         <NTag size="small" round :bordered="false">字数 {{ chapter.review.length }}</NTag>
+        <!-- 目标 vs 实际：把"字数是否达标"从模型自评分变成两个可核对的数字 -->
+        <NTag
+          v-if="lengthStat"
+          size="small"
+          round
+          :bordered="false"
+          :type="Math.abs(lengthStat.dev) <= Math.max(500, Math.round(lengthStat.target * 0.15)) ? 'success' : 'warning'"
+        >
+          目标 {{ lengthStat.target }} / 实际 {{ lengthStat.actual }}（{{ lengthStat.dev >= 0 ? '+' : '' }}{{ lengthStat.dev }} 字，{{ lengthStat.ratio >= 0 ? '+' : '' }}{{ lengthStat.ratio }}%）
+        </NTag>
+      </div>
+      <div v-if="chapterTarget !== null" class="target-row">
+        <span class="target-label">预期字数</span>
+        <NInputNumber v-model:value="chapterTarget" size="small" :min="500" :max="20000" :step="500" style="width: 130px" />
+        <span class="muted">字（打回时按此目标重写；不改则沿用）</span>
       </div>
       <div v-if="chapter.review.comment" class="muted comment">{{ chapter.review.comment }}</div>
 
@@ -411,5 +507,43 @@ async function decide(action: 'approve' | 'reject'): Promise<void> {
   display: flex;
   justify-content: space-between;
   align-items: center;
+}
+/* 预期字数（问题3）：生成前/打回时都能改，写作-评分-门禁同一目标 */
+.target-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 8px 0 4px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: #f7f8fa;
+  border: 1px solid #eceef1;
+  font-size: 12px;
+}
+.target-label {
+  font-weight: 600;
+  color: #3a3d44;
+}
+.mini-btn {
+  border: 1px solid #d8dbe0;
+  background: #fff;
+  color: #3a3d44;
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.mini-btn:hover:not(:disabled) {
+  background: #f0f1f3;
+}
+.mini-btn.primary {
+  background: #1d4ed8;
+  border-color: #1d4ed8;
+  color: #fff;
+}
+.mini-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 </style>

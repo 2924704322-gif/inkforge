@@ -495,13 +495,17 @@ def test_a3_no_inline_constitution_and_origin_mark():
         "target_words", "tolerance", "revision_section", "chapter", "outline",
         "recent_summaries", "related_summaries", "character_states",
         "foreshadowing", "due_foreshadowing", "worldview_rules", "state_board",
-        "style_guide", "custom_constraints",
+        "style_guide", "custom_constraints", "brief",
     ), "x"))
     assert "<!-- origin: system-constitution -->" in rendered
 
 
 def test_a4_seven_templates_gained_placeholder():
-    """A4：7 个补占位符的模板均含 {{custom_constraints}}（合计 12 个模板全覆盖）。"""
+    """A4：7 个补占位符的模板均含 {{custom_constraints}}（合计 14 个模板全覆盖）。
+
+    14 = 原 13 + `architect_outline_revise`（2026-09-17 新增的大纲**定向修订**模板：
+    打回重写不再从零生成，必须带原大纲 + 意见 + 修订模式）。
+    """
     added = (
         "architect_demo", "architect_worldview", "architect_characters",
         "architect_outline", "architect_style", "editor_cross_volume", "summarizer",
@@ -509,7 +513,12 @@ def test_a4_seven_templates_gained_placeholder():
     templates = load_all()
     for name in added:
         assert "{{custom_constraints}}" in templates[name], name
-    assert sum("{{custom_constraints}}" in t for t in templates.values()) == 13
+    assert sum("{{custom_constraints}}" in t for t in templates.values()) == 14
+    # 新增模板必须同时带 brief（作者需求）与修订三件套，否则打回仍会漂移
+    revise = templates["architect_outline_revise"]
+    for var in ("{{brief}}", "{{original_outline}}", "{{revision_notes}}",
+                "{{revision_mode}}"):
+        assert var in revise, var
 
 
 def test_a5_custom_constraints_reaches_architect():

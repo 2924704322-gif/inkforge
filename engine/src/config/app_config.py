@@ -48,10 +48,21 @@ class GenerationConfig(BaseModel):
     # 对话协商协作模式（v2.0 P4-A）：partial_rewrite 时 Writer↔Editor 磋稿后定向修订
     negotiation_enabled: bool = False
     # 字数控制门禁
-    word_count_tolerance: int = 500          # 章节字数硬容差 ±500 字
+    word_count_tolerance: int = 500          # 章节字数硬容差 ±500 字（绝对下限）
+    # 按目标字数的比例容差（问题3）：长章用固定 ±500 会过严（5000 字章只允许 10% 偏差），
+    # 短章又会过松。实际容差 = max(word_count_tolerance, round(target * ratio))。
+    word_count_tolerance_ratio: float = 0.15
     max_continuation_attempts: int = 1       # Writer 续写/压缩追加调用上限
     max_length_retries: int = 1              # 字数门禁打回重写上限
     length_gate_enabled: bool = True         # 字数门禁总开关
+
+    def tolerance_for(self, target_words: int) -> int:
+        """给定本章目标字数，算出允许偏差（绝对值与比例取较大者）。"""
+        try:
+            scaled = round(int(target_words) * float(self.word_count_tolerance_ratio))
+        except (TypeError, ValueError):
+            scaled = 0
+        return max(int(self.word_count_tolerance), scaled)
 
 
 class AppConfig(BaseModel):
