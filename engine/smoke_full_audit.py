@@ -480,8 +480,12 @@ def run(data_dir: Path, engine: EngineProcess, suite: Suite, args: argparse.Name
         if lid:
             got = http("GET", f"{base}/api/learning/{lid}", timeout=QUICK)
             text = (got.body or {}).get("content", "")
-            suite.check("J4 三阶段成果落盘且分节完整",
-                        "素材拆解" in text and "剧情学习" in text and "文风学习" in text,
+            # 2026-09-19 订正：断言口径对齐**当前**分节契约 —— full 模式的素材小节
+            # （世界观/人物/道具/地点/桥段）并入素材库，写法小节（剧情技法/文风学习）留在成果里。
+            # 旧断言写的是重构前的小节名（素材拆解/剧情学习），**即便实现正确也永远不可能通过**，
+            # 掩盖了真实缺陷（路由判据恒真导致成果"条目 0 条"）整整一批。
+            suite.check("J4 full 模式成果：写法小节留在成果里（素材小节并入素材库）",
+                        "剧情技法" in text and "文风学习" in text,
                         f"{len(text)} 字")
     suite.check("J5 素材删除", http("DELETE", f"{base}/api/materials/{mid}",
                                     timeout=QUICK).status == 200)
@@ -589,6 +593,65 @@ def run(data_dir: Path, engine: EngineProcess, suite: Suite, args: argparse.Name
     suite.check("L6 非法 rel 写入 → 拒绝", rl.status == 400, f"status={rl.status}")
     suite.check("L7 默认书不可删（保护规则）",
                 http("DELETE", f"{base}/api/books/demo-web", timeout=QUICK).status == 409)
+
+    # ═══ M 风格工坊 · 约束提炼（第三个模块：两个输入框，按需求提炼粘贴的正文）═══
+    print("\n[M] 风格工坊约束提炼（双输入端点）", flush=True)
+    forge = http("GET", f"{base}/api/style-forge/agent", timeout=QUICK)
+    fb = forge.body or {}
+    suite.check("M1 约束提炼智能体名片可读",
+                forge.status == 200 and fb.get("key") == "constraint"
+                and bool(fb.get("never_sees")) and bool((fb.get("limits") or {}).get("source_max")),
+                f"status={forge.status} key={fb.get('key')} "
+                f"never_sees={len(fb.get('never_sees') or [])} 项")
+    suite.check("M2 智能体运行时提示词带第零条（与其它智能体同源装配）",
+                "第零条" in str(fb.get("prompt", "")))
+    # 2026-09-19 方向订正后的两个输入位：正文（粘贴）+ 需求；缺任何一个都不该消耗模型调用
+    no_src = http("POST", f"{base}/api/style-forge/constraints",
+                  {"source_text": "   ", "requirement": "提炼文风"}, timeout=QUICK)
+    suite.check("M3a 未粘贴正文 → 400（不消耗模型调用）",
+                no_src.status == 400, f"status={no_src.status}")
+    no_req = http("POST", f"{base}/api/style-forge/constraints",
+                  {"source_text": SAMPLE, "requirement": "   "}, timeout=QUICK)
+    suite.check("M3b 未写提炼需求 → 400", no_req.status == 400, f"status={no_req.status}")
+    short = http("POST", f"{base}/api/style-forge/constraints",
+                 {"source_text": "太短", "requirement": "提炼文风"}, timeout=QUICK)
+    suite.check("M3c 正文过短 → 400（提前拦掉，省一次调用）",
+                short.status == 400, f"status={short.status}")
+    # 隔离边界的**运行期**断言：请求体里夹带 novel/target 不生效 —— 端点只认那两个文本位
+    smuggled = http("POST", f"{base}/api/style-forge/constraints",
+                    {"source_text": "", "requirement": "", "novel": "demo-web",
+                     "target": "ch-1"}, timeout=QUICK)
+    suite.check("M4 端点只认「正文 + 需求」（夹带 novel/target 不生效）",
+                smuggled.status == 400,
+                f"status={smuggled.status} detail={str((smuggled.body or {}).get('detail', ''))[:40]}")
+    # 新端点必须与其它 /api/* 一样受鉴权保护（HANDOVER §5.5）
+    no_token = http("GET", f"{base}/api/style-forge/agent", token=None, timeout=QUICK)
+    suite.check("M5 新端点自动受鉴权保护（无 token → 401）",
+                no_token.status in (401, 403), f"status={no_token.status}")
+    if llm:
+        started = time.time()
+        got = http("POST", f"{base}/api/style-forge/constraints",
+                   {"source_text": SAMPLE,
+                    "requirement": "把这段正文里的文风与节奏特征提炼成可判定的写作约束"
+                                   "（叙事视角、句式节奏、段落长度、描写偏好、结尾钩子），"
+                                   "每条都要能在正文里找到依据。",
+                    "max_items": 10},
+                   timeout=LLM * 2)
+        gb = got.body or {}
+        lines = [ln for ln in str(gb.get("constraints", "")).splitlines() if ln.strip()]
+        suite.check(f"M6 正文 + 需求 → 条目（真实 LLM，{time.time() - started:.1f}s）",
+                    got.status == 200 and bool(gb.get("constraints")) and len(lines) >= 2
+                    and all(ln.startswith("- ") for ln in lines),
+                    f"status={got.status} {len(lines)} 条：{lines[:2]}")
+        # 提炼必须**有正文依据**：正文里的独特物象（雪/断剑/旧疤）应当在产出里留下痕迹
+        text_out = str(gb.get("constraints", ""))
+        suite.check("M7 提炼结果有正文依据（不是凭空生成）",
+                    any(k in text_out for k in ("雪", "断剑", "剑冢", "旧疤", "钟声")),
+                    f"产出片段：{text_out[:80]}")
+        suite.check("M8 回执复述输入边界（只用了你粘贴的正文）",
+                    got.status == 200 and bool(gb.get("isolation"))
+                    and gb.get("count") == len(lines),
+                    f"isolation={gb.get('isolation')!r} count={gb.get('count')}")
 
 
 def _poll(pred, timeout: float, every: float = 3.0) -> bool:

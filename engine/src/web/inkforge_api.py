@@ -48,8 +48,29 @@ from src.web.actions import (
 )
 from src.web.scope import WORKSPACE, chats_dir, is_workspace
 from src.web.scope import workspace_dir as workspace_data_dir
+from src.web.server import classify_failure, redact_secrets
 
 logger = get_logger(__name__)
+
+
+def _with_constitution(system: str) -> str:
+    """给任意 system 提示词补第零条（幂等）。
+
+    所有面向用户的交互式链路都必须经过它：路由、规划、动作协议、主智能体作答。
+    漏一处就会出现"这条路径上的指令没有无条件执行条款"（真实缺口：规划器与动作协议块）。
+    """
+    from src.agents.prompt_loader import ensure_constitution
+
+    return ensure_constitution(system)
+
+#: 失败来源 → 中文标签（错误文案与 X-Inkforge-Error-Source 响应头共用）
+_SOURCE_LABEL = {
+    "network": "网络连接中断",
+    "provider_auth": "接入点鉴权失败",
+    "config": "模型配置错误",
+    "parse": "模型输出无法解析",
+    "engine": "引擎内部错误",
+}
 
 _NOVEL_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _REL_RE = re.compile(r"^settings/[A-Za-z0-9_\-/\u4e00-\u9fff]+\.md$")
@@ -615,7 +636,7 @@ def _plan_actions_with_model(registry, role: str, user_msg: str,
         "**不要再反问参数**；参数尽量从上下文与上一条提议里取，取不到的用最合理默认值。\n"
         if after_confirm else ""
     )
-    system = (
+    system = _with_constitution(
         "你是工具调用规划器。根据用户消息与上下文，判断需要调用哪些工具。\n"
         "只输出一个 JSON 对象，形如：{\"actions\": [{\"op\": \"book_list\", \"args\": {}}]}。\n"
         "op 必须**逐字**使用下面清单里的名字；args 用清单里的参数名。\n"
@@ -853,6 +874,8 @@ class ChatSendBody(BaseModel):
 class BindingsBody(BaseModel):
     custom_skill_ids: list[str] = Field(default_factory=list)
     pack_ids: list[str] = Field(default_factory=list)
+    #: true = 追加合并（未列出的已绑资源保持不动）；false = 整体替换（默认，勾选面板语义）
+    merge: bool = False
 
 
 # ---------- 对话智能体预设（阶段式对话创作） ----------
@@ -933,6 +956,10 @@ SUB_AGENTS: dict[str, dict[str, str]] = {
 # 此处按名转出（re-export），不得内嵌副本——本模块历史上内嵌过一份，已删除。
 from src.agents.prompt_loader import CONSTITUTION  # noqa: E402 - 集中登记转出
 
+# W3 单一源（同上）：约束提炼智能体的默认提示词只在 src/services/constraint_forge.py
+# 定义一份，此处按其常量引用，避免"改了一处另一处不生效"。第零条由 agent_prompt() 运行时追加。
+from src.services import constraint_forge  # noqa: E402 - 集中登记转出
+
 MASTER_PROMPT = (
     "你是「墨师」，Inkforge 的主创作智能体——长篇小说的总编辑兼总控，也是与作者对接的唯一入口。\n"
     "职责：\n"
@@ -966,6 +993,13 @@ ROUTER_PROMPT = (
 AGENT_PRESETS = {
     "master": {"label": "主智能体（墨师）", "prompt": MASTER_PROMPT},
     **SUB_AGENTS,
+    # 风格工坊「约束提炼」页的专职智能体：与五个阶段子智能体同级注册，
+    # 因此自带"可在智能体设置里查看/改提示词 + 运行时必带第零条"两项既有能力。
+    # 它不是对话/路由用的阶段智能体（不进 ROUTER_PROMPT 的委派枚举）。
+    constraint_forge.AGENT_KEY: {
+        "label": constraint_forge.AGENT_LABEL,
+        "prompt": constraint_forge.SYSTEM_PROMPT,
+    },
 }
 
 
@@ -1003,7 +1037,11 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
         """
         nid = novel or default_novel
         if not _NOVEL_ID_RE.match(nid):
-            raise ValueError(f"非法书名标识：{nid!r}")
+            # 2026-09-19 对抗排查修正：原先这里抛**裸 ValueError** → FastAPI 兜成 500
+            # 「Internal Server Error」。路径校验本身是生效的（点号与斜杠都进不来，**不构成穿越**），
+            # 但非法入参被报成服务端错误：用户看不到原因、日志里全是假故障。
+            # 本模块其它 `_store` 兄弟实现（inkforge_extra / inkforge_windows）都返回 400，此处对齐。
+            raise HTTPException(400, f"非法书名标识：{nid!r}")
         from src.memory.store_factory import open_store
 
         return open_store(get_settings().novels_dir / nid, writable=writable)
@@ -1288,7 +1326,10 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
 
     @app.post("/api/chats")
     def chats_create(body: ChatCreateBody, novel: str = "") -> JSONResponse:
-        allowed = set(AGENT_PRESETS) | {"chat"}
+        # 会话型智能体白名单：**排除约束提炼智能体** —— 它是风格工坊页面的专用智能体，
+        # 数据通路只有"用户文本 → 约束条目"；一旦让它当会话智能体，就会走进带作品上下文
+        # 的对话链路（那正是它承诺不看的东西）。隔离要成立，入口也得一起关。
+        allowed = (set(AGENT_PRESETS) | {"chat"}) - {constraint_forge.AGENT_KEY}
         if body.agent not in allowed:
             raise HTTPException(400, f"未知智能体：{body.agent}")
         scope_value, book = _resolve_scope(novel)
@@ -1487,7 +1528,18 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
             )
         except Exception as exc:  # noqa: BLE001 - 模型错误透传给前端
             logger.exception("主智能体编排失败")
-            raise HTTPException(502, f"模型调用失败：{type(exc).__name__}: {exc}") from exc
+            # 归因：网络断线 / Key 失效 / 配置错误 / 引擎内部异常 → 前端据此给确切提示
+            source, hint = classify_failure(exc)
+            # 坑（2026-09-19 实测，同 inkforge_forge）：HTTP 响应头只能是 latin-1，
+            # 中文 hint 放进 X-Inkforge-Hint 会让 starlette 在组装响应时抛
+            # UnicodeEncodeError —— 本意是"给确切原因"的失败通路，反而变成 500 且归因全丢。
+            # 因此：响应头只留 ASCII 来源码，可执行提示并入 detail 正文。
+            raise HTTPException(
+                502,
+                f"模型调用失败（{_SOURCE_LABEL.get(source, source)}）："
+                f"{redact_secrets(f'{type(exc).__name__}: {exc}')}\n\n建议：{hint}",
+                headers={"X-Inkforge-Error-Source": source},
+            ) from exc
 
         # 纯动作轮：用确定性文本作答（避免模型二次改写把参数/影响说明写走样）
         if actions_taken and not reply:
@@ -1536,9 +1588,13 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
         return ctx
 
     def _actions_prompt(scope_value: str, book: str) -> str:
-        """动作协议提示块（含当前书目，供墨师解析"这本书"）。"""
+        """动作协议提示块（含当前书目，供墨师解析"这本书"）。
+
+        带第零条：动作块会作为 system 消息单独送达（动作轮汇总、补规划），那条路径上
+        没有主提示词兜底，缺了它就会出现"这条链路上的指令没有无条件执行条款"。
+        """
         where = f"《{book}》" if book else "工作区（尚未选定书目）"
-        return f"{_ACTION_PROMPT_HEAD}\n\n当前上下文：{where}"
+        return _with_constitution(f"{_ACTION_PROMPT_HEAD}\n\n当前上下文：{where}")
 
     def _run_actions(scope_value: str, book: str, actions: list[dict],
                      *, confirmed: bool, dry_run: bool = False,
@@ -1726,9 +1782,10 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
         # 结果回灌：让墨师用自然语言汇总（并在纯动作轮里给出可读答复）
         summarize = [
             ChatMessage(role="system",
-                        content=(_ACTION_PROMPT_HEAD
-                                 + "\n以下是系统刚执行完的动作结果，请据此作答；"
-                                   "不要重复动作块，除非还需要新的动作。\n\n" + receipt)),
+                        content=_with_constitution(
+                            _ACTION_PROMPT_HEAD
+                            + "\n以下是系统刚执行完的动作结果，请据此作答；"
+                              "不要重复动作块，除非还需要新的动作。\n\n" + receipt)),
             *prior,
             ChatMessage(role="user", content=user_msg),
         ]
@@ -1894,6 +1951,51 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
             lines.append(f"- **{key}**：{text[:600]}")
         return "\n".join(lines)
 
+    def apply_binding(
+        novel: str, custom_skill_ids: list[str], pack_ids: list[str], merge: bool = False
+    ) -> dict:
+        """把自定义约束 + 蒸馏技能包摘要合成 settings/custom-skills.md（绑定唯一实现）。
+
+        端点与墨师动作 `book_bind_skills` 都走这里（单一实现源），避免两条写入路径
+        的行为漂移；语义见 `bindings_set` 文档。
+        """
+        store = _store(novel, writable=True)
+        rel = "settings/custom-skills.md"
+        current_custom: list[str] = []
+        current_packs: list[str] = []
+        if merge and store.exists(rel):
+            meta = store.read(rel).metadata
+            current_custom = list(meta.get("bound_custom") or [])
+            current_packs = list(meta.get("bound_packs") or [])
+        custom_ids = list(dict.fromkeys([*current_custom, *custom_skill_ids]))
+        pack_ids = list(dict.fromkeys([*current_packs, *pack_ids]))
+
+        sections: list[str] = ["# 创作约束（风格工坊绑定，最高优先级）"]
+        for sid in custom_ids:
+            path = get_settings().novels_dir.parent / "custom_skills" / f"{sid}.md"
+            if not path.exists():
+                raise HTTPException(404, f"自定义 Skill 不存在：{sid}")
+            post = frontmatter.load(str(path))
+            sections.append(f"## 自定义约束：{post.metadata.get('title', sid)}\n\n{post.content}")
+        for pid in pack_ids:
+            try:
+                sections.append(_pack_digest(pid))
+            except FileNotFoundError as exc:
+                raise HTTPException(404, str(exc))
+        store.write(
+            rel,
+            "\n\n".join(sections),
+            metadata={"bound_custom": custom_ids, "bound_packs": pack_ids},
+            commit_message="风格工坊：更新技能绑定",
+        )
+        return {
+            "ok": True,
+            "bound_custom": custom_ids,
+            "bound_packs": pack_ids,
+            # 一行可读回执：用户能立刻确认"这次到底绑上了什么"
+            "summary": f"已绑定 {len(custom_ids)} 条自定义约束、{len(pack_ids)} 个技能包",
+        }
+
     @app.get("/api/bindings")
     def bindings_get(novel: str = "") -> JSONResponse:
         store = _store(novel)
@@ -1907,27 +2009,20 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
 
     @app.post("/api/bindings")
     def bindings_set(body: BindingsBody, novel: str = "") -> JSONResponse:
-        """把自定义约束 + 蒸馏技能包摘要合成 settings/custom-skills.md。"""
-        store = _store(novel, writable=True)
-        sections: list[str] = ["# 创作约束（风格工坊绑定，最高优先级）"]
-        for sid in body.custom_skill_ids:
-            path = get_settings().novels_dir.parent / "custom_skills" / f"{sid}.md"
-            if not path.exists():
-                raise HTTPException(404, f"自定义 Skill 不存在：{sid}")
-            post = frontmatter.load(str(path))
-            sections.append(f"## 自定义约束：{post.metadata.get('title', sid)}\n\n{post.content}")
-        for pid in body.pack_ids:
-            try:
-                sections.append(_pack_digest(pid))
-            except FileNotFoundError as exc:
-                raise HTTPException(404, str(exc))
-        content = "\n\n".join(sections)
-        store.write(
-            "settings/custom-skills.md",
-            content,
-            metadata={"bound_custom": body.custom_skill_ids, "bound_packs": body.pack_ids},
-            commit_message="风格工坊：更新技能绑定",
+        """把自定义约束 + 蒸馏技能包摘要合成 settings/custom-skills.md。
+
+        写入语义（P1 修复"覆盖丢约束"）：
+        · 默认**整体替换**：请求里的清单即生效清单（风格工坊的勾选面板依赖此语义，
+          取消勾选必须真的解绑）；
+        · ``merge=true`` 为**追加合并**：未列出的已绑资源保持不动。供「新建约束后
+          一键绑定到当前作品」这类单点增补使用 —— 它只知道新加的那一条，若走替换语义
+          会把该书原有的技能包绑定整段冲掉。
+        """
+        return JSONResponse(
+            apply_binding(novel, body.custom_skill_ids, body.pack_ids, merge=body.merge)
         )
-        return JSONResponse({"ok": True, "bound_custom": body.custom_skill_ids, "bound_packs": body.pack_ids})
+
+    #: 供墨师动作层复用（actions.py::book_bind_skills 导入它，保证单一实现源）
+    app.state.apply_binding = apply_binding
 
     logger.info("Inkforge 扩展 API 已注册（chat/settings/chapter/bindings）")

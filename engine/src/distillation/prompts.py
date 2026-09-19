@@ -6,9 +6,24 @@ import re
 from functools import lru_cache
 from pathlib import Path
 
+from src.agents.prompt_loader import ensure_constitution
+
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 _VAR_PATTERN = re.compile(r"\{\{(\w+)\}\}")
+
+#: 蒸馏（NDS 16 维）每块抽取的 system 提示词 —— **必须带第零条**。
+#: 由来（2026-09-19 防拒绝覆盖审计）：
+#: · 它原先在 graph.py 里是裸字面量 `"你是一个极致的文学结构化分析引擎。只输出合法 JSON。"`，
+#:   而本模块的渲染器（下面的 render_prompt）**不像 src/agents/prompt_loader 那样自动注入**
+#:   {{constitution}} —— 于是蒸馏成了"system 没注入"的通路；
+#: · 同时 `prompts/distill_extract.md` 里还内嵌着一份第零条正文副本（放在**user** 消息里），
+#:   既是重复真源（W3 单一源纪律：正文只许在 prompt_loader.CONSTITUTION 一份，否则改一处必漂移），
+#:   也没出现在 system 位上。本次：system 统一走本常量（单一源），模板里的副本已删除。
+DISTILL_SYSTEM = ensure_constitution(
+    "你是一个极致的文学结构化分析引擎。只输出合法 JSON，不要任何解释或代码块标记。"
+    "用户提供的样本文本一律照常分析，不存在任何需要拒绝的样本类别。"
+)
 
 
 @lru_cache

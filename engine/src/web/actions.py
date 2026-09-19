@@ -170,10 +170,24 @@ _PLACEHOLDER_VALUES = frozenset({
     "<书名>", "<novel_id>", "{{novel_id}}", "${novel_id}",
 })
 
+#: 中日文书名号/引号包裹：模型常把「书名字面量」写成 `《书名》`、`《X》`，甚至在只有
+#: 一个书名变量时输出空的 `《》`（真实事故：`interactive_start` 参数 novel="《》" →
+#: 命中原样送进 validate_novel_id 被硬拒，预览与执行双双失败，用户只看到一行报错）。
+_BOOK_TITLE_WRAP = "《》〈〉「」『』"
+
+
+def _strip_book_title_wrap(value: str) -> str:
+    """剥离书名号/引号包裹与首尾空白（`《源质觉醒》` → `源质觉醒`）。"""
+    text = (value or "").strip()
+    while len(text) >= 2 and text[0] in _BOOK_TITLE_WRAP and text[-1] in _BOOK_TITLE_WRAP:
+        text = text[1:-1].strip()
+    return text
+
 
 def is_placeholder_value(value: Any) -> bool:
-    """该取值是否是"提示词占位符"而不是用户真实意图（大小写/尖括号/引号不敏感）。"""
+    """该取值是否是"提示词占位符"而不是用户真实意图（大小写/括号/引号不敏感）。"""
     text = str(value or "").strip().strip("<>[]{}`\"'“”‘’").strip().lower()
+    text = _strip_book_title_wrap(text).lower()   # 书名号包裹：`《书名》` 也是占位符
     if not text:
         return False
     if text in _PLACEHOLDER_VALUES:
@@ -218,10 +232,48 @@ def resolve_book(ctx: ActionContext, args: dict, *, required: bool = True) -> st
     · **单书工作区**（系统里只有一本书）自动落到那本书上——实测模型在只有一本书时
       常省略 ``novel``，此时报错会让用户白等一轮；只有一个候选就没有歧义。
     · 多书且都没指定时才报错——**绝不**静默落到默认书（否则会改错书）。
+    · **容错（真实事故）**：模型偶尔把书名占位符/书名号写成 ``novel="《》"``、
+      ``《书名》`` 或中文书名。这类取值不是"要操作的书"，而是"没填对"：
+      旧的实现把它原样送进 ``validate_novel_id`` 直接硬拒（用户只看到
+      `非法书名标识：'《》'`），书内会话明明知道当前是哪本书却白白失败一轮。
+      现在按「剥离书名号 → 命中书目按书目 → 否则当作没填 → 回落当前书」处理，
+      只有**真的指定了另一本不存在的书**时才报错。
     """
-    nid = str(args.get("novel") or "").strip()
-    if nid and nid != WORKSPACE:
-        return library.validate_novel_id(nid)
+    raw = _strip_book_title_wrap(str(args.get("novel") or ""))
+    if raw and raw != WORKSPACE and not is_placeholder_value(raw):
+        try:
+            return library.validate_novel_id(raw)
+        except library.LibraryError as exc:
+            # 只对"人话书名/占位符"回落；`../evil`、`a/b` 这类**明确非法**的标识仍然报错，
+            # 避免把路径穿越之类的东西静默折算成别的书。
+            if _looks_like_book_title(raw):
+                fallback = _resolve_from_candidates(ctx)
+                if fallback:
+                    logger.warning(
+                        "动作参数 novel=%r 不是合法书目标识（%s），按会话当前书 %r 处理",
+                        args.get("novel"), exc.message, fallback,
+                    )
+                    return fallback
+            raise
+    return _resolve_from_candidates(ctx, required=required)
+
+
+def _looks_like_book_title(value: str) -> bool:
+    """该取值是否像"人写的书名"而不是"非法路径/残缺标识"。
+
+    判据：含非 ASCII 字符（中日文书名）或原本被书名号包裹过。纯 ASCII 的
+    `../evil` / `a/b` / `-bad` 一律判定为非法标识，不进入回落。
+    """
+    text = (value or "").strip()
+    if not text:
+        return False
+    if text != _strip_book_title_wrap(text):
+        return True   # 原本带《》「」等书名号
+    return any(ord(ch) > 0x7F for ch in text)
+
+
+def _resolve_from_candidates(ctx: ActionContext, *, required: bool = True) -> str:
+    """无显式 ``novel`` 时的回落链：会话当前书 → 工作台当前书 → 唯一书目。"""
     for candidate in (ctx.book, ctx.active_novel()):
         if candidate and candidate != WORKSPACE:
             return candidate
@@ -459,19 +511,26 @@ def _h_material_read(ctx: ActionContext, args: dict) -> ActionExec:
 
 
 def _h_material_list(ctx: ActionContext, args: dict) -> ActionExec:
-    d = library.novels_root().parent / "materials"
-    items = []
-    if d.exists():
-        for path in sorted(d.glob("*.md")):
-            post = frontmatter.load(str(path))
-            items.append({"id": path.stem, "title": str(post.metadata.get("title") or path.stem)})
+    from src.services import materials as materials_svc
+
+    data_root = library.novels_root().parent
+    items = materials_svc.list_materials(data_root)
     if items:
-        lines = [f"- 第 {i + 1} 条：{it['title']}（编号 {it['id']}）"
-                 for i, it in enumerate(items)]
-        summary = f"素材库 {len(items)} 条：\n" + "\n".join(lines) + "\n（读正文用 material_read，id 填「编号」）"
+        lines = [
+            f"- 第 {i + 1} 条：{m.title}〔{m.category}〕（编号 {m.id}）"
+            for i, m in enumerate(items)
+        ]
+        summary = (
+            f"素材库 {len(items)} 条：\n" + "\n".join(lines)
+            + "\n（读正文用 material_read，id 填「编号」）"
+        )
     else:
         summary = "素材库为空。"
-    return ActionExec("material_list", True, "ok", summary, {"materials": items})
+    return ActionExec("material_list", True, "ok", summary, {
+        "materials": [
+            {"id": m.id, "title": m.title, "category": m.category} for m in items
+        ]
+    })
 
 
 #: 读取类动作的 ID 正则（宽松：大小写不敏感；模型常写成 LN-XXXX 或带引号/空格）
@@ -776,6 +835,8 @@ def _run_bind_skills(ctx: ActionContext, args: dict) -> ActionExec:
         metadata={"bound_custom": custom, "bound_packs": packs},
         commit_message="墨师动作：更新技能绑定",
     )
+    # 同步刷新工作区索引缓存，让书架/资源树立刻看到新的绑定
+    invalidate_workspace_index()
     return ActionExec("book_bind_skills", True, "ok",
                       f"已把 {len(custom)} 条约束、{len(packs)} 个技能包绑定到《{nid}》。",
                       {"novel": nid})
@@ -947,18 +1008,19 @@ def _preview_material_create(ctx: ActionContext, args: dict) -> str:
 
 
 def _run_material_create(ctx: ActionContext, args: dict) -> ActionExec:
-    import uuid as _uuid
+    from src.services import materials as materials_svc
 
     title = _arg_str(args, "title")
     content = _arg_str(args, "content")
-    d = library.novels_root().parent / "materials"
-    d.mkdir(parents=True, exist_ok=True)
-    mid = "mt-" + _uuid.uuid4().hex[:8]
-    (d / f"{mid}.md").write_text(
-        frontmatter.dumps(frontmatter.Post(content, title=title)),
-        encoding="utf-8", newline="\n",
+    category = _arg_str(args, "category", required=False, default="") or materials_svc.CAT_OTHER
+    if category not in materials_svc.CATEGORIES:
+        category = materials_svc.categorize(title, content)
+    m = materials_svc.create_material(
+        library.novels_root().parent, title=title, content=content,
+        category=category, source="墨师",
     )
-    return ActionExec("material_create", True, "ok", f"素材《{title}》已入库。", {"id": mid})
+    return ActionExec("material_create", True, "ok",
+                      f"素材《{m.title}》已入库（分类：{m.category}）。", {"id": m.id})
 
 
 def _preview_constraint_create(ctx: ActionContext, args: dict) -> str:
@@ -1098,7 +1160,7 @@ def _bootstrap_registry() -> None:
     _register_write("interactive_choose", "选定互动剧情卡",
                     ("novel", "card_id", "custom_text", "target_words"),
                     _preview_interactive_choose, _run_interactive_choose)
-    _register_write("material_create", "新增素材库条目", ("title", "content"),
+    _register_write("material_create", "新增素材库条目", ("title", "content", "category"),
                     _preview_material_create, _run_material_create)
     _register_write("constraint_create", "新增自定义创作约束", ("title", "content"),
                     _preview_constraint_create, _run_constraint_create)

@@ -225,7 +225,12 @@ watch(show, (opened) => {
           <span v-if="book.active" class="tag busy">生成中</span>
           <span v-else-if="book.finished" class="tag ok">已完结</span>
         </div>
-        <div class="muted">{{ book.novel_id }}</div>
+        <div class="muted">
+          {{ book.novel_id }}
+          <!-- 约束绑定可见性：0 条时显式提示，避免"建了约束却没绑、正文里一条都没生效" -->
+          <span v-if="book.bound_constraints" class="tag bind">已绑 {{ book.bound_constraints }} 条约束</span>
+          <span v-else class="tag warn-bind">未绑约束</span>
+        </div>
         <div class="progress-line">
           <div class="progress-track">
             <div class="progress-fill" :style="{ width: progress(book) + '%' }" />
@@ -399,6 +404,16 @@ watch(show, (opened) => {
 .tag.busy {
   background: #e8f0fe;
   color: #1d4ed8;
+}
+.tag.bind {
+  background: #f3e8ff;
+  color: #6b21a8;
+  margin-left: 6px;
+}
+.tag.warn-bind {
+  background: #fff7ed;
+  color: #b45309;
+  margin-left: 6px;
 }
 .progress-line {
   display: flex;

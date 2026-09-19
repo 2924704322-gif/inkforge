@@ -11,6 +11,8 @@ export interface Book {
   finished: boolean
   interactive: boolean
   is_default: boolean
+  /** 已绑定的自定义创作约束条数（0 = 本书没有任何约束在生效） */
+  bound_constraints?: number
 }
 
 export interface CustomSkill {
@@ -413,6 +415,45 @@ export interface Bindings {
   bound_packs: string[]
 }
 
+// ---------- 风格工坊 · 约束提炼（第三个模块） ----------
+
+/**
+ * 约束提炼智能体名片（`GET /api/style-forge/agent`）。
+ *
+ * `sees` / `never_sees` 是引擎侧对"这个智能体到底看得到什么"的显式声明（2026-09-19 订正）：
+ * **看什么由你决定** —— 你在【正文内容】框里粘贴的文本它才看得到；
+ * 它不会自己去翻你的作品库（正文/章节/大纲/设定/素材一律读不到）。
+ */
+export interface ForgeAgentInfo {
+  key: string
+  label: string
+  role: string
+  prompt: string
+  max_items: { default: number; min: number; max: number }
+  /** 两个输入框的字数限制（正文 / 需求） */
+  limits: { source_max: number; source_min: number; requirement_max: number }
+  sees: string[]
+  never_sees: string[]
+}
+
+/** 一次提炼的结果（`POST /api/style-forge/constraints`）。 */
+export interface ForgeResult {
+  ok: boolean
+  agent: { key: string; label: string }
+  /** 名称建议（由提炼需求首句确定性生成，用户可改） */
+  title: string
+  /** 可直接复制/入库的条目文本（`- ` 条目行） */
+  constraints: string
+  items: string[]
+  count: number
+  role: string
+  model: string
+  provider: string
+  elapsed: number
+  /** 引擎回执的输入边界复述：只用了本页粘贴的文本，未读作品库 */
+  isolation: string
+}
+
 export interface PlotCard {
   card_id: string
   title: string
@@ -436,6 +477,12 @@ export interface InteractiveState {
   draft?: InteractiveDraft | null
   approved_count?: number
   error?: string | null
+  /** 失败归因：network / provider_auth / config / parse / engine（引擎 classify_failure） */
+  error_source?: string
+  /** 可执行提示：告诉用户下一步该做什么（重试 / 查配置 / 导出日志） */
+  error_hint?: string
+  /** 本次会话绑定的 角色→provider/model，排障用 */
+  models?: Record<string, string>
 }
 
 
@@ -450,13 +497,89 @@ export interface Material {
   id: string
   title: string
   content: string
+  /** 素材分类：世界观 / 人物 / 道具地点 / 桥段 / 技法 / 文风 / 其他（决定二开建书落盘去向） */
+  category?: string
+  /** 来源：手工 / 墨师 / 蒸馏:<任务>#<章节> */
+  source?: string
+  /** 归属书籍（素材库按书浏览）；手工新增的为「无来源（手工）」 */
+  source_book?: string
+  /** 重要度：主级（反复出现/被强调）/ 次级（只出现一次）——道具地点默认只显示主级 */
+  importance?: '主级' | '次级'
+  /** 由哪几章蒸馏而来 */
+  chapters?: number[]
+  /** 被重复验证的次数 */
+  hits?: number
+  updated?: number
+}
+
+/** 素材库第一屏：按来源书籍分组 */
+export interface MaterialBook {
+  book: string
+  total: number
+  updated: number
+  counts: Record<string, number>
+  chapters: number[]
+}
+
+export interface LearningSource {
+  seq: number
+  label: string
+  chars: number
+  distilled_at?: number
+  sha256?: string
+}
+
+export interface LearningConflict {
+  section: string
+  existing: string
+  existing_chapters?: number[]
+  incoming: string
+  incoming_chapter: number
+  overlap?: number
+}
+
+export interface LearningResolution {
+  section: string
+  action: string
+  existing?: string
+  incoming?: string
+  final_text?: string
+  before_text?: string
+  resolved_at?: number
+}
+
+export interface LearningItemRow {
+  id: string
+  section: string
+  text: string
+  chapters: number[]
+  hits: number
 }
 
 export interface LearningItem {
   id: string
   title: string
   created?: number
+  updated?: number
   content?: string
+  /** full=全量蒸馏学习（带原书设定/剧情）/ style=只学通用写法（文风+技法，不含原书内容） */
+  mode?: 'full' | 'style'
+  mode_label?: string
+  /** style 模式下被净化的专有名词条数 */
+  scrubbed?: number
+  /** 已投喂的章节数（累积式蒸馏：一条成果可多次追加） */
+  sources?: LearningSource[] | number
+  /** 累计条目数（列表里是计数，详情里是数组） */
+  items?: LearningItemRow[] | number
+  /** 蒸馏产出并入库的素材引用（标题 + 分类） */
+  materials?: { title: string; category: string }[] | number
+  /** 待裁决冲突（同一条目出现不同说法） */
+  conflicts?: LearningConflict[] | number
+  /** 已裁决历史（可撤销） */
+  resolved?: LearningResolution[]
+  /** 旧格式成果（追加时会自动升级为条目化） */
+  legacy?: boolean
+  changelog?: string[]
 }
 
 export interface DashboardChapter {

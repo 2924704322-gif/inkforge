@@ -1,4 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
+import { spawn } from 'node:child_process'
 import path from 'node:path'
 
 import { EngineSupervisor } from './engine-supervisor'
@@ -233,10 +234,16 @@ if (!gotLock) {
   app.quit()
 } else {
   app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore()
-      mainWindow.focus()
+    // 用户双击图标"再启动一次"时的行为：窗口若已被关掉（mainWindow === null），
+    // 旧逻辑什么都不做 → 从用户视角看就是"点了没反应、启动不了"。
+    // 现在补上重建窗口：进程还活着就把工作台还给用户，不必去任务管理器杀进程。
+    if (!mainWindow) {
+      createWindow()
+      return
     }
+    if (mainWindow.isMinimized()) mainWindow.restore()
+    mainWindow.show()
+    mainWindow.focus()
   })
 
   app.whenReady().then(() => {
@@ -262,6 +269,30 @@ if (!gotLock) {
       .stop()
       .catch(() => undefined)
       .then(() => app.quit())
+  })
+
+  // 兜底回收引擎进程树：主进程被强杀/崩溃时 before-quit 不会执行，Python sidecar 会变成
+  // 孤儿继续占用 checkpoints.sqlite 与 chroma 目录，导致下次启动的引擎卡在读写锁上。
+  const killEngineTree = (): void => {
+    const pid = supervisor?.pid
+    if (!pid) return
+    try {
+      if (process.platform === 'win32') {
+        spawn('taskkill', ['/PID', String(pid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+        })
+      } else {
+        process.kill(pid, 'SIGKILL')
+      }
+    } catch {
+      /* 进程可能已退出 */
+    }
+  }
+  process.on('exit', killEngineTree)
+  process.on('uncaughtException', (err) => {
+    console.error('[inkforge] 主进程未捕获异常', err)
+    killEngineTree()
   })
 
   app.on('window-all-closed', () => {

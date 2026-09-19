@@ -66,6 +66,19 @@ _REVIEW_SYSTEM = (
 )
 
 
+def review_system_prompt(novel_id: str) -> str:
+    """提案评审的 system 提示词（**必须带第零条**）。
+
+    由来（2026-09-19 防拒绝覆盖审计）：本条通路原先在调用处直接拼字面量
+    `f"{_REVIEW_SYSTEM}\\n\\n{_book_brief(novel_id)}"`，没有经过任何注入器 ——
+    而它恰恰是最需要无条件执行兜底的一条：评审提示词里写着"不要以『这不是正文』为由拒评"，
+    靠的是模型自觉。包装成函数后，"这条通路带第零条"变成可被测试直接断言的事实。
+    """
+    from src.agents.prompt_loader import ensure_constitution
+
+    return ensure_constitution(f"{_REVIEW_SYSTEM}\n\n{_book_brief(novel_id)}")
+
+
 def _score(value: object, default: float = 0.0) -> float:
     """把模型返回的分数容错成 float（可能是字符串、None 或带单位）。"""
     try:
@@ -260,7 +273,7 @@ def register_proposal_api(app: Any, hub: Any, default_novel: str) -> None:
             messages = [
                 ChatMessage(
                     role="system",
-                    content=f"{_REVIEW_SYSTEM}\n\n{_book_brief(novel_id)}",
+                    content=review_system_prompt(novel_id),
                 ),
                 ChatMessage(
                     role="user",

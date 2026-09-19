@@ -131,6 +131,64 @@ def apply_skills_to_store(store: MdStore, skill_ids: list[str]) -> list[str]:
     return titles
 
 
+BINDING_HEADER = "# 创作约束（风格工坊绑定，最高优先级）"
+
+
+def sync_custom_skill_to_books(skill_id: str) -> list[str]:
+    """把全局约束库里的某条约束**就地刷新**到所有已绑定它的书。
+
+    由来（真实事故两连发）：① 约束建了没绑 → 正文里一条都没进去；② 绑了之后再去
+    改约束内容，改动只落在全局库 `data/custom_skills/`，各书 settings/custom-skills.md
+    里的仍是旧副本 —— 用户于是看到"改了也没用"。本函数让「编辑约束」立即对已绑作品生效。
+
+    只重写约束段落，**保留各书原有的 bound_packs 技能包摘要**（不重新计算摘要，
+    避免把包的旧快照换成新快照而产生意外差异）。返回被刷新的书目 id 列表。
+    """
+    by_id = {s["skill_id"]: s for s in list_custom_skills()}
+    skill = by_id.get(skill_id)
+    label = skill["title"] if skill else skill_id
+    updated: list[str] = []
+    novels_dir = novels_root()
+    if not novels_dir.is_dir():
+        return []
+    for path in sorted(p for p in novels_dir.iterdir() if p.is_dir()):
+        if not NOVEL_ID_RE.match(path.name):
+            continue
+        store = open_store(path, writable=False)
+        rel = CUSTOM_SKILLS_REL
+        if not store.exists(rel):
+            continue
+        try:
+            doc = store.read(rel)
+            bound_custom = [str(s) for s in (doc.metadata.get("bound_custom") or [])]
+        except Exception as exc:  # noqa: BLE001 - 单本损坏不影响其它书
+            logger.warning("读取 %s 的约束绑定失败，已跳过：%s", path.name, exc)
+            continue
+        if skill_id not in bound_custom:
+            continue
+        # 保留包的摘要段落：原文件里 "### 蒸馏技能包：" 起的部分原样截出来
+        pack_tail = ""
+        marker = "### 蒸馏技能包："
+        if marker in doc.content:
+            pack_tail = "\n\n" + doc.content[doc.content.index(marker):].strip()
+        sections = [BINDING_HEADER]
+        for sid in bound_custom:
+            item = by_id.get(sid)
+            if item is None:      # 约束已被删除：跳过但保留绑定记录，便于用户发现
+                continue
+            sections.append(f"## 自定义约束：{item['title']}\n\n{item['content']}")
+        store_write = open_store(path, writable=True)
+        store_write.write(
+            rel,
+            "\n\n".join(sections) + pack_tail,
+            metadata={"bound_custom": bound_custom,
+                      "bound_packs": list(doc.metadata.get("bound_packs") or [])},
+            commit_message=f"同步约束更新：{label}",
+        )
+        updated.append(path.name)
+    return updated
+
+
 # ---------- 建书 ----------
 
 def validate_novel_id(nid: str) -> str:
@@ -215,6 +273,14 @@ def list_books(default_novel: str = "", active: set[str] | None = None,
         chapters = store.list_chapters() if store.root.exists() else []
         approved = sum(1 for c in chapters if c.metadata.get("status") == "approved")
         is_active = nid in _active
+        # 已绑定的自定义约束数：书架要能一眼看出"这本书到底有没有约束在生效"
+        # （真实事故：用户在风格工坊建了约束却没绑定，正文里一条都没进去，界面上毫无线索）。
+        bound_custom: list[str] = []
+        if store.exists(CUSTOM_SKILLS_REL):
+            try:
+                bound_custom = list(store.read(CUSTOM_SKILLS_REL).metadata.get("bound_custom") or [])
+            except Exception:  # noqa: BLE001 - 元数据损坏不影响书架列表
+                bound_custom = []
         # 完结判定：本进程会话已跑完，或已定稿章数达到大纲计划章数（能扛重启）。
         finished = (not is_active) and (
             nid in _done or (planned > 0 and approved >= planned)
@@ -229,6 +295,7 @@ def list_books(default_novel: str = "", active: set[str] | None = None,
             "finished": finished,
             "interactive": interactive,
             "is_default": nid == default_novel,
+            "bound_constraints": len(bound_custom),
         })
     return items
 

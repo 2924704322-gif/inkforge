@@ -8,8 +8,12 @@ import type {
   ActionAuditRecord,
   AgentPreset,
   DashboardData,
+  LearningConflict,
   LearningItem,
+  LearningResolution,
+  LearningSource,
   Material,
+  MaterialBook,
 } from '../types'
 
 /**
@@ -65,8 +69,15 @@ async function resetPreset(p: AgentPreset): Promise<void> {
 const learningItems = ref<LearningItem[]>([])
 const learnTitle = ref('')
 const learnSample = ref('')
+// full=全量蒸馏（素材+剧情+文风）；style=只学通用写法（文风+技法+负面清单，不含原书内容）
+const learnMode = ref<'full' | 'style'>('full')
 const learningBusy = ref(false)
 const viewLearning = ref<LearningItem | null>(null)
+
+const MODE_HINT: Record<'full' | 'style', string> = {
+  full: '提取素材：世界观 / 人物 / 道具地点 / 桥段 → 进素材库。设定类条目可绑定到作品，也可用它「二开建书」；桥段默认不导入，需在素材库手动勾选。',
+  style: '提取写法：文风指纹 + 技法模板 + 负面清单，已做专有名词净化，产出里不带原书的人名/地名/门派/功法与剧情。',
+}
 
 async function loadLearning(): Promise<void> {
   const res = await api<{ items: LearningItem[] }>('GET', '/api/learning')
@@ -80,11 +91,20 @@ async function runLearning(): Promise<void> {
   }
   learningBusy.value = true
   try {
-    const res = await api<{ id: string }>('POST', '/api/learning', {
-      title: learnTitle.value.trim(),
-      sample: learnSample.value,
-    })
-    message.success('三阶段学习完成')
+    const res = await api<{ id: string; mode_label?: string; scrubbed?: number }>(
+      'POST',
+      '/api/learning',
+      {
+        title: learnTitle.value.trim(),
+        sample: learnSample.value,
+        mode: learnMode.value,
+      },
+    )
+    const extra =
+      learnMode.value === 'style' && res.scrubbed
+        ? `（已净化 ${res.scrubbed} 个专有名词）`
+        : ''
+    message.success(`${res.mode_label ?? '学习'}完成${extra}`)
     learnTitle.value = ''
     learnSample.value = ''
     await loadLearning()
@@ -101,39 +121,319 @@ async function viewDoc(id: string): Promise<void> {
   viewLearning.value = res
 }
 
+// 列表里 sources/items/conflicts 是计数，详情里是数组 —— 用取数辅助函数抹平差异
+const listCount = (v: unknown): number => (Array.isArray(v) ? v.length : Number(v ?? 0))
+const asArray = <T,>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : [])
+const srcCount = (item: LearningItem): number => listCount(item.sources)
+const srcDetail = (item: LearningItem): LearningSource[] =>
+  asArray<LearningSource>(item.sources)
+const conflictDetail = (item: LearningItem): LearningConflict[] =>
+  asArray<LearningConflict>(item.conflicts)
+const resolvedDetail = (item: LearningItem): LearningResolution[] =>
+  asArray<LearningResolution>(item.resolved)
+
+// ── 冲突裁决（确定性落库，不再调模型） ──
+const resolvingBusy = ref(false)
+const editingConflict = ref<number | null>(null)
+const editingText = ref('')
+
+const ACTION_LABEL: Record<string, string> = {
+  keep_existing: '保留原有',
+  take_incoming: '采纳新增',
+  merge_both: '合并两条',
+  edit: '手动编辑',
+}
+
+function startEditConflict(index: number, seed: string): void {
+  editingConflict.value = index
+  editingText.value = seed
+}
+
+async function resolveConflict(
+  action: 'keep_existing' | 'take_incoming' | 'merge_both' | 'edit' | 'undo',
+  opts: { index?: number; text?: string; bulk?: boolean; undoIndex?: number } = {},
+): Promise<void> {
+  const target = viewLearning.value
+  if (!target) return
+  if (action === 'undo' && opts.undoIndex === undefined) return
+  resolvingBusy.value = true
+  try {
+    const res = await api<{
+      resolved?: number
+      remaining?: number
+      warnings?: string[]
+      summary?: string
+    }>('POST', `/api/learning/${target.id}/conflicts/resolve`, {
+      action,
+      index: opts.index,
+      text: opts.text ?? '',
+      bulk: opts.bulk ?? false,
+      undo_index: opts.undoIndex,
+    })
+    if (res.warnings?.length) {
+      message.warning(res.warnings[0])
+    } else {
+      message.success(res.summary ?? '已处理')
+    }
+    editingConflict.value = null
+    editingText.value = ''
+    await viewDoc(target.id)
+    await loadLearning()
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : String(err))
+  } finally {
+    resolvingBusy.value = false
+  }
+}
+
+// ── 追加蒸馏：在既有成果上继续投喂下一章 ──
+const appendTarget = ref<LearningItem | null>(null)
+const appendSample = ref('')
+const appendLabel = ref('')
+const appending = ref(false)
+
+function startAppend(item: LearningItem): void {
+  appendTarget.value = item
+  appendSample.value = ''
+  appendLabel.value = `第 ${srcCount(item) + 1} 章`
+}
+
+async function doAppend(): Promise<void> {
+  const target = appendTarget.value
+  if (!target) return
+  if (appendSample.value.trim().length < 200) {
+    message.warning('追加的样本至少 200 字')
+    return
+  }
+  appending.value = true
+  try {
+    const res = await api<{
+      already?: boolean
+      summary?: string
+      added?: number
+      merged?: number
+      conflicts?: number
+      scrubbed?: number
+    }>('POST', `/api/learning/${target.id}/append`, {
+      sample: appendSample.value,
+      label: appendLabel.value.trim(),
+      mode: target.mode,
+    })
+    if (res.already) {
+      message.info(res.summary ?? '这段内容已经蒸馏过了')
+    } else {
+      const extra = res.scrubbed ? `，净化 ${res.scrubbed} 个专名` : ''
+      message.success(
+        `已追加：新增 ${res.added ?? 0} 条，合并 ${res.merged ?? 0} 条` +
+          (res.conflicts ? `，冲突 ${res.conflicts} 条（待裁决）` : '') + extra,
+      )
+    }
+    appendTarget.value = null
+    appendSample.value = ''
+    await loadLearning()
+    await viewDoc(target.id)
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : String(err))
+  } finally {
+    appending.value = false
+  }
+}
+
 async function removeLearning(item: LearningItem): Promise<void> {
   await api('DELETE', `/api/learning/${item.id}`)
   if (viewLearning.value?.id === item.id) viewLearning.value = null
   await loadLearning()
 }
 
-// ── 素材库 ──
+// ── 素材库（统一容器；主浏览维度 = 来源书籍 → 书内七维模块） ──
 const materials = ref<Material[]>([])
-const newMaterial = ref({ title: '', content: '' })
+const materialCats = ref<string[]>([])
+const materialBooks = ref<MaterialBook[]>([])
+const activeBook = ref('')
+const activeBookData = ref<{ by_category: Record<string, Material[]>; total: number } | null>(null)
+const newMaterial = ref({ title: '', content: '', category: '其他' })
 const expandedMaterial = ref('')
 
 async function loadMaterials(): Promise<void> {
-  const res = await api<{ materials: Material[] }>('GET', '/api/materials')
+  const res = await api<{ materials: Material[]; books: MaterialBook[]; categories: string[] }>(
+    'GET',
+    '/api/materials',
+  )
   materials.value = res.materials
+  materialBooks.value = res.books ?? []
+  materialCats.value = res.categories ?? []
 }
+
+/** 进入某本书的素材详情页（七维模块）。 */
+function openBook(book: string): void {
+  activeBook.value = book
+  expandedMaterial.value = ''
+  showMinor.value = false
+  void refreshBook()
+}
+
+async function refreshBook(): Promise<void> {
+  if (!activeBook.value) return
+  const res = await api<{
+    by_category: Record<string, Material[]>
+    total: number
+  }>('GET', `/api/materials?book=${encodeURIComponent(activeBook.value)}`)
+  activeBookData.value = { by_category: res.by_category, total: res.total }
+}
+
+function closeBook(): void {
+  activeBook.value = ''
+  activeBookData.value = null
+  void loadMaterials()
+}
+
+/** 书详情页里的分类顺序：按七维固定顺序展示 */
+const BOOK_CAT_ORDER = ['世界观', '人物', '道具', '地点', '桥段', '技法', '文风', '其他']
+// 道具/地点默认只显示"主级"（反复出现或被强调过的），次级另给开关 —— 用户实测混进来的杂项太多
+const showMinor = ref(false)
+const IMPORTANCE_ORDER: Record<string, number> = { 主级: 0, 次级: 1 }
+
+function catItems(cat: string): Material[] {
+  const all = activeBookData.value?.by_category?.[cat] ?? []
+  const filtered = showMinor.value ? all : all.filter((m) => (m.importance ?? '次级') === '主级')
+  return [...filtered].sort(
+    (a, b) => (IMPORTANCE_ORDER[a.importance ?? '次级'] ?? 1) - (IMPORTANCE_ORDER[b.importance ?? '次级'] ?? 1),
+  )
+}
+
+function catTotal(cat: string): number {
+  return (activeBookData.value?.by_category?.[cat] ?? []).length
+}
+
+const activeBookCats = computed(() =>
+  BOOK_CAT_ORDER.filter((c) => catTotal(c) > 0),
+)
+
+const minorCount = computed(() =>
+  BOOK_CAT_ORDER.reduce((n, c) => n + catItems(c).filter(
+    (m) => (m.importance ?? '次级') !== '主级').length, 0),
+)
 
 async function createMaterial(): Promise<void> {
   if (!newMaterial.value.title.trim() || !newMaterial.value.content.trim()) {
     message.warning('名称与内容不能为空')
     return
   }
-  await api('POST', '/api/materials', {
-    title: newMaterial.value.title.trim(),
-    content: newMaterial.value.content.trim(),
-  })
-  message.success('素材已保存')
-  newMaterial.value = { title: '', content: '' }
-  await loadMaterials()
+  try {
+    await api('POST', '/api/materials', {
+      title: newMaterial.value.title.trim(),
+      content: newMaterial.value.content.trim(),
+      category: newMaterial.value.category,
+      // 停在某本书详情页时新增，就归到那本书名下
+      source_book: activeBook.value || '',
+    })
+    message.success('素材已保存')
+    newMaterial.value = { title: '', content: '', category: newMaterial.value.category }
+    if (activeBook.value) await refreshBook()
+    else await loadMaterials()
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : String(err))
+  }
 }
 
 async function removeMaterial(m: Material): Promise<void> {
   await api('DELETE', `/api/materials/${m.id}`)
-  await loadMaterials()
+  if (activeBook.value) await refreshBook()
+  else await loadMaterials()
+}
+
+// ── 二开建书（按分类混选：可"用书 A 的世界观 + 书 B 的人物"） ──
+const spawnOpen = ref(false)
+const spawning = ref(false)
+const SPAWN_CATS = ['世界观', '人物', '道具', '地点', '技法', '文风', '桥段']
+const spawnForm = ref({
+  novel_id: '',
+  title: '',
+  /** 分类 → { book: 来源书（空 = 不限）, ids: 勾选的素材 id } */
+  picks: {} as Record<string, { book: string; ids: string[] }>,
+})
+
+function openSpawn(): void {
+  const picks: Record<string, { book: string; ids: string[] }> = {}
+  for (const c of SPAWN_CATS) {
+    // 桥段默认不勾选：它是原著最"像"的部分，导入后容易贴着原著情节走
+    picks[c] = {
+      book: '',
+      ids: c === '桥段'
+        ? []
+        : materials.value.filter((m) => m.category === c).map((m) => m.id),
+    }
+  }
+  spawnForm.value = { novel_id: '', title: '', picks }
+  spawnOpen.value = true
+}
+
+function spawnCatPool(cat: string): Material[] {
+  const book = spawnForm.value.picks[cat]?.book ?? ''
+  return materials.value.filter(
+    (m) => m.category === cat && (!book || m.source_book === book),
+  )
+}
+
+function toggleSpawnItem(cat: string, id: string): void {
+  const ids = spawnForm.value.picks[cat].ids
+  const i = ids.indexOf(id)
+  if (i >= 0) ids.splice(i, 1)
+  else ids.push(id)
+}
+
+function selectAllInCat(cat: string): void {
+  spawnForm.value.picks[cat].ids = spawnCatPool(cat).map((m) => m.id)
+}
+
+function clearCat(cat: string): void {
+  spawnForm.value.picks[cat].ids = []
+}
+
+/** 某分类选中的素材来自哪些书（用于提示"这是跨书混搭"） */
+function pickedBooks(cat: string): string[] {
+  const ids = new Set(spawnForm.value.picks[cat]?.ids ?? [])
+  return [...new Set(materials.value.filter((m) => ids.has(m.id))
+    .map((m) => m.source_book ?? '?'))]
+}
+
+const spawnTotal = computed(() =>
+  SPAWN_CATS.reduce((n, c) => n + (spawnForm.value.picks[c]?.ids.length ?? 0), 0),
+)
+
+async function doSpawn(): Promise<void> {
+  if (!spawnForm.value.novel_id.trim()) {
+    message.warning('请填写新书标识（英文/数字/下划线，作为目录名）')
+    return
+  }
+  const ids = SPAWN_CATS.flatMap((c) => spawnForm.value.picks[c]?.ids ?? [])
+  if (!ids.length) {
+    message.warning('至少选择一个分类里的素材')
+    return
+  }
+  spawning.value = true
+  try {
+    const res = await api<{
+      imported?: number
+      summary?: string
+      source_summary?: string
+      novel_id: string
+    }>('POST', '/api/materials/spawn-book', {
+      novel_id: spawnForm.value.novel_id.trim(),
+      title: spawnForm.value.title.trim() || spawnForm.value.novel_id.trim(),
+      material_ids: ids,
+      mode: 'interactive',
+    })
+    message.success(
+      `${res.summary ?? ''}${res.source_summary ? `（${res.source_summary}）` : ''}`,
+    )
+    spawnOpen.value = false
+    appStore.treeVersion += 1
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : String(err))
+  } finally {
+    spawning.value = false
+  }
 }
 
 // ── 数据看板 ──
@@ -236,7 +536,14 @@ async function loadAll(): Promise<void> {
 watch(
   () => appStore.sideWindow,
   (w) => {
-    if (w) void loadAll()
+    if (!w) return
+    // 每次打开素材库都回到「书籍列表」第一屏（避免停在上次那本书的详情页）
+    if (w === 'materials') {
+      activeBook.value = ''
+      activeBookData.value = null
+      spawnOpen.value = false
+    }
+    void loadAll()
   },
 )
 watch(
@@ -269,7 +576,8 @@ watch(
         <!-- 智能体设置 -->
         <template v-if="which === 'agents'">
           <div class="muted" style="margin-bottom: 10px">
-            五个阶段智能体的系统提示词；修改后下一轮对话立即生效。绑定素材与约束见「风格工坊」。
+            各智能体的系统提示词（五个阶段子智能体 + 风格工坊的约束提炼智能体）；修改后下一轮对话立即生效。
+            绑定素材与约束见「风格工坊」。
           </div>
           <div v-for="p in presets" :key="p.key" class="agent-block">
             <div class="agent-line">
@@ -296,11 +604,33 @@ watch(
           </div>
         </template>
 
-        <!-- 学习仿写 -->
+        <!-- 学习仿写 → 提取素材 / 提取写法（产出统一进素材库） -->
         <template v-else-if="which === 'learning'">
           <div class="muted" style="margin-bottom: 10px">
-            粘贴一段喜欢的正文（建议 500-3000 字），自动完成素材拆解 / 剧情学习 / 文风学习三阶段分析。
+            粘贴一段喜欢的正文（建议 500-3000 字）。两种意图二选一，产出都会进
+            <b>素材库</b>，可在那里筛选、绑定到作品、或直接二开建书。
           </div>
+
+          <div class="mode-row">
+            <button
+              class="mode-card"
+              :class="{ on: learnMode === 'full' }"
+              @click="learnMode = 'full'"
+            >
+              <b>提取素材</b>
+              <span class="muted">世界观 / 人物 / 道具地点 / 桥段 → 素材库（可二开建书）</span>
+            </button>
+            <button
+              class="mode-card"
+              :class="{ on: learnMode === 'style' }"
+              @click="learnMode = 'style'"
+            >
+              <b>提取写法</b>
+              <span class="muted">文风指纹 + 技法模板 + 负面清单 · 不含原书内容</span>
+            </button>
+          </div>
+          <div class="mode-hint muted">{{ MODE_HINT[learnMode] }}</div>
+
           <NInput v-model:value="learnTitle" size="small" placeholder="学习任务标题，例：天蚕土豆·战斗章" style="margin-bottom: 8px" />
           <NInput
             v-model:value="learnSample"
@@ -310,49 +640,325 @@ watch(
             style="margin-bottom: 8px"
           />
           <button class="primary-btn" :disabled="learningBusy" @click="runLearning">
-            {{ learningBusy ? '三阶段分析中…（约 1 分钟）' : '开始学习' }}
+            {{
+              learningBusy
+                ? learnMode === 'style'
+                  ? '写法分析中…（约 1 分钟）'
+                  : '三阶段分析中…（约 1 分钟）'
+                : learnMode === 'style'
+                  ? '提取写法'
+                  : '提取素材'
+            }}
           </button>
 
-          <div class="section-title">历史成果</div>
+          <div class="section-title">任务列表（产出已进素材库）</div>
           <div v-for="item in learningItems" :key="item.id" class="row-card">
-            <span class="row-title" @click="viewDoc(item.id)">{{ item.title }}</span>
+            <span class="row-title" @click="viewDoc(item.id)">
+              <span class="tag" :class="item.mode === 'style' ? 'style' : 'full'">
+                {{ item.mode === 'style' ? '写法' : '素材' }}
+              </span>
+              {{ item.title }}
+              <span class="muted">
+                · {{ srcCount(item) }} 章
+                <template v-if="listCount(item.materials)"> · 素材 {{ listCount(item.materials) }} 条</template>
+                <template v-if="listCount(item.items)"> · 写法 {{ listCount(item.items) }} 条</template>
+                <template v-if="item.scrubbed"> · 已净化 {{ item.scrubbed }}</template>
+                <template v-if="listCount(item.conflicts)"> · <b class="warn">冲突 {{ listCount(item.conflicts) }}</b></template>
+              </span>
+            </span>
             <span class="row-gap">
+              <button class="ghost-btn" @click="startAppend(item)">追加蒸馏</button>
               <button class="ghost-btn" @click="viewDoc(item.id)">查看</button>
               <button class="del-btn" @click="removeLearning(item)">删除</button>
             </span>
           </div>
+
+          <!-- 追加蒸馏对话框 -->
+          <div v-if="appendTarget" class="append-box">
+            <div class="row-between">
+              <b>往「{{ appendTarget.title }}」追加一章</b>
+              <button class="ghost-btn" @click="appendTarget = null">取消</button>
+            </div>
+            <div class="muted">
+              已学 {{ srcCount(appendTarget) }} 章。追加后：重复的写法只累加命中次数，
+              新写法并入条目表；同一条目出现不同说法会进「待裁决冲突」，不会覆盖原有内容。
+              同一段内容重复投喂会自动跳过。
+            </div>
+            <NInput v-model:value="appendLabel" size="small" placeholder="章节标签，例：第二章" />
+            <NInput
+              v-model:value="appendSample"
+              type="textarea"
+              :rows="6"
+              placeholder="粘贴本章样本（至少 200 字）……"
+            />
+            <button class="primary-btn" :disabled="appending" @click="doAppend">
+              {{ appending ? '蒸馏中…（约 1 分钟）' : '追加并蒸馏' }}
+            </button>
+          </div>
+
           <div v-if="viewLearning" class="view-box scroll-y">
             <div class="row-between">
               <b>{{ viewLearning.title }}</b>
               <button class="ghost-btn" @click="viewLearning = null">收起</button>
             </div>
+            <div class="muted">
+              来源：{{ srcDetail(viewLearning).map((s) => `${s.label}(${s.chars}字)`).join(' / ') || '—' }}
+              <template v-if="viewLearning.legacy"> · 旧格式（追加一章会自动升级为条目化）</template>
+            </div>
+            <div v-if="conflictDetail(viewLearning).length" class="conflict-box">
+              <div class="row-between">
+                <b>待裁决冲突 {{ conflictDetail(viewLearning).length }} 条</b>
+                <span class="row-gap">
+                  <button
+                    class="ghost-btn"
+                    :disabled="resolvingBusy"
+                    @click="resolveConflict('keep_existing', { bulk: true })"
+                  >
+                    全部保留原有
+                  </button>
+                  <button
+                    class="ghost-btn"
+                    :disabled="resolvingBusy"
+                    @click="resolveConflict('take_incoming', { bulk: true })"
+                  >
+                    全部采纳新增
+                  </button>
+                </span>
+              </div>
+              <div class="muted">
+                同一维度的两种说法会让 Writer 收到矛盾要求，需要收敛成一条。
+                采纳后仍可撤销；裁决只改条目表，不再调用模型。
+              </div>
+              <div
+                v-for="(c, i) in conflictDetail(viewLearning)"
+                :key="i"
+                class="conflict-row"
+              >
+                <div class="muted">
+                  【{{ c.section }}】重合度 {{ c.overlap ?? '—' }}
+                </div>
+                <div>原有（第 {{ (c.existing_chapters || []).join('、') }} 章）：{{ c.existing }}</div>
+                <div>追加（第 {{ c.incoming_chapter }} 章）：{{ c.incoming }}</div>
+                <div v-if="editingConflict === i" class="conflict-edit">
+                  <NInput v-model:value="editingText" type="textarea" :rows="2" size="small" />
+                  <span class="row-gap">
+                    <button
+                      class="primary-btn"
+                      :disabled="resolvingBusy || !editingText.trim()"
+                      @click="resolveConflict('edit', { index: i, text: editingText })"
+                    >
+                      保存
+                    </button>
+                    <button class="ghost-btn" @click="editingConflict = null">取消</button>
+                  </span>
+                </div>
+                <div v-else class="row-gap conflict-actions">
+                  <button class="ghost-btn" :disabled="resolvingBusy" @click="resolveConflict('keep_existing', { index: i })">
+                    保留原有
+                  </button>
+                  <button class="primary-btn" :disabled="resolvingBusy" @click="resolveConflict('take_incoming', { index: i })">
+                    采纳新增
+                  </button>
+                  <button class="ghost-btn" :disabled="resolvingBusy" @click="resolveConflict('merge_both', { index: i })">
+                    合并两条
+                  </button>
+                  <button class="ghost-btn" :disabled="resolvingBusy" @click="startEditConflict(i, c.incoming)">
+                    手动编辑…
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div v-if="resolvedDetail(viewLearning).length" class="resolved-box">
+              <b>已裁决 {{ resolvedDetail(viewLearning).length }} 条</b>
+              <div
+                v-for="(r, i) in resolvedDetail(viewLearning)"
+                :key="i"
+                class="resolved-row"
+              >
+                <span class="muted">
+                  ✓ {{ ACTION_LABEL[r.action] ?? r.action }}（{{ r.section }}）
+                </span>
+                <span>{{ r.final_text || r.incoming || r.existing }}</span>
+                <button
+                  class="ghost-btn"
+                  :disabled="resolvingBusy"
+                  @click="resolveConflict('undo', { undoIndex: i })"
+                >
+                  撤销
+                </button>
+              </div>
+            </div>
             <pre class="pre-wrap view-pre">{{ viewLearning.content }}</pre>
           </div>
         </template>
 
-        <!-- 素材库 -->
+        <!-- 素材库：① 书籍列表 → ② 书内七维模块 -->
         <template v-else-if="which === 'materials'">
-          <div class="muted" style="margin-bottom: 10px">
-            世界观资料、桥段、设定素材……在「绑定到当前作品」页勾选后注入 Writer/Editor。
-          </div>
-          <div v-for="m in materials" :key="m.id" class="row-card">
-            <div class="col-gap">
-              <div class="row-between">
-                <span class="row-title">{{ m.title }}</span>
-                <span class="row-gap">
-                  <button class="ghost-btn" @click="expandedMaterial = expandedMaterial === m.id ? '' : m.id">
-                    {{ expandedMaterial === m.id ? '收起' : '查看' }}
-                  </button>
-                  <button class="del-btn" @click="removeMaterial(m)">删除</button>
+          <!-- ② 书详情：七维模块 -->
+          <template v-if="activeBook">
+            <div class="row-between shelf-head-gap">
+              <span class="row-gap">
+                <button class="ghost-btn" @click="closeBook">← 返回书籍列表</button>
+                <b>{{ activeBook }}</b>
+                <span class="muted">
+                  共 {{ activeBookData?.total ?? 0 }} 条
+                  <template v-if="minorCount"> · 已折叠 {{ minorCount }} 条次级</template>
+                </span>
+                <label class="minor-toggle">
+                  <input v-model="showMinor" type="checkbox" />
+                  显示次级（只出现一次的杂项）
+                </label>
+              </span>
+              <button class="primary-btn" @click="openSpawn">二开建书</button>
+            </div>
+
+            <div v-for="cat in activeBookCats" :key="cat" class="dim-block">
+              <div class="dim-title">
+                <span class="tag cat">{{ cat }}</span>
+                {{ catItems(cat).length }} / {{ catTotal(cat) }} 条
+                <span v-if="cat === '桥段'" class="muted">· 按章序排列，导入后作为续写线索</span>
+                <span v-else-if="cat === '道具' || cat === '地点'" class="muted">
+                  · 默认只显示反复出现/被强调过的
                 </span>
               </div>
-              <pre v-if="expandedMaterial === m.id" class="pre-wrap view-pre">{{ m.content }}</pre>
+              <div
+                v-for="m in catItems(cat)"
+                :key="m.id"
+                class="row-card"
+              >
+                <div class="col-gap">
+                  <div class="row-between">
+                    <span class="row-title">
+                      <span v-if="(m.importance ?? '') === '主级'" class="tag major">主级</span>
+                      {{ m.title }}
+                      <span v-if="(m.hits ?? 1) > 1" class="muted">· 印证 {{ m.hits }} 次</span>
+                      <span v-if="m.chapters?.length" class="muted">· 第 {{ m.chapters.join('、') }} 章</span>
+                    </span>
+                    <span class="row-gap">
+                      <button class="ghost-btn" @click="expandedMaterial = expandedMaterial === m.id ? '' : m.id">
+                        {{ expandedMaterial === m.id ? '收起' : '查看' }}
+                      </button>
+                      <button class="del-btn" @click="removeMaterial(m)">删除</button>
+                    </span>
+                  </div>
+                  <pre v-if="expandedMaterial === m.id" class="pre-wrap view-pre">{{ m.content }}</pre>
+                </div>
+              </div>
+              <div v-if="!catItems(cat).length" class="muted" style="padding: 2px 0">
+                该分类下没有主级素材（勾选上方「显示次级」可查看全部）。
+              </div>
             </div>
-          </div>
-          <div class="new-block">
-            <NInput v-model:value="newMaterial.title" size="small" placeholder="素材名称，例：修真宗门体系" style="margin-bottom: 6px" />
-            <NInput v-model:value="newMaterial.content" type="textarea" :rows="4" size="small" placeholder="素材内容" style="margin-bottom: 8px" />
-            <button class="primary-btn" @click="createMaterial">添加素材</button>
+            <div v-if="!activeBookCats.length" class="muted" style="padding: 4px 0">
+              这本书下暂无素材。
+            </div>
+          </template>
+
+          <!-- ① 书籍列表：素材的主浏览维度 -->
+          <template v-else>
+            <div class="muted" style="margin-bottom: 10px">
+              按<b>来源书籍</b>浏览：点一本书进入它的七维素材模块。素材来自手写、墨师新增、
+              以及「提取素材」蒸馏的产出。
+            </div>
+            <div class="row-between shelf-head-gap">
+              <span class="muted">共 {{ materialBooks.length }} 本书 · {{ materials.length }} 条素材</span>
+              <button class="primary-btn" @click="openSpawn">二开建书</button>
+            </div>
+
+            <div
+              v-for="b in materialBooks"
+              :key="b.book"
+              class="row-card book-card-click"
+              @click="openBook(b.book)"
+            >
+              <div class="col-gap" style="width: 100%">
+                <div class="row-between">
+                  <span class="row-title">📖 {{ b.book }}</span>
+                  <span class="muted">{{ b.total }} 条 →</span>
+                </div>
+                <span class="muted">
+                  <template v-if="b.chapters?.length">已蒸馏第 {{ b.chapters.join('、') }} 章 · </template>
+                  <template v-for="(n, cat) in b.counts" :key="cat">{{ cat }} {{ n }} · </template>
+                </span>
+              </div>
+            </div>
+            <div v-if="!materialBooks.length" class="muted" style="padding: 4px 0">
+              素材库还是空的。可以用「学习仿写 → 提取素材」从样本里蒸馏，或在下方直接添加。
+            </div>
+
+            <div class="new-block">
+              <NInput v-model:value="newMaterial.title" size="small" placeholder="素材名称，例：修真宗门体系" style="margin-bottom: 6px" />
+              <NInput v-model:value="newMaterial.content" type="textarea" :rows="4" size="small" placeholder="素材内容" style="margin-bottom: 6px" />
+              <div class="cat-row" style="margin-bottom: 8px">
+                <button
+                  v-for="c in (materialCats.length ? materialCats : ['其他'])"
+                  :key="c"
+                  class="cat-chip"
+                  :class="{ on: newMaterial.category === c }"
+                  @click="newMaterial.category = c"
+                >
+                  {{ c }}
+                </button>
+              </div>
+              <button class="primary-btn" @click="createMaterial">添加素材</button>
+            </div>
+          </template>
+
+          <!-- 二开建书：按分类混选（可用书 A 的世界观 + 书 B 的人物） -->
+          <div v-if="spawnOpen" class="append-box">
+            <div class="row-between">
+              <b>二开建书</b>
+              <span class="row-gap">
+                <span class="muted">已选 {{ spawnTotal }} 条</span>
+                <button class="ghost-btn" @click="spawnOpen = false">取消</button>
+              </span>
+            </div>
+            <div class="spawn-grid">
+              <NInput v-model:value="spawnForm.novel_id" size="small" placeholder="新书标识（英文/数字/下划线）" />
+              <NInput v-model:value="spawnForm.title" size="small" placeholder="书名（可留空）" />
+            </div>
+            <div class="muted">
+              每一行选一个分类的素材。**「来源书」可分别指定** —— 例如世界观取书 A、人物取书 B。
+              落盘去向：世界观→worldview、人物→characters、文风→style.md、技法/道具/地点→custom-skills.md。
+              <b>勾选「桥段」会额外生成「原文剧情线索」</b>（按章序排列），新书从最后一条之后接着往下写。
+            </div>
+
+            <div v-for="cat in SPAWN_CATS" :key="cat" class="spawn-row">
+              <div class="row-between">
+                <span class="row-gap">
+                  <span class="tag cat">{{ cat }}</span>
+                  <select v-model="spawnForm.picks[cat].book" class="mini-select">
+                    <option value="">全部来源书</option>
+                    <option v-for="b in materialBooks" :key="b.book" :value="b.book">{{ b.book }}</option>
+                  </select>
+                  <span class="muted">{{ spawnForm.picks[cat].ids.length }}/{{ spawnCatPool(cat).length }}</span>
+                  <span v-if="pickedBooks(cat).length > 1" class="warn">
+                    跨 {{ pickedBooks(cat).length }} 本书混搭
+                  </span>
+                </span>
+                <span class="row-gap">
+                  <button class="ghost-btn" @click="selectAllInCat(cat)">全选</button>
+                  <button class="ghost-btn" @click="clearCat(cat)">清空</button>
+                </span>
+              </div>
+              <div class="cat-row">
+                <button
+                  v-for="m in spawnCatPool(cat)"
+                  :key="m.id"
+                  class="cat-chip"
+                  :class="{ on: spawnForm.picks[cat].ids.includes(m.id) }"
+                  @click="toggleSpawnItem(cat, m.id)"
+                  :title="m.source_book"
+                >
+                  {{ m.title }}
+                </button>
+                <span v-if="!spawnCatPool(cat).length" class="muted">（该分类暂无素材）</span>
+              </div>
+            </div>
+
+            <button class="primary-btn" :disabled="spawning" @click="doSpawn">
+              {{ spawning ? '建书中…' : `建书并导入 ${spawnTotal} 条` }}
+            </button>
           </div>
         </template>
 
@@ -584,6 +1190,183 @@ export default { name: 'SideWindows' }
   font-weight: 600;
   font-size: 13px;
   cursor: pointer;
+}
+.mode-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.mode-card {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  text-align: left;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 9px 11px;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.mode-card.on {
+  border-color: #1d4ed8;
+  background: #f0f5ff;
+}
+.mode-hint {
+  font-size: 12px;
+  line-height: 1.7;
+  margin-bottom: 10px;
+}
+.tag {
+  display: inline-block;
+  font-size: 11px;
+  border-radius: 999px;
+  padding: 1px 8px;
+  margin-right: 6px;
+  white-space: nowrap;
+}
+.tag.full {
+  background: #f3f4f6;
+  color: #5c6470;
+}
+.tag.style {
+  background: #f3e8ff;
+  color: #6b21a8;
+}
+.tag.cat {
+  background: #eef4ff;
+  color: #1d4ed8;
+}
+.cat-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.cat-chip {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  padding: 3px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  color: #5c6470;
+}
+.cat-chip.on {
+  border-color: #1d4ed8;
+  background: #f0f5ff;
+  color: #1d4ed8;
+  font-weight: 600;
+}
+.shelf-head-gap {
+  margin-bottom: 8px;
+}
+.book-card-click {
+  cursor: pointer;
+}
+.minor-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: #5c6470;
+  cursor: pointer;
+}
+.tag.major {
+  background: #fff7ed;
+  color: #b45309;
+}
+.book-card-click:hover {
+  border-color: #1d4ed8;
+  background: #f8faff;
+}
+.dim-block {
+  margin-bottom: 14px;
+}
+.dim-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  color: #3a3d44;
+}
+.spawn-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.spawn-row {
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: #fff;
+}
+.mini-select {
+  font-size: 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 2px 6px;
+  background: #fff;
+  color: #3a3d44;
+  max-width: 160px;
+}
+.warn {
+  color: #b45309;
+}
+.append-box,
+.conflict-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid #dbe6fe;
+  background: #f8faff;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.conflict-box {
+  border-color: #fcd34d;
+  background: #fffbeb;
+}
+.conflict-row {
+  border-top: 1px dashed #f0d9a0;
+  padding-top: 6px;
+}
+.conflict-actions {
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+.conflict-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+.resolved-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid #d7e8d9;
+  background: #f6fbf7;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.resolved-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: space-between;
+  border-top: 1px dashed #d7e8d9;
+  padding-top: 5px;
 }
 .row-between {
   display: flex;

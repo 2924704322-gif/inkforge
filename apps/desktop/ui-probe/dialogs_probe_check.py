@@ -99,7 +99,9 @@ def main() -> int:
             page.screenshot(path=str(SHOTS / "dialogs-b-bookshelf.png"))
 
             print("\n[C] 新建作品 → 结构化 brief → 创建")
-            page.get_by_role("button", name="新建作品").click()
+            # 精确匹配：左侧导航按钮的可见文案是「📚 书架 / 新建作品」，
+            # 用子串匹配会同时命中它与书架对话框里的「新建作品」（strict mode 直接报错）。
+            page.get_by_role("button", name="新建作品", exact=True).click()
             page.wait_for_timeout(400)
             check(
                 "「新建作品」表单已弹出",
@@ -163,6 +165,53 @@ def main() -> int:
                 check(f"「{nav}」对话框可打开", page.locator(f"text={title}").count() > 0)
                 page.keyboard.press("Escape")
                 page.wait_for_timeout(400)
+
+            print("\n[E2] 风格工坊 · 第三个同级模块「约束提炼」（双输入形态）")
+            page.get_by_role("button", name="风格工坊").first.click()
+            page.wait_for_timeout(600)
+            tabs = page.locator(".tabs .tab")
+            check("风格工坊有三个同级标签（新增第三个）",
+                  tabs.count() == 3, f"{tabs.count()} 个：{tabs.all_inner_texts()}")
+            tabs.nth(2).click()
+            page.wait_for_timeout(400)
+            src_box = page.locator("textarea[placeholder*='粘贴要提炼的正文']")
+            req_box = page.locator("textarea[placeholder*='把这段里可复用的写作约束']")
+            check("① 正文内容框存在", src_box.count() == 1)
+            check("② 提炼需求框存在", req_box.count() == 1)
+            check("两个内容框是分开的两个 textarea（不是同一个）",
+                  src_box.count() == 1 and req_box.count() == 1
+                  and page.locator(".forge-field textarea").count() == 2,
+                  f"共 {page.locator('.forge-field textarea').count()} 个")
+            check("有字数计数（正文 / 上限）",
+                  page.locator(".forge-counter").count() >= 2,
+                  page.locator(".forge-counter").first.inner_text())
+            check("有「提炼」按钮",
+                  page.get_by_role("button", name="提炼", exact=True).count() == 1)
+            scope = page.locator(".scope-no")
+            check("隔离声明按新语义（看不到作品库 / 没粘贴的内容）",
+                  scope.count() == 1 and "作品库" in scope.inner_text(),
+                  scope.inner_text() if scope.count() else "缺失")
+            check("第三页有「查看智能体设定」入口",
+                  page.get_by_role("button", name="查看智能体设定").count() == 1)
+
+            src_box.fill("剑冢的雪落了三天，他把断剑插回石缝，指节冻得发紫。")
+            req_box.fill("提炼这段的文风与节奏约束")
+            page.get_by_role("button", name="提炼", exact=True).click()
+            page.wait_for_timeout(700)
+            check("点「提炼」调用 POST /api/style-forge/constraints",
+                  has_call(page, "/api/style-forge/constraints"),
+                  str([c for c in calls(page) if "style-forge" in c]))
+            out = page.locator(".forge-out textarea")
+            value = out.input_value() if out.count() else ""
+            check("结果区渲染出 `- ` 条目",
+                  value.startswith("- ") and "\n- " in value, repr(value))
+            check("结果区有「复制」按钮",
+                  page.get_by_role("button", name="复制", exact=True).count() == 1)
+            check("结果区有「存入约束库」按钮",
+                  page.get_by_role("button", name="存入约束库").count() == 1)
+            page.screenshot(path=str(SHOTS / "dialogs-e2-style-forge-constraint.png"))
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(400)
 
             print("\n[F] 运行期 JS 报错")
             real_errors = [e for e in errors if "favicon" not in e.lower()]

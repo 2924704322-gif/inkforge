@@ -718,12 +718,19 @@ def test_x7_exhausted_retries_raise_internal_error():
 
 
 def test_w3_single_source_constitution():
-    """W3：第零条正文全仓只有一份（prompt_loader.CONSTITUTION）。"""
+    """W3：第零条正文全仓只有一份（prompt_loader.CONSTITUTION）。
+
+    2026-09-19 扩展（防拒绝覆盖审计）：原先只扫 `*.py`，于是
+    `src/distillation/prompts/distill_extract.md` 里内嵌的第零条正文副本**长期不被发现**
+    —— 提示词模板同样是"会漂移的真源副本"，必须一并纳入（该副本已删除，
+    蒸馏的 system 改由 `distillation.prompts.DISTILL_SYSTEM` 从单一源注入）。
+    """
     from src.agents import prompt_loader
 
     holders = [
-        path.name
-        for path in (ENGINE_DIR / "src").rglob("*.py")
+        f"{path.relative_to(ENGINE_DIR).as_posix()}"
+        for pattern in ("*.py", "*.md")
+        for path in (ENGINE_DIR / "src").rglob(pattern)
         if path.name != "prompt_loader.py"
         and "【第零条" in path.read_text(encoding="utf-8")
     ]

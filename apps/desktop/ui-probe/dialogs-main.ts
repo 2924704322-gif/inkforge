@@ -73,6 +73,43 @@ function route(method: string, path: string): { status: number; data: unknown } 
   if (p === '/api/chats') return { status: 200, data: { chats: [] } }
   if (p === '/api/chats/c-probe/send') return { status: 200, data: { reply: '探针回复' } }
   if (p === '/api/agent-presets') return { status: 200, data: { presets: [] } }
+  // 风格工坊第三页（约束提炼）：智能体名片 + 一次提炼的结果，桩数据形状与引擎一致
+  if (p === '/api/style-forge/agent') {
+    return {
+      status: 200,
+      data: {
+        key: 'constraint',
+        label: '约束提炼智能体',
+        role: 'constraint',
+        prompt: '（探针桩：约束提炼智能体的系统提示词）',
+        max_items: { default: 18, min: 3, max: 60 },
+        limits: { source_max: 20000, source_min: 20, requirement_max: 2000 },
+        sees: ['你在【正文内容】框里粘贴的文本', '你在【提炼需求】框里写的要求'],
+        never_sees: [
+          '你作品库里的任何文件（正文 / 章节 / 大纲 / 设定 / 素材 / 摘要）',
+          '你没有粘贴进输入框的任何内容',
+        ],
+      },
+    }
+  }
+  if (p === '/api/style-forge/constraints') {
+    return {
+      status: 200,
+      data: {
+        ok: true,
+        agent: { key: 'constraint', label: '约束提炼智能体' },
+        title: '提炼文风与节奏',
+        constraints: '- **叙事视角**：第三人称限知；\n- **节奏**：短句为主，单段不超过 4 行',
+        items: ['**叙事视角**：第三人称限知', '**节奏**：短句为主，单段不超过 4 行'],
+        count: 2,
+        role: 'constraint',
+        model: 'probe-model',
+        provider: 'probe',
+        elapsed: 0.1,
+        isolation: '只提炼你在本页粘贴的正文；未读取你作品库里的任何文件。',
+      },
+    }
+  }
   if (p === '/api/learning') return { status: 200, data: { items: [] } }
   if (p === '/api/materials') return { status: 200, data: { materials: [] } }
   if (p === '/api/settings/tree') return { status: 200, data: { items: [] } }

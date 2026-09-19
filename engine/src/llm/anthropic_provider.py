@@ -7,6 +7,13 @@ import time
 import anthropic
 
 from src.llm.base import ChatMessage, ChatResult, ModelProvider, ProviderError
+from src.llm.openai_compat import (  # 网络错误判定/文案归一：单一事实源，勿复制
+    CHAT_TIMEOUT_SECONDS,
+    NETWORK_ATTEMPTS,
+    PROBE_TIMEOUT_SECONDS,
+    _describe_network_error,
+    _is_network_error,
+)
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -17,7 +24,13 @@ class AnthropicProvider(ModelProvider):
 
     def __init__(self, name: str, api_key: str, base_url: str | None = None):
         super().__init__(name)
-        kwargs: dict = {"api_key": api_key, "max_retries": 0}
+        # max_retries=0：重试节奏由本类统一控制；timeout 显式设置，避免网络黑洞下
+        # 界面被 SDK 默认的 10 分钟超时拖成「假死」。
+        kwargs: dict = {
+            "api_key": api_key,
+            "max_retries": 0,
+            "timeout": CHAT_TIMEOUT_SECONDS,
+        }
         if base_url:
             kwargs["base_url"] = base_url
         self._client = anthropic.Anthropic(**kwargs)
@@ -43,7 +56,7 @@ class AnthropicProvider(ModelProvider):
             )
 
         last_err: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(NETWORK_ATTEMPTS):
             try:
                 resp = self._client.messages.create(
                     model=model,
@@ -81,21 +94,43 @@ class AnthropicProvider(ModelProvider):
                 break
             except Exception as e:
                 last_err = e
-                if attempt < 2:
+                if attempt < NETWORK_ATTEMPTS - 1:
                     time.sleep(2**attempt)
                     continue
                 break
+        if last_err is not None and _is_network_error(last_err):
+            raise ProviderError(
+                self.name,
+                f"网络连接失败（已重试 {NETWORK_ATTEMPTS} 次）: "
+                f"{_describe_network_error(last_err)}",
+            ) from last_err
         raise ProviderError(self.name, f"chat 调用失败: {last_err}")
 
     def probe(self, model: str) -> None:
-        try:
-            self._client.messages.create(
-                model=model,
-                messages=[{"role": "user", "content": "ping"}],
-                max_tokens=1,
-            )
-        except Exception as e:
-            raise ProviderError(self.name, f"探活失败（model={model}）: {e}") from e
+        """启动探活：短超时 + 网络类重试（探活失败在 probe_all 里是 Fail-Fast 的）。"""
+        last_err: Exception | None = None
+        for attempt in range(NETWORK_ATTEMPTS):
+            try:
+                self._client.messages.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "ping"}],
+                    max_tokens=1,
+                    timeout=PROBE_TIMEOUT_SECONDS,
+                )
+                return
+            except Exception as e:  # noqa: BLE001
+                if not _is_network_error(e):
+                    raise ProviderError(
+                        self.name, f"探活失败（model={model}）: {e}"
+                    ) from e
+                last_err = e
+                if attempt < NETWORK_ATTEMPTS - 1:
+                    time.sleep(2**attempt)
+        raise ProviderError(
+            self.name,
+            f"探活失败（model={model}，已重试 {NETWORK_ATTEMPTS} 次）: "
+            f"{_describe_network_error(last_err) if last_err else '未知网络错误'}",
+        ) from last_err
 
     def supports_json_mode(self) -> bool:
         return False  # 无原生 JSON mode，统一走提示词约束

@@ -16,7 +16,7 @@ from langgraph.graph import END, START, StateGraph
 
 from src.distillation.chunker import Chunk
 from src.distillation.merger import build_cumulative_summary, merge_increment
-from src.distillation.prompts import render_prompt
+from src.distillation.prompts import DISTILL_SYSTEM, render_prompt
 from src.distillation.schemas import ChunkExtraction, FullReport
 from src.llm.base import ChatMessage
 from src.utils.logger import get_logger
@@ -97,7 +97,7 @@ def build_distill_graph(pipe: DistillPipeline, checkpoint_db: Path):
         )
 
         messages = [
-            ChatMessage(role="system", content="你是一个极致的文学结构化分析引擎。只输出合法 JSON。"),
+            ChatMessage(role="system", content=DISTILL_SYSTEM),
             ChatMessage(role="user", content=prompt),
         ]
 

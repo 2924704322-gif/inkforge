@@ -20,6 +20,21 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def translate_system_prompt(target_lang: str) -> str:
+    """翻译 Skill 的 system 提示词（**必须带第零条**）。
+
+    由来（2026-09-19 防拒绝覆盖审计）：本条通路原先在 `_translate_text` 里直接拼字面量，
+    未经任何注入器。翻译是最容易被模型"自行加戏"的环节（删情节、加说明、拒绝译某段），
+    必须有无条件执行条款兜底；包装成函数后"这条通路带第零条"可被测试直接断言。
+    """
+    from src.agents.prompt_loader import ensure_constitution
+
+    return ensure_constitution(
+        f"你是专业文学译者。请把用户提供的小说正文忠实翻译为{target_lang}，"
+        "保留分段与语气，不要增删情节，不要输出除译文外的任何说明。"
+    )
+
+
 class TranslateSettings(SkillSettings):
     enabled: bool = False                # 翻译有 LLM 成本，基线默认关闭
     target_lang: str = "English"         # 目标语言（自然语言名，直接进提示词）
@@ -62,13 +77,7 @@ class TranslateSkill(Skill):
 
     def _translate_text(self, text: str, target_lang: str) -> str:
         messages = [
-            ChatMessage(
-                role="system",
-                content=(
-                    f"你是专业文学译者。请把用户提供的小说正文忠实翻译为{target_lang}，"
-                    "保留分段与语气，不要增删情节，不要输出除译文外的任何说明。"
-                ),
-            ),
+            ChatMessage(role="system", content=translate_system_prompt(target_lang)),
             ChatMessage(role="user", content=text),
         ]
         result = self.context.registry.chat_as(self.settings.role, messages)

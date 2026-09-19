@@ -46,6 +46,11 @@ export class EngineSupervisor extends EventEmitter {
     return `http://127.0.0.1:${this.port}`
   }
 
+  /** 引擎子进程 pid（0 = 未运行）。主进程退出时用它兜底回收整棵进程树。 */
+  get pid(): number {
+    return this.proc?.pid ?? 0
+  }
+
   /** 记录一个由用户授权（系统对话框）的绝对路径。 */
   grantPath(absolutePath: string): void {
     try {
@@ -72,6 +77,24 @@ export class EngineSupervisor extends EventEmitter {
     this.logs.push(stamped)
     if (this.logs.length > 800) this.logs.shift()
     console.log(stamped)
+    this.appendToFile(stamped)
+  }
+
+  /**
+   * 日志落盘（`engine/data/runtime/logs/desktop-<yyyyMMdd>.log`）。
+   *
+   * 由来：日志原先只存在内存环形缓冲里，一旦用户重启应用现场就没了——排"互动创作
+   * 跑一半报连接错误"这类问题时，手上一点证据都没有。写盘失败只告警，绝不影响主流程。
+   */
+  private appendToFile(line: string): void {
+    try {
+      const dir = path.join(this.engineDir, 'data', 'runtime', 'logs')
+      fs.mkdirSync(dir, { recursive: true })
+      const day = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+      fs.appendFileSync(path.join(dir, `desktop-${day}.log`), `${line}\n`, 'utf8')
+    } catch {
+      /* 落盘失败不影响引擎运行 */
+    }
   }
 
   recentLogs(): string[] {
@@ -109,7 +132,11 @@ export class EngineSupervisor extends EventEmitter {
     this.pipeLogs(proc)
 
     proc.on('error', (err) => {
+      // spawn 本身失败（如 py 解释器路径不存在 ENOENT）：必须落到 crashed，
+      // 否则界面会永远停在「引擎启动中…」而没有任何解释。
       this.log(`进程错误: ${err.message}`)
+      this.state = 'crashed'
+      this.emitState(`引擎进程无法启动：${err.message}`)
     })
     proc.on('exit', (code) => {
       this.proc = null
@@ -221,7 +248,7 @@ export class EngineSupervisor extends EventEmitter {
           body === undefined ? undefined : { 'Content-Type': 'application/json' },
         ),
         body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(180_000),
+        signal: AbortSignal.timeout(this.timeoutMs(apiPath)),
       })
       const text = await res.text()
       let data: unknown = null
@@ -235,9 +262,30 @@ export class EngineSupervisor extends EventEmitter {
       return { status: res.status, data }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
+      // 超时要和"连接被重置/引擎已退出"分开报：两者的下一步动作完全不同
+      // （前者是模型慢、等一等；后者是引擎进程没了、要重启）。原先统一成
+      // `引擎通信失败：<原始英文>`，用户看不懂也判断不了。
+      const timedOut = /timeout|timed out|aborted/i.test(message)
+      const detail = timedOut
+        ? `引擎请求超时（${Math.round(this.timeoutMs(apiPath) / 1000)}s 未返回，路径 ${apiPath}）。`
+          + '若正在进行长章节生成，稍后重试即可；持续如此请查看引擎日志。'
+        : `引擎通信失败（${message}）。引擎进程可能已退出或正在重启：`
+          + '可在「工具」里点「重启引擎」，或重新启动 Inkforge。'
       this.log(`请求失败 ${method} ${apiPath}: ${message}`)
-      return { status: 502, data: { detail: `引擎通信失败：${message}` } }
+      return { status: 502, data: { detail, raw: message } }
     }
+  }
+
+  /**
+   * 按路径选择超时：长文生成类请求可能跑几分钟，健康检查/读接口必须短，
+   * 否则 UI 会把「引擎卡住」和「模型慢」混为一谈。
+   */
+  private timeoutMs(apiPath: string): number {
+    if (apiPath === '/api/ping') return 5_000
+    const slow = /^\/api\/(interactive|converse|chats|demo|start|resume|proposals|distill)/.test(
+      apiPath,
+    )
+    return slow ? 1_800_000 : 60_000
   }
 
   /** 流式下载（技能包 ZIP / 文稿导出），落盘到用户选择的路径。 */
@@ -275,13 +323,29 @@ export class EngineSupervisor extends EventEmitter {
     const proc = this.proc
     if (!proc) return
     this.log('正在停止引擎…')
+    // 先取 pid：子进程一退出，proc.pid 仍可读，但为稳妥起见固定下来给 taskkill 用
+    const killedPid = proc.pid
     await new Promise<void>((resolve) => {
+      const forceKillTree = (): void => {
+        if (process.platform !== 'win32' || !killedPid) return
+        try {
+          // python 可能还有 git 等子进程；taskkill /T 一起收掉，避免残留进程
+          // 继续占用 checkpoints.sqlite / chroma 目录
+          spawn('taskkill', ['/PID', String(killedPid), '/T', '/F'], {
+            windowsHide: true,
+            stdio: 'ignore',
+          })
+        } catch {
+          /* 已退出 */
+        }
+      }
       const timer = setTimeout(() => {
         try {
           proc.kill('SIGKILL')
         } catch {
           /* 已退出 */
         }
+        forceKillTree()
         resolve()
       }, 3000)
       proc.once('exit', () => {

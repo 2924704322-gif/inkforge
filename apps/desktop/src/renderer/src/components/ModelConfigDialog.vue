@@ -30,6 +30,7 @@ const ROLE_META: Record<string, { label: string; group: string }> = {
   outline: { label: '大纲规划', group: '对话智能体' },
   prose: { label: '正文写手', group: '对话智能体' },
   review: { label: '审校主编', group: '对话智能体' },
+  constraint: { label: '约束提炼（风格工坊）', group: '对话智能体' },
   chat: { label: '通用对话（兼容旧会话）', group: '对话智能体' },
   architect: { label: '大纲 Architect', group: '流水线智能体' },
   writer: { label: '正文 Writer', group: '流水线智能体' },

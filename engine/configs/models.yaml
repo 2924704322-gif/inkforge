@@ -50,7 +50,7 @@ roles:
     model: deepseek-chat
     temperature: 0.0
 
-  # 对话智能体（Inkforge 工作台：主智能体 + 五个子智能体，各自可绑不同模型）
+  # 对话智能体（Inkforge 工作台：主智能体 + 五个子智能体 + 风格工坊约束提炼，各自可绑不同模型）
   master:
     provider: deepseek
     model: deepseek-chat
@@ -75,6 +75,12 @@ roles:
     provider: deepseek
     model: deepseek-chat
     temperature: 0.2
+  # 风格工坊「约束提炼」智能体：把作者口述的要求提取成自定义创作约束。
+  # 温度取低（0.4）= 要的是忠实提取，不是发挥；接入点仍可由此处改绑任意 provider。
+  constraint:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.4
   # 兼容旧会话的通用对话角色
   chat:
     provider: deepseek

@@ -37,6 +37,77 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+
+def classify_failure(exc: BaseException) -> tuple[str, str]:
+    """把后台线程里的异常归类成 (来源, 可执行提示)。
+
+    由来（用户实测）：模型接入点断网时 UI 只显示 SDK 原文 `Connection error.`，
+    用户无法判断"是我网断了 / 引擎死了 / Key 没钱了"，也没有"重试"入口。
+    归一后前端能给出确切原因与下一步动作。
+    """
+    text = f"{type(exc).__name__}: {exc}"
+    low = text.lower()
+    network_kw = (
+        "网络连接失败", "connection error", "connection refused", "connection reset",
+        "timed out", "timeout", "getaddrinfo", "name or service not known",
+        "nodename nor servname", "ssl", "certificate", "proxy", "temporarily unavailable",
+        "eof occurred", "读操作超时", "连接超时",
+    )
+    if any(kw in low for kw in network_kw):
+        return (
+            "network",
+            "与模型服务的网络连接失败。检查本机网络/代理/VPN 后直接点「重试」即可——"
+            "已写好的草稿与剧情卡都保留着，不会重新出题。",
+        )
+    auth_kw = ("401", "403", "invalid api key", "unauthorized", "authentication", "余额",
+               "insufficient", "quota", "402")
+    if any(kw in low for kw in auth_kw):
+        return (
+            "provider_auth",
+            "模型接入点拒绝了本次调用（Key 失效 / 欠费 / 权限不足）。"
+            "在「工具 → Agent 模型配置」里核对接入点与 Key，修好后点「重试」。",
+        )
+    if "json" in low or "解析" in text:
+        return ("parse", "模型返回的内容无法解析（多半是网络截断或额度不足导致截半）。直接点「重试」。")
+    if isinstance(exc, (KeyError, ValueError)) or "models.yaml" in text:
+        # 顺序说明：pydantic / JSON 解析失败也抛 ValueError，故泛化输出类错误（含 json /
+        # 解析）必须排在它前面，否则会被误报成"模型配置错误"。
+        return ("config", "模型配置或模型输出结构有问题（角色未绑定/接入点缺失/字段不符）。检查 configs/models.yaml 后重试。")
+    return ("engine", "引擎内部异常。可先点「重试」；反复出现请导出引擎日志排查。")
+
+
+#: 错误文案里的凭据形态（用于回给前端的 detail 脱敏）
+_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # OpenAI 系 Key：sk- 开头 + 长串
+    (re.compile(r"\bsk-[A-Za-z0-9_\-]{6,}"), "sk-***"),
+    # Authorization: Bearer <token>
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{6,}"), "Bearer ***"),
+    # 各类显式键值：api_key=xxx / "apiKey": "xxx" / token: xxx
+    (re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|secret|password)\b\s*[\"']?\s*[:=]\s*[\"']?"
+                r"([A-Za-z0-9._\-]{6,})"), r"\1=***"),
+    # 兜底：任何 40 位以上的连续 token 形态串
+    (re.compile(r"\b[A-Za-z0-9_\-]{40,}\b"), "***"),
+)
+
+
+def redact_secrets(text: str, limit: int = 400) -> str:
+    """给要回给前端的错误文案脱敏 + 截断。
+
+    由来（2026-09-19 对抗排查实测）：模型接入点返回 5xx 时，SDK 会把**上游响应体原文**
+    塞进异常消息，而我们把 `str(exc)` 原样拼进 502 的 detail —— 上游一旦在错误里回显
+    请求信息（含 Authorization/Key），Key 就会顺着错误提示回给渲染层。
+    本机单用户场景下影响面有限，但"错误通路把凭据带出去"是应当直接堵死的形态：
+    脱敏 + 截断后再回给前端，完整异常仍留在引擎日志里（`logger.exception`）。
+
+    注意：截断同时防住"上游把整页 HTML 错误贴回来"把 UI 刷屏。
+    """
+    out = text or ""
+    for pattern, repl in _SECRET_PATTERNS:
+        out = pattern.sub(repl, out)
+    out = re.sub(r"\s+", " ", out).strip()
+    return out if len(out) <= limit else out[:limit] + "…（已截断）"
+
+
 # 引擎版本（/api/ping 上报，供壳层做兼容性校验）
 APP_VERSION = "0.2.0"
 
@@ -754,6 +825,11 @@ class InteractiveSession:
         self._cards: list[dict] = []
         self._draft: dict | None = None   # {draft_text, attempt, review, model?}
         self._error: str | None = None
+        #: 失败归因（见 classify_failure）：来源 + 可执行提示。UI 据此给"重试"而不是干瞪眼。
+        self._error_source: str = ""
+        self._error_hint: str = ""
+        #: 本次会话实际用到的 角色→provider/model（用于把失败归因落到具体接入点）
+        self._models: dict[str, str] = {}
         self._worker: threading.Thread | None = None
         self._runner = None                  # InteractiveRunner（重型装配，会话内缓存）
 
@@ -765,20 +841,46 @@ class InteractiveSession:
             pipe = build_pipeline(self.novel_id, target_words=self.target_words)
             pipe.registry.probe_all()
             self._runner = InteractiveRunner(pipe)
+            try:
+                self._models = {
+                    role: f"{pipe.registry._config.roles[role].provider}"
+                          f"/{pipe.registry._config.roles[role].model}"  # noqa: SLF001
+                    for role in ("plot", "writer", "editor")
+                    if role in pipe.registry._config.roles
+                }
+            except Exception:  # noqa: BLE001 - 归因信息缺失不影响主流程
+                self._models = {}
         return self._runner
 
     def _spawn(self, fn, *args) -> None:
-        """启动短后台线程执行一个动作；异常统一转 error 状态。"""
+        """启动短后台线程执行一个动作；异常统一转 error 状态并归因。"""
         def run():
             try:
                 fn(*args)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("互动创作会话异常")
+                source, hint = classify_failure(exc)
                 with self._lock:
                     self._status = "error"
                     self._error = str(exc)
+                    self._error_source = source
+                    self._error_hint = hint
         self._worker = threading.Thread(target=run, daemon=True)
         self._worker.start()
+
+    def reset(self) -> None:
+        """清掉 error 态，让会话可以重新 start（断点由 MD 事实源自证，不丢进度）。
+
+        由来：error 态原先没有任何出口——start/choose/redraw/decision 全被状态校验
+        拒绝，用户只能重启整个应用。本方法只重置**内存状态机**，不动任何正文。
+        """
+        with self._lock:
+            if self._busy():
+                raise RuntimeError("互动会话正在处理中，请等当前这一步跑完再重置")
+            self._status = "idle"
+            self._error = None
+            self._error_source = ""
+            self._error_hint = ""
 
     def _busy(self) -> bool:
         return self._status in ("generating_cards", "writing", "committing")
@@ -792,6 +894,8 @@ class InteractiveSession:
                 raise RuntimeError("互动会话正在处理中，请稍候")
             self._status = "generating_cards"
             self._error = None
+            self._error_source = ""
+            self._error_hint = ""
         self._spawn(self._do_start)
 
     def _do_start(self) -> None:
@@ -935,6 +1039,10 @@ class InteractiveSession:
                 "draft": dict(self._draft) if self._draft else None,
                 "approved_count": approved,
                 "error": self._error,
+                # 失败归因：UI 用它决定给「重试 / 去配置模型 / 导出日志」
+                "error_source": self._error_source,
+                "error_hint": self._error_hint,
+                "models": dict(self._models),
                 "target_words": self.target_words,
             }
 
@@ -1162,7 +1270,11 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
 
     @app.put("/api/custom-skills/{sid}")
     def custom_skills_update(sid: str, body: CustomSkillBody) -> JSONResponse:
-        """更新自定义 Skill（不存在 404）。"""
+        """更新自定义 Skill（不存在 404）；**并同步刷新所有已绑定它的书**。
+
+        由来：编辑只改全局库副本，各书 settings/custom-skills.md 里仍是旧版 ——
+        用户看到的是"改了没反应"。这里就地刷新已绑作品，并回执刷新了哪几本。
+        """
         title = body.title.strip()
         content = body.content.strip()
         if not title or not content:
@@ -1176,18 +1288,40 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
             frontmatter.dumps(frontmatter.Post(content, title=title)),
             encoding="utf-8", newline="\n",
         )
-        return JSONResponse({"ok": True, "skill_id": sid, "title": title})
+        from src.services.library import sync_custom_skill_to_books
+
+        refreshed = sync_custom_skill_to_books(sid)
+        logger.info("约束 %s 已更新，同步刷新 %d 本已绑作品", sid, len(refreshed))
+        return JSONResponse({
+            "ok": True,
+            "skill_id": sid,
+            "title": title,
+            "synced_books": refreshed,
+            "summary": (
+                f"已更新并同步到 {len(refreshed)} 本已绑作品：{'、'.join(refreshed)}"
+                if refreshed else "已更新（暂无作品绑定它——请到「绑定到当前作品」标签页绑定）"
+            ),
+        })
 
     @app.delete("/api/custom-skills/{sid}")
     def custom_skills_delete(sid: str) -> JSONResponse:
-        """删除自定义 Skill（不存在 404；已写入各书的约束不受影响）。"""
+        """删除自定义 Skill（不存在 404）；已绑定的书会同步摘掉这条约束。"""
         if not _SKILL_ID_RE.match(sid):
             raise HTTPException(400, f"非法 Skill 标识：{sid!r}")
         path = _custom_skills_dir() / f"{sid}.md"
         if not path.exists():
             raise HTTPException(404, f"Skill {sid} 不存在")
         path.unlink()
-        return JSONResponse({"ok": True, "skill_id": sid})
+        from src.services.library import sync_custom_skill_to_books
+
+        refreshed = sync_custom_skill_to_books(sid)
+        logger.info("约束 %s 已删除，同步更新 %d 本已绑作品", sid, len(refreshed))
+        return JSONResponse({
+            "ok": True,
+            "skill_id": sid,
+            "synced_books": refreshed,
+            "summary": (f"已删除，并同步更新 {len(refreshed)} 本已绑作品" if refreshed else "已删除"),
+        })
 
     # ---------- Agent 模型接入配置（全局，跨书生效） ----------
 
@@ -1490,8 +1624,21 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
 
     @app.get("/api/interactive/state")
     def interactive_state(novel: str = "") -> JSONResponse:
-        """互动会话快照轮询：{status, chapter, cards, draft, approved_count, error}。"""
+        """互动会话快照轮询：{status, chapter, cards, draft, approved_count, error,
+        error_source, error_hint, models}。"""
         return JSONResponse(_isess(novel).snapshot())
+
+    @app.post("/api/interactive/reset")
+    def interactive_reset(novel: str = "") -> JSONResponse:
+        """清掉互动会话的 error 态，让「重试」有路可走（不动任何正文/剧情卡）。
+
+        由来：error 态原先没有出口，用户只能重启整个应用（用户实测的"锁死"）。
+        """
+        try:
+            _isess(novel).reset()
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc))
+        return JSONResponse({"ok": True, "state": _isess(novel).snapshot()})
 
     @app.post("/api/interactive/choose")
     def interactive_choose(body: InteractiveChooseBody, novel: str = "") -> JSONResponse:
@@ -1712,6 +1859,9 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
     register_proposal_api(app, hub, novel_id)
     from src.web.inkforge_windows import register_windows_api
     register_windows_api(app, hub, novel_id)
+    # 风格工坊第三页：约束提炼（**只吃用户文本，不读任何作品内容**——隔离见 inkforge_forge 文件头）
+    from src.web.inkforge_forge import register_forge_api
+    register_forge_api(app, hub, novel_id)
 
     # ────────── 访问控制（S1-4）──────────
     # 必须在所有路由注册完成后再挂中间件；token 由桌面壳经环境变量注入，

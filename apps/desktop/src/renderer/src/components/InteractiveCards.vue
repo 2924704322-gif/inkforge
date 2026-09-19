@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 
-import { NInput } from 'naive-ui'
+import { NInput, useMessage } from 'naive-ui'
 import { api, scoreColor, withNovel } from '../api'
 import type { InteractiveState, PlotCard } from '../types'
 
@@ -23,6 +23,7 @@ const redrawFeedback = ref('')
 const rejectFeedback = ref('')
 const busy = ref(false)
 const showCustom = ref(false)
+const message = useMessage()
 
 const STATUS_LABEL: Record<string, string> = {
   idle: '未开始',
@@ -37,11 +38,34 @@ const STATUS_LABEL: Record<string, string> = {
 
 const statusText = computed(() => STATUS_LABEL[props.state.status] ?? props.state.status)
 
-async function call(action: () => Promise<void>): Promise<void> {
+/** 失败来源中文名（引擎 classify_failure 给出 error_source；缺省当"引擎内部异常"）。 */
+const SOURCE_LABEL: Record<string, string> = {
+  network: '模型服务连接失败',
+  provider_auth: '接入点鉴权失败',
+  config: '模型配置错误',
+  parse: '模型输出无法解析',
+  engine: '引擎内部异常',
+}
+const sourceLabel = computed(() => SOURCE_LABEL[props.state.error_source ?? ''] ?? '引擎内部异常')
+
+/** 本次会话绑定的接入点（plot/writer/editor），排障时要能一眼看到是哪个点在失败。 */
+const modelText = computed(() => {
+  const models = props.state.models ?? {}
+  return Object.entries(models)
+    .map(([role, m]) => `${role}=${m}`)
+    .join(' · ')
+})
+
+async function call(action: () => Promise<void>, label: string): Promise<void> {
   if (busy.value) return
   busy.value = true
   try {
     await action()
+    emit('refresh')
+  } catch (err) {
+    // 关键：这里以前只有 finally、没有 catch —— 互动创作的失败会变成**静默的
+    // unhandled rejection**：用户看不到任何提示，卡片停在原状态，只能以为"卡死了"。
+    message.error(`${label}失败：${err instanceof Error ? err.message : String(err)}`)
     emit('refresh')
   } finally {
     busy.value = false
@@ -49,9 +73,18 @@ async function call(action: () => Promise<void>): Promise<void> {
 }
 
 const start = (): void => {
+  void call(
+    () => api('POST', withNovel('/api/interactive/start', props.novelId)),
+    '启动互动创作',
+  )
+}
+
+/** 清掉引擎侧 error 态后再重新 start：断点由 MD 事实源自证，草稿/剧情卡都不会丢。 */
+const retry = (): void => {
   void call(async () => {
+    await api('POST', withNovel('/api/interactive/reset', props.novelId))
     await api('POST', withNovel('/api/interactive/start', props.novelId))
-  })
+  }, '重试')
 }
 
 const choose = (cardId: string, custom = ''): void => {
@@ -61,7 +94,7 @@ const choose = (cardId: string, custom = ''): void => {
       custom_text: custom,
     })
     customText.value = ''
-  })
+  }, '选卡写章')
 }
 
 const redraw = (): void => {
@@ -70,7 +103,7 @@ const redraw = (): void => {
       feedback: redrawFeedback.value.trim(),
     })
     redrawFeedback.value = ''
-  })
+  }, '重抽剧情卡')
 }
 
 const decide = (action: 'approve' | 'reject'): void => {
@@ -81,7 +114,7 @@ const decide = (action: 'approve' | 'reject'): void => {
       revision_mode: 'targeted',
     })
     rejectFeedback.value = ''
-  })
+  }, action === 'approve' ? '定稿入库' : '打回重写')
 }
 
 const DIMS = [
@@ -125,7 +158,9 @@ function pickCard(card: PlotCard): void {
       </button>
     </div>
 
-    <div v-if="state.error" class="ic-error">{{ state.error }}</div>
+    <!-- 非 error 状态下的错误提示（如"自定义卡内容为空"这类可当场改正的参数错误）；
+         error 状态有专门的兜底块，这里不重复渲染。 -->
+    <div v-if="state.error && state.status !== 'error'" class="ic-error">{{ state.error }}</div>
 
     <!-- 未开始 / 完本 -->
     <template v-if="state.status === 'idle'">
@@ -138,6 +173,21 @@ function pickCard(card: PlotCard): void {
     </template>
     <template v-else-if="state.status === 'done'">
       <div class="ic-body">本书已完本。</div>
+    </template>
+
+    <!-- 异常兜底：原先没有任何分支覆盖 error 态 → 页面只剩一行红字、零个可点按钮，
+         用户只能重启整个应用（用户实测的"锁死"）。这里给出确切归因 + 重试出口。 -->
+    <template v-else-if="state.status === 'error'">
+      <div class="ic-body">
+        <div class="ic-error-title">本轮没有跑完：{{ sourceLabel }}</div>
+        <div v-if="state.error_hint" class="muted">{{ state.error_hint }}</div>
+        <div v-if="modelText" class="muted">本次绑定：{{ modelText }}</div>
+      </div>
+      <div class="ic-error">{{ state.error }}</div>
+      <div class="ic-actions">
+        <button class="primary-btn" :disabled="busy" @click="retry">重试（保留已出的剧情卡与草稿）</button>
+        <button class="ghost-btn" :disabled="busy" @click="start">从断点继续</button>
+      </div>
     </template>
 
     <!-- 出卡中 / 写章中 / 入库中 -->
@@ -290,6 +340,17 @@ function pickCard(card: PlotCard): void {
 .ic-error {
   font-size: 12.5px;
   color: #dc2626;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  padding: 6px 8px;
+  word-break: break-all;
+}
+.ic-error-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #b91c1c;
+  margin-bottom: 4px;
 }
 .ic-actions {
   display: flex;
