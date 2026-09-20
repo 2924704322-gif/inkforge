@@ -13,6 +13,7 @@ from src.agents.writer import (
     _fmt_foreshadowing,
     _fmt_list,
     _fmt_state_board,
+    _reality_policy_of,
 )
 from src.llm.base import ChatMessage
 from src.llm.registry import ModelRegistry
@@ -75,6 +76,8 @@ class Plotter:
             worldview_rules=_fmt_list(ctx.worldview_rules),
             custom_constraints=ctx.custom_constraints.strip() or "（无）",
             feedback=feedback.strip() or "（无）",
+            # 现实性口径：出卡是本章走向的第一道决策，同样不得被"现实性"拉回
+            reality_policy=_reality_policy_of(ctx),
         )
         # 虚构框架 + 零拒绝 + 约束优先级链（与世界观/大纲同源，此前出卡链路缺这一段）
         prompt = f"{brief_fidelity_block()}\n\n{prompt}"

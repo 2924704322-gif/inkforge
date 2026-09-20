@@ -29,6 +29,10 @@ logger = get_logger(__name__)
 
 ROLE = "architect"
 
+#: 作者未指定单章字数时的兜底预算（与 configs/base.yaml → generation.default_target_words
+#: 保持同量级）。仅用于大纲提示词的"每章预期字数"提示，不改变任何门禁。
+DEFAULT_CHAPTER_WORDS = 5000
+
 T = TypeVar("T", bound=BaseModel)
 
 
@@ -76,7 +80,20 @@ BRIEF_FIDELITY_DIRECTIVE = (
 GENERATE_RETRIES = 2
 GENERATE_RETRY_TEMPERATURE = 0.2
 NO_PREAMBLE_REINJECT = "只输出正文本身——从第一个字到最后一个字。"
-_REFUSAL_MARKERS = ("无法生成", "做不到", "超出范围", "请换一个")
+
+#: 元自指信号：出现即判拒答（不论长短）——真实拒答几乎总带这类自我定位语。
+_REFUSAL_META = (
+    "作为AI", "作为人工智能", "作为一个AI", "AI助手", "语言模型", "人工智能助手",
+    "as an ai", "i'm an ai", "i am an ai",
+)
+#: 拒答措辞（**只在短产出里才判**，见 _looks_like_refusal）。
+_REFUSAL_PHRASES = (
+    "抱歉", "对不起", "很抱歉", "我不能", "我无法", "无法生成", "无法提供", "无法满足",
+    "无法协助", "做不到", "超出范围", "请换一个", "恕难", "请谅解",
+    "i can't", "i cannot", "i'm sorry", "i won't",
+)
+#: 超过这个长度的产出**不因出现礼貌词判拒答**：正文里角色说"抱歉""我做不到"是常态。
+_REFUSAL_MAX_CHARS = 400
 
 
 class BriefFidelityError(RuntimeError):
@@ -84,8 +101,30 @@ class BriefFidelityError(RuntimeError):
 
 
 def _looks_like_refusal(text: str) -> bool:
-    """产出是否含拒绝语义（X7 ①）。"""
-    return any(marker in text for marker in _REFUSAL_MARKERS)
+    """产出是否为"拒答"（X7 ①）。
+
+    由来（2026-09-19 真机排查）：原实现是 `any(marker in text)`，词表只有
+    （无法生成 / 做不到 / 超出范围 / 请换一个）且**任意位置命中即判拒答**，两头都出问题：
+    · **漏判**（更严重）：真实拒答多写成「抱歉，我不能创作这类内容」——四个词一个都不含，
+      于是拒答文本被**当成正文落盘**，接着被 Editor 打 0 分、判 full_rewrite，
+      用户看到的就是"生成不出来 / 一直被打回"；
+    · **误判**：正文里角色说一句「我做不到」（或旁白出现"超出范围"）→ 整章被判拒答 →
+      重试 4 次全废 → 抛 BriefFidelityError。
+
+    现口径（两头都收）：
+    1. **元自指**（作为AI / 语言模型 …）→ 无论长短一律判拒答；
+    2. 其余拒答措辞**只在短产出（≤400 字）里判定** —— 正常章节远超此长度，
+       而拒答通常是一小段说明；长产出里出现"抱歉/做不到"不再误伤。
+    """
+    s = (text or "").strip()
+    if not s:
+        return False
+    low = s.lower()
+    if any(m.lower() in low for m in _REFUSAL_META):
+        return True
+    if len(s) > _REFUSAL_MAX_CHARS:
+        return False
+    return any(m.lower() in low for m in _REFUSAL_PHRASES)
 
 
 def _retry_note(last_error: str) -> str:
@@ -221,24 +260,26 @@ class Architect:
         self._store = store
 
     def generate_settings(self, brief: str, total_chapters: int,
-                          custom_constraints: str = "") -> OutlineOutput:
+                          custom_constraints: str = "",
+                          chapter_words: int | None = None) -> OutlineOutput:
         """完整生成流程，返回大纲（供图状态使用）。
 
         若资料库中存在已确认的设定 Demo（story-overview.md 标记），
         则沿用其世界观/角色，不再推翻重来，只生成大纲+伏笔。
         custom_constraints：项目级约束正文（settings/custom-skills.md 直读），
         逐跳送达世界观/角色/大纲渲染，与 brief 同处。
+        chapter_words：作者要求的**单章预期字数**（生成前设定），逐章预算围绕它给出。
         """
         confirmed = self._load_confirmed_settings()
         if confirmed is not None:
             worldview, characters = confirmed
             logger.info("Architect: 检测到已确认的设定 Demo，沿用世界观/角色，仅生成大纲")
             return self._generate_outline(brief, worldview, characters, total_chapters,
-                                          custom_constraints)
+                                          custom_constraints, chapter_words)
         worldview = self._generate_worldview(brief, custom_constraints)
         characters = self._generate_characters(brief, worldview, custom_constraints)
         outline = self._generate_outline(brief, worldview, characters, total_chapters,
-                                         custom_constraints)
+                                         custom_constraints, chapter_words)
         return outline
 
     # ---------- 设定 Demo（创作向导先审后入库） ----------
@@ -325,8 +366,20 @@ class Architect:
     def _load_confirmed_settings(
         self,
     ) -> tuple[WorldviewOutput, CharactersOutput] | None:
-        """从资料库回读已确认的世界观/角色；无确认标记返回 None。"""
+        """从资料库回读**已确认的设定 Demo**；无确认标记返回 None。
+
+        为什么必须显式检查 `demo_confirmed`：`story-overview.md` 现在还有一个
+        用途是**只记书名**（建书时落盘，见 library.create_book）。若只看文件是否存在，
+        新建的书会被误判成"设定已确认"——一旦它恰好从素材库导入了世界观与人物，
+        Architect 就会跳过设定生成，用户看到的是"我明明没确认过设定"。
+        """
         if not self._store.exists(DEMO_OVERVIEW_REL):
+            return None
+        try:
+            if not self._store.read(DEMO_OVERVIEW_REL).metadata.get("demo_confirmed"):
+                return None
+        except Exception as exc:  # noqa: BLE001 - 元数据损坏按"未确认"处理
+            logger.warning("读取 story-overview.md 失败（按未确认处理）：%s", exc)
             return None
         docs: list[WorldviewDoc] = []
         chars: list[CharacterProfile] = []
@@ -512,18 +565,23 @@ class Architect:
         characters: CharactersOutput,
         total_chapters: int,
         custom_constraints: str = "",
+        chapter_words: int | None = None,
     ) -> OutlineOutput:
         logger.info("Architect: 生成大纲与伏笔表 ...")
         char_digest = "\n".join(
             f"- {c.name}（{c.role}）：{c.personality[:60]}"
             for c in characters.characters
         )
+        # 单章预期字数（用户要求）：作者指定的数必须进大纲提示词，否则 Architect 会
+        # 按自己的默认值给每章排预算，用户"要求 5000 字"从大纲这一步就丢了。
+        words = chapter_words if chapter_words and int(chapter_words) > 0 else DEFAULT_CHAPTER_WORDS
         prompt = render_prompt(
             "architect_outline",
             brief=brief,
             worldview_digest=self._worldview_digest(worldview),
             character_digest=char_digest,
             total_chapters=total_chapters,
+            chapter_words=words,
             custom_constraints=custom_constraints.strip() or "（无）",
             brief_fidelity=brief_fidelity_block(),
         )

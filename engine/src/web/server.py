@@ -330,12 +330,19 @@ class BriefFieldsBody(BaseModel):
     themes: str = ""       # 主题
     arc: str = ""          # 期望弧线
     avoid: str = ""        # 明确不要的写法
+    # 现实性口径开关（默认 False = 以作者创作目标为准，不因"不符合现实"改稿）。
+    # 这是**程序读回的布尔开关**，不进 BRIEF_FIELDS 的文本渲染（见 reality_policy）。
+    allow_realism: bool = False
 
 
 class Decision(BaseModel):
     action: str          # approve / reject
     feedback: str = ""
     revision_mode: str = "targeted"   # P3: targeted 定向修订 / rewrite 整体重写
+    # 预期字数（问题3 + 本次修复）：打回重写时带上它 → 下一稿按新目标写。
+    # 此前 /api/decision 只透传 action/feedback/revision_mode，而前端（ReviewCard）
+    # 一直在提交 target_words —— 改了"预期字数"却没有任何效果，属于静默丢参。
+    target_words: int | None = None
 
 
 class StartBody(BaseModel):
@@ -824,6 +831,9 @@ class InteractiveSession:
         self._chapter = 0
         self._cards: list[dict] = []
         self._draft: dict | None = None   # {draft_text, attempt, review, model?}
+        #: 本章预期字数（生成前可设；写入后回填实际生效值）——打回重写时沿用同一个目标，
+        #: 否则"生成前设的 5000 字"会在第一次打回后悄悄退回默认值（用户实测的坑）。
+        self._chapter_target: int | None = None
         self._error: str | None = None
         #: 失败归因（见 classify_failure）：来源 + 可执行提示。UI 据此给"重试"而不是干瞪眼。
         self._error_source: str = ""
@@ -909,18 +919,22 @@ class InteractiveSession:
                 self._chapter = chapter
                 self._cards = record.get("cards") or []
                 self._draft = draft
+                self._chapter_target = draft.get("target_words") or None
                 self._status = "awaiting_review"
             return
         record = runner.load_cards(chapter)
         if record is not None:
             if record["chosen"]:
-                # 已选卡但无草稿（写作中断）：续写
+                # 已选卡但无草稿（写作中断）：续写。**必须取回生成前设定的字数**，
+                # 否则断点续写会把用户设的 5000 字退回 Writer 默认值。
                 plan = runner.chosen_plan(chapter)
                 with self._lock:
                     self._chapter = chapter
                     self._cards = record["cards"]
+                    self._chapter_target = record.get("target_words") or None
+                    resume_target = self._chapter_target
                     self._status = "writing"
-                self._write(runner, chapter, plan)
+                self._write(runner, chapter, plan, target_words=resume_target)
                 return
             with self._lock:
                 self._chapter = chapter
@@ -931,6 +945,8 @@ class InteractiveSession:
             self._chapter = chapter
             self._cards = []
             self._draft = None
+            # 新章：清掉上一章的字数意图，等用户在选卡页重新设定
+            self._chapter_target = None
         cards = runner.generate_cards(chapter)
         with self._lock:
             self._cards = cards
@@ -943,13 +959,18 @@ class InteractiveSession:
                 raise RuntimeError(f"当前不在选卡阶段（{self._status}）")
             self._status = "writing"
             chapter = self._chapter
-        self._spawn(self._do_choose, chapter, card_id, custom_text, target_words)
+            # 生成前设的字数：留到审核/打回阶段复用（打回不填就沿用同一个目标）
+            if target_words:
+                self._chapter_target = int(target_words)
+            effective = self._chapter_target
+        self._spawn(self._do_choose, chapter, card_id, custom_text, effective)
 
     def _do_choose(self, chapter: int, card_id: str, custom_text: str,
                    target_words: int | None = None) -> None:
         runner = self._ensure_runner()
         try:
-            plan = runner.choose_card(chapter, card_id, custom_text)
+            plan = runner.choose_card(chapter, card_id, custom_text,
+                                      target_words=target_words)
         except ValueError as exc:
             # 选卡参数错误（如自定义卡空内容）：回退到选卡阶段而非 error
             with self._lock:
@@ -965,6 +986,7 @@ class InteractiveSession:
                                       target_words=target_words)
         with self._lock:
             self._draft = result
+            self._chapter_target = result.get("target_words") or self._chapter_target
             self._status = "awaiting_review"
 
     def redraw(self, feedback: str = "") -> None:
@@ -983,7 +1005,8 @@ class InteractiveSession:
             self._status = "awaiting_choice"
 
     def decision(self, action: str, feedback: str = "",
-                 revision_mode: str = "targeted") -> None:
+                 revision_mode: str = "targeted",
+                 target_words: int | None = None) -> None:
         with self._lock:
             if self._status != "awaiting_review":
                 raise RuntimeError(f"当前不在审核阶段（{self._status}）")
@@ -994,12 +1017,16 @@ class InteractiveSession:
                 if not feedback.strip():
                     raise RuntimeError("打回重写必须填写修改意见")
                 self._status = "writing"
+                # 打回时改了预期字数 → 按新目标重写；不改则沿用本章原目标
+                if target_words:
+                    self._chapter_target = int(target_words)
             else:
                 raise RuntimeError(f"未知动作：{action}")
+            effective = self._chapter_target
         if action == "approve":
             self._spawn(self._do_commit, chapter)
         else:
-            self._spawn(self._do_reject, chapter, feedback, revision_mode)
+            self._spawn(self._do_reject, chapter, feedback, revision_mode, effective)
 
     def _do_commit(self, chapter: int) -> None:
         runner = self._ensure_runner()
@@ -1010,18 +1037,22 @@ class InteractiveSession:
             self._chapter = nxt
             self._cards = []
             self._draft = None
+            # 新章重新定字数（回到服务默认值，等用户在选卡页按需覆盖）
+            self._chapter_target = None
             self._status = "generating_cards"
         cards = runner.generate_cards(nxt)
         with self._lock:
             self._cards = cards
             self._status = "awaiting_choice"
 
-    def _do_reject(self, chapter: int, feedback: str, revision_mode: str) -> None:
+    def _do_reject(self, chapter: int, feedback: str, revision_mode: str,
+                   target_words: int | None = None) -> None:
         runner = self._ensure_runner()
         plan = runner.chosen_plan(chapter)
         if plan is None:
             raise RuntimeError(f"第 {chapter} 章无已选剧情卡，无法重写")
-        self._write(runner, chapter, plan, feedback, revision_mode)
+        self._write(runner, chapter, plan, feedback, revision_mode,
+                    target_words=target_words)
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -1031,6 +1062,18 @@ class InteractiveSession:
                     approved = self._runner.approved_count()
                 except Exception:  # noqa: BLE001 - 快照不因统计失败而中断
                     approved = 0
+            target = self._chapter_target or self.target_words
+            # 可接受字数区间：由引擎按非对称口径下发，前端只显示不自算
+            floor = ceiling = None
+            if self._runner is not None and target:
+                try:
+                    floor, ceiling = self._runner.length_bounds(int(target))
+                except Exception:  # noqa: BLE001 - 区间只影响展示
+                    floor = ceiling = None
+            elif target:
+                from src.config.app_config import get_app_config
+
+                floor, ceiling = get_app_config().generation.length_bounds(int(target))
             return {
                 "novel_id": self.novel_id,
                 "status": self._status,
@@ -1043,7 +1086,9 @@ class InteractiveSession:
                 "error_source": self._error_source,
                 "error_hint": self._error_hint,
                 "models": dict(self._models),
-                "target_words": self.target_words,
+                "target_words": self._chapter_target or self.target_words,
+                "length_floor": floor,
+                "length_ceiling": ceiling,
             }
 
 
@@ -1543,6 +1588,9 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
     @app.post("/api/decision")
     def decision(body: Decision, novel: str = "") -> JSONResponse:
         payload = {"action": body.action}
+        if body.target_words not in (None, ""):
+            # 逐章确认关卡（生成前设定）与章节打回（下一稿设定）共用这一个入口
+            payload["target_words"] = body.target_words
         if body.action == "reject":
             payload["feedback"] = body.feedback
             payload["revision_mode"] = body.revision_mode
@@ -1663,9 +1711,15 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
 
     @app.post("/api/interactive/decision")
     def interactive_decision(body: Decision, novel: str = "") -> JSONResponse:
-        """人审裁决：approve 定稿入库并自动进入下一章出卡；reject 携意见重写。"""
+        """人审裁决：approve 定稿入库并自动进入下一章出卡；reject 携意见重写。
+
+        `target_words` 与 `revision_mode` 一并透传：打回时改预期字数 → 按新目标重写；
+        选「整章重写」→ 不携带上一稿（此前前端只能硬编码 targeted，用户没法要求重写）。
+        """
         try:
-            _isess(novel).decision(body.action, body.feedback, body.revision_mode)
+            _isess(novel).decision(
+                body.action, body.feedback, body.revision_mode, body.target_words
+            )
         except RuntimeError as exc:
             raise HTTPException(409, str(exc))
         return JSONResponse({"ok": True})

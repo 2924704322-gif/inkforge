@@ -15,9 +15,10 @@ import {
   NTag,
   useMessage,
 } from 'naive-ui'
-import { computed, ref, watch } from 'vue'
+import { computed, ref } from 'vue'
 
-import { api, scoreColor, withNovel } from '../api'
+import { api, lengthBounds, scoreColor, withNovel } from '../api'
+import { useWordTarget } from '../composables/useWordTarget'
 import type { PendingItem, StatusSnapshot } from '../types'
 import DiffView from './DiffView.vue'
 
@@ -45,6 +46,8 @@ const gate = computed(() =>
         approved_chapter: number
         target_words?: number | null
         planned_target_words?: number | null
+        length_floor?: number | null
+        length_ceiling?: number | null
       })
     : null,
 )
@@ -54,48 +57,82 @@ const gate = computed(() =>
  * · 关卡上 = 下一章的预期字数（来自大纲预算，可改）；
  * · 审阅卡上 = 本章目标字数，打回时改它 → 下一稿按新目标写。
  * 单一入口：写作、评分、字数门禁读的都是这一个值（引擎侧 state.chapter_target_words）。
+ *
+ * 两个都用 useWordTarget 管理：**用户手改之后，轮询快照与组件重挂载都不会把数字顶回去**。
+ * 用户实测的缺陷：手改预期字数后点一下输入框外面就弹回 3000 ——
+ * 原因是编辑态由服务端快照驱动（watch + `:key` 重挂载），而不是由"用户是否改过"驱动。
  */
-const gateTarget = ref<number | null>(null)
-const chapterTarget = ref<number | null>(null)
-watch(
-  () => gate.value?.next_chapter ?? null,
-  () => {
-    const t = gate.value?.target_words ?? gate.value?.planned_target_words ?? null
-    gateTarget.value = typeof t === 'number' && t > 0 ? t : null
-  },
-  { immediate: true },
-)
-watch(
-  () => [chapter.value?.chapter ?? null, chapter.value?.attempt ?? null],
-  () => {
-    const t = chapter.value?.target_words
-    chapterTarget.value = typeof t === 'number' && t > 0 ? t : null
-  },
-  { immediate: true },
+const gateTarget = useWordTarget({
+  suggested: computed(
+    () => gate.value?.target_words ?? gate.value?.planned_target_words ?? null,
+  ),
+  effective: computed(() => gate.value?.target_words ?? null),
+  // 换章 → 清空手改（关卡是"生成前的设定"，不该把上一章的意图带过来）
+  resetWhen: computed(() => `gate-${gate.value?.next_chapter ?? 0}`),
+})
+const chapterTarget = useWordTarget({
+  suggested: computed(() => chapter.value?.target_words ?? null),
+  effective: computed(() => chapter.value?.target_words ?? null),
+  // 换稿 / 换章 → 清空手改，重新跟随引擎生效值
+  resetWhen: computed(
+    () => `ch-${chapter.value?.chapter ?? 0}-${chapter.value?.attempt ?? 0}`,
+  ),
+})
+
+/** 目标 vs 实际：把"字数是否达标"从模型自评分变成可核对的二元组 + 合格区间。 */
+const lengthStat = computed(() =>
+  lengthBounds(
+    chapterTarget.display.value,
+    chapter.value?.actual_length,
+    chapter.value?.length_floor,
+    chapter.value?.length_ceiling,
+  ),
 )
 
-/** 目标 vs 实际：把"字数是否达标"从模型自评分变成可核对的两个数字。 */
-const lengthStat = computed(() => {
-  const target = chapterTarget.value
-  const actual = chapter.value?.actual_length
-  if (!target || typeof actual !== 'number') return null
-  const dev = actual - target
-  const ratio = Math.round((dev / target) * 100)
-  return { target, actual, dev, ratio }
-})
+/** 逐章关卡上的字数区间（生成**之前**就能看到"这章写多少才算合格"）。 */
+const gateBounds = computed(() =>
+  lengthBounds(
+    gateTarget.display.value,
+    null,
+    gate.value?.length_floor,
+    gate.value?.length_ceiling,
+  ),
+)
+
+/**
+ * 一键把审校建议并入打回意见（避免手动复制漏项/改词 → 重写不按建议走）。
+ * 与互动创作的同类按钮同源逻辑，两处文案与序号格式保持一致。
+ */
+function mergeSuggestions(): void {
+  const issues = chapter.value?.review?.issues ?? []
+  if (!issues.length) {
+    message.warning('本条稿子没有待落地的审校建议')
+    return
+  }
+  const lines = issues.map((it, i) => {
+    const head = `${i + 1}. [${dimensionLabel(it.dimension)}] ${it.description}`
+    return it.suggestion ? `${head}\n   → 建议：${it.suggestion}` : head
+  })
+  const block = `【按审校建议逐条修改】\n${lines.join('\n')}`
+  feedback.value = feedback.value.trim()
+    ? `${feedback.value.trim()}\n\n${block}`
+    : block
+  message.success(`已并入 ${lines.length} 条审校建议，可再补充你自己的要求`)
+}
 
 /** 关卡上"按此字数开写"：把字数随决策一起提交，之后照常按「继续」放行。 */
 async function startWithTarget(): Promise<void> {
   if (submitting.value) return
   submitting.value = true
+  const words = gateTarget.display.value
   try {
     await api('POST', withNovel('/api/decision', props.novelId), {
       action: 'approve',
-      target_words: gateTarget.value,
+      target_words: words ?? undefined,
     })
     message.success(
-      gateTarget.value
-        ? `已开始写第 ${gate.value?.next_chapter} 章（预期 ${gateTarget.value} 字）`
+      words
+        ? `已开始写第 ${gate.value?.next_chapter} 章（预期 ${words} 字）`
         : `已开始写第 ${gate.value?.next_chapter} 章`,
     )
     emit('decided')
@@ -160,8 +197,8 @@ async function decide(action: 'approve' | 'reject'): Promise<void> {
       action,
       feedback: feedback.value.trim(),
       revision_mode: revisionMode.value,
-      // 打回时若改了预期字数，一并带上 → 下一稿按新目标写
-      target_words: chapterTarget.value,
+      // 打回时若改了预期字数，一并带上 → 下一稿按新目标写（未改则沿用引擎生效值）
+      target_words: action === 'reject' ? chapterTarget.payload.value : undefined,
     })
     if (action === 'approve') {
       message.success('已通过')
@@ -195,14 +232,22 @@ async function decide(action: 'approve' | 'reject'): Promise<void> {
       <div class="target-row">
         <span class="target-label">预期字数</span>
         <NInputNumber
-          v-model:value="gateTarget"
+          v-model:value="gateTarget.display.value"
           size="small"
           :min="500"
           :max="20000"
           :step="500"
           style="width: 130px"
         />
-        <span class="muted">字（大纲预算，可改）</span>
+        <span class="muted">
+          字（大纲预算，可改）
+          {{ gateBounds ? ` · 可接受 ${gateBounds.floor}-${gateBounds.ceiling} 字` : '' }}
+        </span>
+        <button
+          v-if="gateTarget.dirty.value"
+          class="mini-btn"
+          @click="gateTarget.reset()"
+        >恢复默认</button>
         <button class="mini-btn primary" :disabled="submitting" @click="startWithTarget">
           按此字数开写第 {{ gate.next_chapter }} 章
         </button>
@@ -266,21 +311,30 @@ async function decide(action: 'approve' | 'reject'): Promise<void> {
           {{ dimensionLabel(d) }} {{ chapter.review[d] }}
         </NTag>
         <NTag size="small" round :bordered="false">字数 {{ chapter.review.length }}</NTag>
-        <!-- 目标 vs 实际：把"字数是否达标"从模型自评分变成两个可核对的数字 -->
+        <!-- 目标 vs 实际：字数是否达标 = 实际是否落在可接受区间（下浮 500 硬线 / 上浮 2000 放宽） -->
         <NTag
           v-if="lengthStat"
           size="small"
           round
           :bordered="false"
-          :type="Math.abs(lengthStat.dev) <= Math.max(500, Math.round(lengthStat.target * 0.15)) ? 'success' : 'warning'"
+          :type="lengthStat.ok ? 'success' : 'warning'"
         >
-          目标 {{ lengthStat.target }} / 实际 {{ lengthStat.actual }}（{{ lengthStat.dev >= 0 ? '+' : '' }}{{ lengthStat.dev }} 字，{{ lengthStat.ratio >= 0 ? '+' : '' }}{{ lengthStat.ratio }}%）
+          目标 {{ chapterTarget.display.value }} / 实际 {{ lengthStat.actual }}（{{ lengthStat.deviation >= 0 ? '+' : '' }}{{ lengthStat.deviation }} 字）
+          · 可接受 {{ lengthStat.floor }}-{{ lengthStat.ceiling }} 字
+          {{ lengthStat.ok ? '✓' : (lengthStat.actual < lengthStat.floor ? '· 不足' : '· 超出') }}
         </NTag>
       </div>
-      <div v-if="chapterTarget !== null" class="target-row">
+      <div v-if="chapterTarget.display.value !== null" class="target-row">
         <span class="target-label">预期字数</span>
-        <NInputNumber v-model:value="chapterTarget" size="small" :min="500" :max="20000" :step="500" style="width: 130px" />
-        <span class="muted">字（打回时按此目标重写；不改则沿用）</span>
+        <NInputNumber v-model:value="chapterTarget.display.value" size="small" :min="500" :max="20000" :step="500" style="width: 130px" />
+        <span class="muted">
+          打回时按此目标重写（不改则沿用）{{ lengthStat ? ` · 可接受 ${lengthStat.floor}-${lengthStat.ceiling} 字` : '' }}
+        </span>
+        <button
+          v-if="chapterTarget.dirty.value"
+          class="mini-btn"
+          @click="chapterTarget.reset()"
+        >恢复默认</button>
       </div>
       <div v-if="chapter.review.comment" class="muted comment">{{ chapter.review.comment }}</div>
 
@@ -299,6 +353,10 @@ async function decide(action: 'approve' | 'reject'): Promise<void> {
           <div v-if="issue.quote" class="muted issue-quote">原文：{{ issue.quote }}</div>
           <div class="issue-suggestion">建议：{{ issue.suggestion }}</div>
         </div>
+        <!-- 一键并入：手动复制建议时容易漏项/改词，导致重写拿到的意见 ≠ 审校建议 -->
+        <NButton size="tiny" secondary block @click="mergeSuggestions">
+          ↳ 把以上 {{ chapter.review.issues.length }} 条建议并入打回意见
+        </NButton>
       </NAlert>
 
       <div class="draft-toolbar">

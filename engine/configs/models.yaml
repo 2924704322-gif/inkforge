@@ -16,6 +16,12 @@ providers:
   #   base_url: http://localhost:11434/v1
   #   api_key: none
 
+# 关于 max_tokens（**长正文字数的硬上限，务必显式设置**）：
+#   不写 max_tokens 时 DeepSeek 兼容端点按自己的默认值截断（通常 4096），
+#   折算成中文正文只有约 3000-4000 字 —— 于是"要求 5000 字"从**第一次调用**就
+#   被物理截断，无论提示词怎么写都到不了目标（用户实测"实际输出远小于要求"的直接原因）。
+#   deepseek-chat 单次输出上限是 8192，故正文类角色统一给足 8000；
+#   结构化短输出（审校评分 / 约束提炼）保持默认，避免浪费。
 roles:
   # orchestrator 角色已移除：v1.0 采用 LangGraph 固定状态图编排（graph.py），
   # 无 LLM 意图路由需求；如未来引入自由对话入口再恢复此绑定。
@@ -37,6 +43,7 @@ roles:
     provider: deepseek
     model: deepseek-chat
     temperature: 0.8
+    max_tokens: 8000    # 全书大纲 + 逐章字数预算：几十章的大纲一次输出，4k 会截断
     # 可选：降级接入点（主接入点调用失败时自动切换，需在 providers 中定义该点）
     # fallback:
     #   provider: my-claude
@@ -45,6 +52,7 @@ roles:
     provider: deepseek
     model: deepseek-chat
     temperature: 0.7
+    max_tokens: 8000    # ★ 章节正文：必须给足，否则单次产出被截断在 3000-4000 字
   editor:
     provider: deepseek
     model: deepseek-chat
@@ -71,6 +79,7 @@ roles:
     provider: deepseek
     model: deepseek-chat
     temperature: 0.7
+    max_tokens: 8000    # 子智能体的正文类产出：与 writer 同等上限
   review:
     provider: deepseek
     model: deepseek-chat

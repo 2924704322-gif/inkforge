@@ -35,10 +35,22 @@ export interface BriefFields {
   themes?: string       // 主题
   arc?: string          // 期望弧线
   avoid?: string        // 明确不要的写法
+  /**
+   * 现实性口径开关（默认 false = 以作者创作目标为准）。
+   *
+   * 由来（用户要求）："面对用户可能不符合实际的创作需求，不需要因为现实原因修改"。
+   * 默认**不**把现实合理性当评判依据；勾上才允许审校按现实逻辑提建议。
+   * 它是程序读回的布尔开关，**不进** BRIEF_FIELD_DEFS 的文本字段循环
+   * （那个循环会对值调用 .trim()，混进布尔会炸）。
+   */
+  allow_realism?: boolean
 }
 
+/** 结构化 brief 里**文本类**字段的键（排除布尔开关 allow_realism）。 */
+export type BriefTextFieldKey = Exclude<keyof BriefFields, 'allow_realism'>
+
 /** 结构化 brief 字段编辑顺序与中文标签（与引擎侧一致）。 */
-export const BRIEF_FIELD_DEFS: { key: keyof BriefFields; label: string; placeholder: string }[] = [
+export const BRIEF_FIELD_DEFS: { key: BriefTextFieldKey; label: string; placeholder: string }[] = [
   { key: 'genre', label: '体裁', placeholder: '例：东方玄幻 / 冷硬派推理 / 惊悚' },
   { key: 'pov', label: '视角', placeholder: '例：第三人称限知，紧贴主角 / 反派第一人称' },
   { key: 'tone', label: '基调', placeholder: '例：冷硬克制 / 阴暗压抑 / 温柔治愈' },
@@ -61,10 +73,12 @@ export function emptyBriefFields(): BriefFields {
     themes: '',
     arc: '',
     avoid: '',
+    allow_realism: false,
   }
 }
 
 export function hasBriefFields(fields: BriefFields): boolean {
+  // 只看文本字段：布尔开关（allow_realism）不构成"填了创作需求"
   return BRIEF_FIELD_DEFS.some((d) => (fields[d.key] ?? '').trim().length > 0)
 }
 
@@ -148,6 +162,9 @@ export type PendingItem =
       /** 下一章预期字数（大纲预算；生成前可在关卡上改） */
       target_words?: number | null
       planned_target_words?: number | null
+      /** 可接受字数区间（下浮 ≤500 / 上浮 ≤2000），由引擎下发，前端只负责显示 */
+      length_floor?: number | null
+      length_ceiling?: number | null
     } & Record<string, unknown>)
   | ({
       type: 'chapter_review'
@@ -161,6 +178,9 @@ export type PendingItem =
       target_words?: number | null
       /** 本章实际字数（引擎侧统计，与目标并列展示"偏差"） */
       actual_length?: number | null
+      /** 字数可接受区间（引擎按非对称口径下发） */
+      length_floor?: number | null
+      length_ceiling?: number | null
       model?: string
       used_fallback?: boolean
       previous_draft?: string
@@ -468,6 +488,15 @@ export interface InteractiveDraft {
   attempt?: number
   review?: ChapterReview
   model?: string
+  /** 本章实际字数（引擎统计） */
+  words?: number
+  /** 本章目标字数（生成前可设；打回重写时沿用同一个目标） */
+  target_words?: number | null
+  /** 字数可接受区间（引擎按非对称口径下发） */
+  length_floor?: number | null
+  length_ceiling?: number | null
+  /** 与目标字数的差值 */
+  length_deviation?: number | null
 }
 
 export interface InteractiveState {
@@ -476,6 +505,11 @@ export interface InteractiveState {
   cards?: PlotCard[]
   draft?: InteractiveDraft | null
   approved_count?: number
+  /** 本章目标字数（选卡前可设，生成后回填实际生效值） */
+  target_words?: number | null
+  /** 本章可接受字数区间（引擎按非对称口径下发：下浮 ≤500 / 上浮 ≤2000） */
+  length_floor?: number | null
+  length_ceiling?: number | null
   error?: string | null
   /** 失败归因：network / provider_auth / config / parse / engine（引擎 classify_failure） */
   error_source?: string

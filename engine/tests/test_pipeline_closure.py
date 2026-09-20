@@ -492,10 +492,12 @@ def test_a3_no_inline_constitution_and_origin_mark():
     for name, text in load_all().items():
         assert "第零条" not in text, f"模板 {name} 仍内嵌第零条副本"
     rendered = render_prompt("writer_chapter", **dict.fromkeys((
-        "target_words", "tolerance", "revision_section", "chapter", "outline",
+        "target_words", "tolerance", "length_floor", "length_ceiling",
+        "revision_section", "chapter", "outline",
         "recent_summaries", "related_summaries", "character_states",
         "foreshadowing", "due_foreshadowing", "worldview_rules", "state_board",
-        "style_guide", "custom_constraints", "brief",
+        "style_guide", "custom_constraints", "brief", "brief_fidelity",
+        "reality_policy",
     ), "x"))
     assert "<!-- origin: system-constitution -->" in rendered
 

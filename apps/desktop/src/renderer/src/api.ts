@@ -75,3 +75,53 @@ export function scoreColor(
   if (score >= 6) return 'warning'
   return 'error'
 }
+
+/**
+ * 字数口径（非对称）：**下浮 500 字是硬线，上浮 2000 字以内算合格**。
+ *
+ * 与引擎 `configs/base.yaml → generation.word_count_floor_offset / ceiling_offset` 同源；
+ * 只要引擎在 payload 里带上 `length_floor` / `length_ceiling`（章节审阅与关卡都会带），
+ * 就以引擎给的数为准，这里的常量只是断线兜底，避免两边各显示一套"合格线"。
+ */
+export const LENGTH_FLOOR_OFFSET = 500
+export const LENGTH_CEILING_OFFSET = 2000
+
+export interface LengthBounds {
+  /** 目标字数（原样回带，便于直接展示） */
+  target: number
+  /** 最低可接受字数（低于它 = 不合格，会被门禁打回） */
+  floor: number
+  /** 最高可接受字数（内容完整性优先，超出才算灌水） */
+  ceiling: number
+  /** 实际字数 */
+  actual: number
+  /** 与目标字数的差值（正数=超出） */
+  deviation: number
+  /** 是否在可接受区间内 */
+  ok: boolean
+}
+
+/**
+ * 由「目标字数 + 可选实际字数」算出可接受区间。
+ *
+ * `floor`/`ceiling` 来自引擎 payload 时优先使用（单一事实源）；缺省时按上面的偏移量折算。
+ */
+export function lengthBounds(
+  target: number | null | undefined,
+  actual?: number | null,
+  floor?: number | null,
+  ceiling?: number | null,
+): LengthBounds | null {
+  if (typeof target !== 'number' || target <= 0) return null
+  const lo = typeof floor === 'number' && floor > 0 ? floor : Math.max(1, target - LENGTH_FLOOR_OFFSET)
+  const hi = typeof ceiling === 'number' && ceiling > 0 ? ceiling : target + LENGTH_CEILING_OFFSET
+  const act = typeof actual === 'number' ? actual : 0
+  return {
+    target,
+    floor: lo,
+    ceiling: hi,
+    actual: act,
+    deviation: act - target,
+    ok: act >= lo && act <= hi,
+  }
+}

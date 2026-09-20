@@ -7,14 +7,17 @@ from src.agents.schemas import (
     ArbitrationOutput,
     CrossVolumeReviewOutput,
     NegotiationOutput,
+    ReviewIssue,
     ReviewOutput,
 )
 from src.agents.writer import (
     _fmt_characters,
     _fmt_foreshadowing,
     _fmt_list,
+    _reality_policy_of,
     chapter_length,
     fmt_review_issues,
+    resolve_bounds,
 )
 from src.llm.base import ChatMessage
 from src.llm.registry import ModelRegistry
@@ -85,9 +88,21 @@ class Editor:
     def review_chapter(
         self, ctx: ChapterContext, chapter_text: str, attempt: int,
         target_words: int | None = None,
+        length_bounds: tuple[int, int] | None = None,
     ) -> ReviewOutput:
         logger.info("Editor: 审查第 %d 章（第 %d 稿）...", ctx.chapter, attempt)
         actual = chapter_length(chapter_text)
+        # 字数区间必须与实际门禁同源：调用方已算好就传进来；**没传时按非对称口径现算**
+        # （真机踩到：无条件 `*length_bounds` 展开 None 直接 TypeError，
+        #  凡是不传该参数的调用点——含外部脚本/子进程直调——都会炸）。
+        if target_words is not None:
+            floor, ceiling = (
+                resolve_bounds(int(target_words), *length_bounds)
+                if length_bounds is not None
+                else resolve_bounds(int(target_words))
+            )
+        else:
+            floor = ceiling = DEFAULT_TOLERANCE
         prompt = render_prompt(
             "editor_review",
             chapter=ctx.chapter,
@@ -100,14 +115,21 @@ class Editor:
             custom_constraints=ctx.custom_constraints.strip() or "（无）",
             # 作者创作需求：审查侧必须能看到"作者到底要什么"，否则无法判断约束是否落实
             brief=ctx.brief.strip() or "（未提供）",
+            # 现实性口径（用户要求）：默认以作者创作目标为唯一基准，
+            # 不得因"不符合现实"扣分或提建议；与写作链路同源同一份文本。
+            reality_policy=_reality_policy_of(ctx),
             chapter_text=chapter_text,
             target_words=target_words if target_words is not None else "未指定",
             actual_length=actual,
-            tolerance=self._tolerance,
+            tolerance=floor,
+            length_floor=floor,
+            length_ceiling=ceiling,
         )
         review = chat_structured(
             self._registry, ROLE, [ChatMessage("user", prompt)], ReviewOutput
         )
+        if target_words is not None:
+            review = self._reconcile_length(review, target_words, actual, floor, ceiling)
         logger.info(
             "Editor: 第 %d 章总分 %.1f（一致性%.1f/大纲%.1f/衔接%.1f/文笔%.1f/字数%.1f）→ %s",
             ctx.chapter,
@@ -120,6 +142,49 @@ class Editor:
             verdict_of(review.overall),
         )
         self._save_report(ctx.chapter, review, attempt)
+        return review
+
+    @staticmethod
+    def _reconcile_length(
+        review: ReviewOutput, target: int, actual: int, floor: int, ceiling: int
+    ) -> ReviewOutput:
+        """字数维度的**确定性兜底**：把模型自评分与客观字数对齐。
+
+        由来（用户实测）：字数是否达标原先完全依赖模型自评——模型经常给 length 满分、
+        也常常漏掉 length issue，于是"实际远小于要求"的稿子照样 pass 送人审。
+        字数是可以客观计算的，不该交给模型判断：这里按客观计数覆写 length 分，
+        并在欠字数且模型没标注时补一条可执行的 length issue（谁写的正文都适用）。
+        """
+        if actual < floor:
+            gap = floor - actual
+            review.length = max(0.0, round(10.0 - (gap / 500.0) * 2, 1))
+            if not any(i.dimension == "length" for i in review.issues):
+                review.issues.append(ReviewIssue(
+                    dimension="length",
+                    severity="major" if gap >= 1000 else "minor",
+                    description=f"正文 {actual} 字，低于本章下限 {floor} 字（目标 {target} 字），缺口 {gap} 字",
+                    quote="",
+                    suggestion=(
+                        f"扩充至约 {target} 字以上（至少 {floor} 字）："
+                        "补足场景过程与对话轮次、写出配角的具体反应、把主要冲突多推进一层，"
+                        "不得用抽象概括或复述前文凑字数"
+                    ),
+                ))
+        elif actual > ceiling:
+            over = actual - ceiling
+            review.length = max(0.0, round(10.0 - (over / 500.0) * 1, 1))
+            if not any(i.dimension == "length" for i in review.issues):
+                review.issues.append(ReviewIssue(
+                    dimension="length",
+                    severity="minor",
+                    description=f"正文 {actual} 字，超过本章上限 {ceiling} 字（目标 {target} 字），超出 {over} 字",
+                    quote="",
+                    suggestion=f"压缩至 {target} 字附近（不超过 {ceiling} 字），保留核心事件与结尾钩子",
+                ))
+        else:
+            # 落在非对称区间内 = 合格：模型若因"超出目标"而扣了分，这里纠正回来
+            review.length = 10.0
+            review.issues = [i for i in review.issues if i.dimension != "length"]
         return review
 
     def _save_report(self, chapter: int, review: ReviewOutput, attempt: int) -> None:

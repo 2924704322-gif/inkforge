@@ -124,6 +124,15 @@ export class EngineSupervisor extends EventEmitter {
         ...process.env,
         INKFORGE_ENGINE_TOKEN: this.token,
         ...(uploadRoots.length > 0 ? { INKFORGE_UPLOAD_ROOTS: uploadRoots.join(path.delimiter) } : {}),
+        // 编码：**必须显式指定 UTF-8**。
+        // 由来（2026-09-19 实测复现）：Python 在 Windows 下被 spawn 成管道子进程时，
+        // sys.stdout.encoding 取的是 locale 编码（实测 `gbk`），于是中文日志以 **GBK 字节**写出；
+        // 而 Node 的 `chunk.toString()` 默认按 **UTF-8** 解码这些字节 → 每个字节变成 U+FFFD，
+        // 落进 desktop-<日期>.log 后**不可逆**（实测一条中文日志产生 8 个替换符）。
+        // 后果：排障时日志中文全丢，只能靠 ASCII 骨架猜（上一轮排查就吃了这个亏）。
+        // 这里让引擎侧直接吐 UTF-8，与 Node 的解码口径对齐。
+        PYTHONIOENCODING: 'utf-8',
+        PYTHONUTF8: '1',
       },
     })
     this.proc = proc

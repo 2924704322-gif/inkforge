@@ -158,7 +158,7 @@ _KNOWN_PARAMS: dict[str, frozenset[str]] = {
     ),
     "architect_outline": frozenset(
         {"brief", "worldview_digest", "character_digest", "total_chapters",
-         "custom_constraints", "brief_fidelity"}
+         "chapter_words", "custom_constraints", "brief_fidelity"}
     ),
     "architect_style": frozenset(
         {"brief", "outline_digest", "worldview_digest", "custom_constraints",
@@ -167,22 +167,26 @@ _KNOWN_PARAMS: dict[str, frozenset[str]] = {
     "plotter_cards": frozenset(
         {"chapter", "story_overview", "recent_summaries", "related_summaries",
          "character_states", "state_board", "foreshadowing", "due_foreshadowing",
-         "worldview_rules", "custom_constraints", "feedback", "brief"}
+         "worldview_rules", "custom_constraints", "feedback", "brief",
+         "reality_policy"}
     ),
     "writer_chapter": frozenset(
-        {"target_words", "tolerance", "revision_section", "chapter", "outline",
+        {"target_words", "tolerance", "length_floor", "length_ceiling",
+         "revision_section", "chapter", "outline",
          "recent_summaries", "related_summaries", "character_states",
          "foreshadowing", "due_foreshadowing", "worldview_rules", "state_board",
-         "style_guide", "custom_constraints", "brief"}
+         "style_guide", "custom_constraints", "brief", "brief_fidelity",
+         "reality_policy"}
     ),
     "writer_negotiate": frozenset(
         {"chapter", "outline", "issues", "comment", "chapter_text",
-         "custom_constraints"}
+         "custom_constraints", "brief_fidelity", "reality_policy"}
     ),
     "editor_review": frozenset(
         {"chapter", "outline", "recent_summaries", "character_states",
          "worldview_rules", "foreshadowing", "style_guide", "custom_constraints",
-         "chapter_text", "target_words", "actual_length", "tolerance", "brief"}
+         "chapter_text", "target_words", "actual_length", "tolerance",
+         "length_floor", "length_ceiling", "brief", "reality_policy"}
     ),
     # 大纲**定向修订**（打回重写专用）：带原大纲 JSON + 意见 + 修订模式，
     # 与"从零生成大纲"是两个模板——这是问题2（打回漂移）的修法核心。

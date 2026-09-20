@@ -197,6 +197,97 @@ class TestConstitutionCoverage:
         assert hostile in out
         assert out.count(CONSTITUTION_MARK) == 1
 
+    def test_writer_prompt_carries_fiction_framing_and_zero_refusal(self):
+        """正文写作链路必须与大纲/出卡链路**同源**带「虚构框架 + 零拒绝」块。
+
+        由来（2026-09-19 真机排查，用户报"互动创作拒绝生成"）：`brief_fidelity_block()`
+        （虚构框架声明 + 零拒绝/零篡改/零失败 + 约束优先级链）覆盖了 architect 的 6 个调用点、
+        plotter 出卡、改稿提案 —— **唯独 writer 的正文链路没有**。于是出现典型不对称症状：
+        出卡（有防拒绝块）正常，一到写正文（没有）就容易被模型拒答；
+        而拒答文本若不含旧词表的四个词，甚至会被当成正文落盘（评分 0 → full_rewrite）。
+        """
+        from src.agents.architect import (
+            BRIEF_FIDELITY_DIRECTIVE,
+            FICTION_FRAMING,
+            brief_fidelity_block,
+        )
+        from src.agents.prompt_loader import load_all, render_prompt
+        from src.agents.reality_policy import reality_policy_text
+
+        # ① 模板必须声明占位符（否则调用方传了也不生效）
+        for tpl in ("writer_chapter", "writer_negotiate"):
+            assert "{{brief_fidelity}}" in load_all()[tpl], f"{tpl} 缺 {{{{brief_fidelity}}}} 占位符"
+
+        # ② 渲染后块必须在场，且排在写作任务描述之前（高位注入，不能被后文稀释）
+        probe = dict.fromkeys(
+            ("target_words", "tolerance", "length_floor", "length_ceiling",
+             "revision_section", "chapter", "outline",
+             "recent_summaries", "related_summaries", "character_states", "foreshadowing",
+             "due_foreshadowing", "worldview_rules", "state_board", "style_guide",
+             "custom_constraints", "brief"), "（占位）")
+        probe["brief_fidelity"] = brief_fidelity_block()
+        probe["reality_policy"] = reality_policy_text(False)
+        prompt = render_prompt("writer_chapter", **probe)
+        assert FICTION_FRAMING in prompt, "正文提示词缺虚构框架声明"
+        assert BRIEF_FIDELITY_DIRECTIVE in prompt, "正文提示词缺零拒绝指令"
+        assert prompt.index(FICTION_FRAMING) < prompt.index("## 写作要求"), "防拒绝块必须高位"
+
+        # ③ 与出卡链路同源：源码里必须走同一个装配函数（不许两套话术漂移）
+        import inspect
+
+        from src.agents import writer as writer_mod
+
+        src = inspect.getsource(writer_mod)
+        assert src.count("brief_fidelity_block()") >= 2, "正文/协商两条链路都该注入"
+
+    def test_refusal_detector_two_sided(self):
+        """拒答判定要**两头都收**：认清"抱歉/我不能"式拒答，又不误伤正文。
+
+        由来（2026-09-19 真机排查）：原判定是 `any(marker in text)`，词表只有四个词且任意位置命中：
+        · 漏判：真实拒答「抱歉，我不能创作这类内容」一个词都不含 → 被当成正文落盘；
+        · 误判：正文里角色说「我做不到」→ 整章被判拒答，重试 4 次全废。
+        """
+        from src.agents.architect import _looks_like_refusal
+
+        assert _looks_like_refusal("抱歉，我不能创作这类内容。")
+        assert _looks_like_refusal("作为AI，我无法协助这个请求。")
+        assert _looks_like_refusal("抱歉，无法生成。")          # 旧用例必须继续成立
+        assert not _looks_like_refusal("他握紧剑柄，掌心旧疤发烫。")
+        # 长正文里的礼貌词/否定词不得触发（角色台词与旁白都会出现）
+        assert not _looks_like_refusal("她低声道：「抱歉，我来晚了。」" + "正文" * 900)
+        assert not _looks_like_refusal("这一段超出了他给自己的范围，他做不到回头。" + "正文" * 900)
+
+    def test_writer_entry_point_injects_fidelity_block(self, monkeypatch):
+        """走**真实 Writer 入口**验证注入（不是只渲染模板）：抓取真正发给模型的 prompt。
+
+        为什么要有这条：模板有占位符 ≠ 调用方传了值。上一轮"约束提炼"就是栽在
+        "看起来注入了、其实那条链路没走装配函数"上。这里直接跑 `Writer.write_chapter`，
+        把 registry 打桩，检查捕获到的消息内容。
+        """
+        from src.agents.architect import BRIEF_FIDELITY_DIRECTIVE, FICTION_FRAMING
+        from src.agents.writer import Writer
+        from src.llm import registry as registry_mod
+        from src.llm.base import ChatResult
+        from src.memory.memory_manager import ChapterContext
+
+        captured: list[str] = []
+
+        class _Spy(registry_mod.ModelRegistry):  # type: ignore[misc, valid-type]
+            def chat_as(self, role, messages, **kwargs):
+                captured.extend(m.content for m in messages)
+                return ChatResult(content="第一章正文。" * 60, model="spy",
+                                  provider_name="spy")
+
+        monkeypatch.setattr(registry_mod, "ModelRegistry", _Spy)
+        writer = Writer(_Spy.__new__(_Spy), target_words=200)
+        ctx = ChapterContext(chapter=1, outline="本章大纲：主角登场", brief="作者要求：冷硬克制")
+        writer.write_chapter(ctx)
+
+        blob = "\n".join(captured)
+        assert FICTION_FRAMING in blob, "正文链路没带虚构框架声明"
+        assert BRIEF_FIDELITY_DIRECTIVE in blob, "正文链路没带零拒绝指令"
+        assert "第零条" in blob, "正文链路没带第零条"
+
     def test_no_inline_system_literal_without_constitution(self):
         """静态闸：**内联字符串字面量**充当 system 提示词时必须已含第零条。
 
@@ -515,6 +606,104 @@ class TestMaterialsUnified:
         assert "章末用具体画面收束" in (book / "settings" / "custom-skills.md").read_text(
             encoding="utf-8"
         )
+
+    def test_spawn_book_persists_author_title(self, app_client, sandbox):
+        """★ 二开建书必须把作者填的书名落盘，书架书名不得回落目录名。
+
+        由来（用户实测）："只选了一本书、给了书名，结果书名消失"——
+        修复前 `title` 只进了 HTTP 回执，`create_book` 只建目录骨架，
+        书架的事实源（outline.md / story-overview.md）里一个字都没有。
+        """
+        client, _ = app_client
+        client.post("/api/materials", json={
+            "title": "修为体系", "content": "炼气→筑基", "category": "世界观",
+        })
+        res = client.post("/api/materials/spawn-book", json={
+            "novel_id": "spawn-title", "title": "我的新书", "mode": "interactive",
+        })
+        assert res.status_code == 200, res.text
+        assert res.json()["title"] == "我的新书"
+
+        overview = sandbox.novels / "spawn-title" / "settings" / "story-overview.md"
+        assert overview.exists(), "书名没有落盘（书架只能显示目录名）"
+        assert "book_title: 我的新书" in overview.read_text(encoding="utf-8")
+
+        books = client.get("/api/books").json()["books"]
+        item = next(b for b in books if b["novel_id"] == "spawn-title")
+        assert item["title"] == "我的新书", f"书架书名仍是 {item['title']!r}"
+
+    def test_spawn_book_source_book_none_is_json_safe(self, app_client):
+        """来源书为空的素材不得在回执里产生 None 键（JSON 序列化不安全）。"""
+        client, _ = app_client
+        client.post("/api/materials", json={
+            "title": "手工素材", "content": "手工写的设定", "category": "世界观",
+        })
+        res = client.post("/api/materials/spawn-book", json={
+            "novel_id": "spawn-nosrc", "title": "无来源书",
+        })
+        assert res.status_code == 200, res.text
+        # by_book 的键必须是字符串（前端按书显示来源）
+        assert all(isinstance(k, str) for k in res.json()["by_book"])
+
+    def test_created_book_title_does_not_count_as_confirmed_demo(self, app_client, sandbox):
+        """★ 建书时写的 story-overview.md **不得**被当成"已确认的设定 Demo"。
+
+        否则只要新书里恰好有导入的世界观+人物，Architect 就会跳过设定生成——
+        用户看到的是"我明明没确认过设定，它却说自己有设定"。
+        """
+        from src.agents.architect import Architect
+        from src.memory.md_store import MdStore
+        from src.memory.store_factory import open_store
+
+        client, _ = app_client
+        client.post("/api/materials", json={
+            "title": "修为体系", "content": "炼气→筑基", "category": "世界观",
+        })
+        client.post("/api/materials", json={
+            "title": "林尘", "content": "外门弟子", "category": "人物",
+        })
+        res = client.post("/api/materials/spawn-book", json={
+            "novel_id": "spawn-confirm", "title": "不该被当已确认",
+        })
+        assert res.status_code == 200, res.text
+
+        store = open_store(sandbox.novels / "spawn-confirm", writable=False)
+        assert isinstance(store, MdStore)
+        architect = Architect.__new__(Architect)   # 只测这一处判定，不装配 registry
+        architect._store = store                   # noqa: SLF001
+        assert architect._load_confirmed_settings() is None, (  # noqa: SLF001
+            "建书时写的书名文件被误判成已确认设定 Demo"
+        )
+
+    def test_spawn_book_derives_novel_id_from_chinese_title(self, app_client, sandbox):
+        """★ 中文书名 + 不填目录名 → 引擎按书名派生标识（不得 400）。
+
+        由来：二开建书是"给新书起个名"的轻量动作，用户填的多半是中文书名，
+        而标识必须纯 ASCII。原实现直接 400，等于逼用户先想一个英文目录名。
+        """
+        from src.services.library import derive_novel_id
+
+        # 纯函数：中文 → book-日期；英文 → slug；重名自动加序号；纯符号也不炸
+        assert derive_novel_id("拆装时代").startswith("book-")
+        assert derive_novel_id("My Second Book") == "my-second-book"
+        assert derive_novel_id("abc", {"abc"}) == "abc-2"
+        assert derive_novel_id("!!!").startswith("book-")
+
+        client, _ = app_client
+        client.post("/api/materials", json={
+            "title": "修为体系", "content": "炼气→筑基", "category": "世界观",
+        })
+        res = client.post("/api/materials/spawn-book", json={
+            "novel_id": "", "title": "拆装时代", "mode": "interactive",
+        })
+        assert res.status_code == 200, res.text
+        nid = res.json()["novel_id"]
+        assert nid.startswith("book-")
+        assert (sandbox.novels / nid / "settings").is_dir()
+        # 书架显示的是中文书名（目录名只是标识）
+        books = client.get("/api/books").json()["books"]
+        item = next(b for b in books if b["novel_id"] == nid)
+        assert item["title"] == "拆装时代"
 
     def test_spawn_book_can_include_plot_when_asked(self, app_client, sandbox):
         client, _ = app_client
@@ -1242,13 +1431,18 @@ class TestConstraintRendering:
     def test_writer_prompt_puts_constraint_high_and_keeps_pointer(self):
         """约束块必须在【本章大纲】之前（高位），末尾只留指针 —— 不再是被稀释的尾段。"""
         from src.agents.prompt_loader import CONSTRAINT_HEADING, render_prompt
+        from src.agents.reality_policy import reality_policy_text
 
         prompt = render_prompt(
             "writer_chapter",
             brief="作者需求",
+            brief_fidelity="（虚构框架/零拒绝块占位）",
             target_words=1200,
-            tolerance=300,
+            tolerance=700,
+            length_floor=700,
+            length_ceiling=3200,
             revision_section="",
+            reality_policy=reality_policy_text(False),
             chapter=1,
             outline="本章大纲占位",
             recent_summaries="（无）",
@@ -1269,6 +1463,7 @@ class TestConstraintRendering:
 
     def test_editor_prompt_puts_constraint_before_outline(self):
         from src.agents.prompt_loader import CONSTRAINT_HEADING, render_prompt
+        from src.agents.reality_policy import reality_policy_text
 
         prompt = render_prompt(
             "editor_review",
@@ -1284,12 +1479,16 @@ class TestConstraintRendering:
             chapter_text="待审正文占位",
             target_words=1200,
             actual_length=1100,
-            tolerance=300,
+            tolerance=700,
+            length_floor=700,
+            length_ceiling=3200,
+            reality_policy=reality_policy_text(False),
         )
         assert prompt.index(CONSTRAINT_HEADING) < prompt.index("大纲占位")
 
     def test_plotter_prompt_puts_constraint_before_self_check(self):
         from src.agents.prompt_loader import CONSTRAINT_HEADING, render_prompt
+        from src.agents.reality_policy import reality_policy_text
 
         prompt = render_prompt(
             "plotter_cards",
@@ -1305,6 +1504,7 @@ class TestConstraintRendering:
             custom_constraints=self.SAMPLE,
             feedback="",
             brief="需求",
+            reality_policy=reality_policy_text(False),
         )
         assert prompt.index(CONSTRAINT_HEADING) < prompt.index("快速自检清单")
 
@@ -1516,6 +1716,72 @@ class TestStatusAndQueue:
         client, _ = app_client
         res = client.post("/api/resume?novel=demo-web", json={})
         assert res.status_code == 409
+
+    # ---------- 人审决策载荷贯通（问题①/③ 的接口侧回归）----------
+    # 这两条曾经是**静默丢参**：前端 ReviewCard 一直在提交 target_words，
+    # 但 /api/decision 只透传 action/feedback/revision_mode —— 用户改了"预期字数"
+    # 却没有任何效果，且没有任何报错。
+
+    def _capture(self, client, path: str, body: dict) -> dict:
+        """把提交进来的决策载荷截下来（不真的驱动生成图）。
+
+        两条路径落到**不同的会话对象**（自由创作 → ReviewSession.submit_decision；
+        互动创作 → InteractiveSession.decision），按 URL 选对会话再替换该方法。
+        """
+        captured: dict = {}
+        interactive = "/interactive/" in path
+        if interactive:
+            sess = client.app.state.hub.get_or_create_interactive("demo-web")
+
+            def _spy(action, feedback="", revision_mode="targeted", target_words=None):
+                captured.update({"action": action, "feedback": feedback,
+                                 "revision_mode": revision_mode,
+                                 "target_words": target_words})
+
+            orig, sess.decision = sess.decision, _spy
+        else:
+            sess = client.app.state.session
+            orig, sess.submit_decision = sess.submit_decision, captured.update
+        try:
+            res = client.post(path, json=body)
+        finally:
+            if interactive:
+                sess.decision = orig
+            else:
+                sess.submit_decision = orig
+        captured["__status"] = res.status_code
+        return captured
+
+    @pytest.mark.parametrize("path", ["/api/decision", "/api/interactive/decision"])
+    def test_decision_forwards_target_words(self, app_client, path):
+        client, _ = app_client
+        got = self._capture(client, f"{path}?novel=demo-web", {
+            "action": "reject", "feedback": "第 2 段要改", "revision_mode": "rewrite",
+            "target_words": 5000,
+        })
+        assert got["__status"] == 200
+        assert got["action"] == "reject"
+        assert got["feedback"] == "第 2 段要改"
+        assert got["revision_mode"] == "rewrite"
+        assert got["target_words"] == 5000, "target_words 被静默丢弃（问题③ 未修）"
+
+    @pytest.mark.parametrize("path", ["/api/decision", "/api/interactive/decision"])
+    def test_gate_approve_forwards_target_words_without_feedback(self, app_client, path):
+        """逐章关卡放行：只带 target_words（生成前设定字数的入口，不需要打回意见）。"""
+        client, _ = app_client
+        got = self._capture(client, f"{path}?novel=demo-web",
+                            {"action": "approve", "target_words": 6200})
+        assert got["__status"] == 200
+        assert got["action"] == "approve"
+        assert got["target_words"] == 6200
+
+    def test_interactive_decision_reject_drops_target_when_absent(self, app_client):
+        """未提供 target_words 时不写入载荷 → 引擎沿用本章原目标（不会被重置为默认值）。"""
+        client, _ = app_client
+        got = self._capture(client, "/api/interactive/decision?novel=demo-web",
+                            {"action": "reject", "feedback": "改一下"})
+        assert got["__status"] == 200
+        assert got.get("target_words") is None
 
     def test_demo_status_idle(self, app_client):
         client, _ = app_client

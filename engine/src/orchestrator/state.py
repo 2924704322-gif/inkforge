@@ -23,6 +23,8 @@ class NovelState(TypedDict, total=False):
     current_chapter: int            # 当前生成章节号（从 1 开始）
     current_volume: int
     chapter_target_words: int       # 本章预期字数（大纲预算 → 人审可改；写作/评分/门禁共用）
+    chapter_length_floor: int       # 本章最低可接受字数（目标 - 下浮上限，硬线）
+    chapter_length_ceiling: int     # 本章最高可接受字数（目标 + 上浮上限，内容完整性优先）
     chapter_ctx: dict               # ChapterContext 序列化（供 Editor 复用）
     draft_text: str                 # 当前稿正文
     attempt: int                    # 当前章第几稿（从 1 开始）

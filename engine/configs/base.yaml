@@ -27,6 +27,15 @@ generation:
   # 对话协商协作模式（v2.0 P4-A）：局部重写前 Writer 逐条回应→Editor 仲裁→定向修订；
   # 每次 partial_rewrite 多 2 次 LLM 调用，基线默认关闭
   negotiation_enabled: false
+  # ---------- 字数门禁（非对称：下浮是硬线，上浮放宽）----------
+  # 可接受区间 = [目标 - word_count_floor_offset, 目标 + word_count_ceiling_offset]。
+  # 例：目标 5000 字 → 可接受 4500-7000 字（低于 4500 判不合格并自动打回扩写；
+  # 5000-7000 之间视为合格，不因"超出目标"而打回，内容完整性优先）。
+  word_count_floor_offset: 500
+  word_count_ceiling_offset: 2000
+  # 单次模型调用产出约 3000-4000 字，因此扩写轮数决定能否达标（勿调成 1）
+  max_continuation_attempts: 3
+  max_length_retries: 2
 
 # Skill 扩展（T3.3）：按名启用/配置，具体字段见各 Skill 的 SettingsModel
 skills:

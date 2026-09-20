@@ -232,12 +232,17 @@ class TestWriterHelpers:
         assert length_deviation(3000, 3000) == 0
 
     def test_length_revision_note_distinguishes_direction(self):
-        """方向信息由 revision_note 承载：短了要求扩充，长了要求删减。"""
+        """方向信息由 revision_note 承载：低于下限要求加戏补足，超上限才要求删减。
+
+        非对称口径（用户要求）：`tolerance` 实参 = **最低可接受字数**，`ceiling` = 最高可接受字数。
+        目标 3000 → 可接受 2500-5000；实际 2000 属"低于下限"，4000 属"区间内"（不该被打回）。
+        """
         from src.agents.writer import length_revision_note
 
-        short = length_revision_note(3000, 2000)
-        long = length_revision_note(3000, 4000)
-        assert "少于目标" in short and "扩充" in short
+        short = length_revision_note(3000, 2000, 2500, 5000)
+        long = length_revision_note(3000, 6000, 2500, 5000)
+        assert "少于目标" in short and "加戏" in short
+        assert "还差 1000 字" in short      # 差额按"到目标"算
         assert "超出目标" in long and "删减" in long
 
     def test_human_revision_notes_targeted(self):

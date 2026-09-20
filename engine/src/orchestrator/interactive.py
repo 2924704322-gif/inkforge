@@ -13,9 +13,15 @@
 from __future__ import annotations
 
 from src.agents.plotter import Plotter
-from src.agents.writer import chapter_length, human_revision_notes, length_deviation
+from src.agents.writer import (
+    chapter_length,
+    human_revision_notes,
+    length_assessment,
+    length_revision_note,
+)
 from src.memory.memory_manager import ChapterContext
 from src.orchestrator.finalize import finalize_chapter
+from src.orchestrator.scheduler import generation_config
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -67,7 +73,7 @@ class InteractiveRunner:
         )
 
     def load_cards(self, chapter: int) -> dict | None:
-        """回读某章剧情卡记录：{cards, chosen, custom_text}；无卡返回 None。"""
+        """回读某章剧情卡记录：{cards, chosen, custom_text, target_words}；无卡返回 None。"""
         rel = cards_rel_path(chapter)
         if not self.pipe.store.exists(rel):
             return None
@@ -76,6 +82,8 @@ class InteractiveRunner:
             "cards": meta.get("cards") or [],
             "chosen": meta.get("chosen"),
             "custom_text": meta.get("custom_text", ""),
+            # 生成前设定的本章预期字数（落卡文件 = 事实源：重启/断点续写都读它）
+            "target_words": meta.get("target_words"),
         }
 
     def draft_snapshot(self, chapter: int) -> dict | None:
@@ -89,14 +97,25 @@ class InteractiveRunner:
         words = doc.metadata.get("words")
         if words is None:
             words = len(doc.content)
+        target = doc.metadata.get("target_words")
         return {
             "draft_text": doc.content,
             "attempt": doc.metadata.get("attempt", 1),
             "title": doc.metadata.get("title", ""),
             "review": self.load_review(chapter),
             "words": words,
-            "target_words": doc.metadata.get("target_words"),
+            "target_words": target,
+            # 字数区间（非对称）：审阅卡显示"合格线"用，与门禁同一对数
+            "length_floor": self.length_bounds(target)[0] if target else None,
+            "length_ceiling": self.length_bounds(target)[1] if target else None,
+            "length_deviation": (words - target) if target else None,
         }
+
+    def length_bounds(self, target: int | None) -> tuple[int | None, int | None]:
+        """本章可接受字数区间（最低, 最高）；无目标时返回 (None, None)。"""
+        if not target:
+            return None, None
+        return generation_config(self.pipe).length_bounds(int(target))
 
     def load_review(self, chapter: int) -> dict | None:
         """从审查报告 frontmatter 重建评分 dict（服务重启后恢复展示/定稿用）。"""
@@ -145,7 +164,8 @@ class InteractiveRunner:
         return names
 
     def _save_cards(self, chapter: int, cards: list[dict],
-                    chosen: str | None = None, custom_text: str = "") -> None:
+                    chosen: str | None = None, custom_text: str = "",
+                    target_words: int | None = None) -> None:
         lines = [f"# 第 {chapter} 章剧情卡\n"]
         for c in cards:
             lines.append(
@@ -157,8 +177,13 @@ class InteractiveRunner:
         if chosen:
             label = "用户自定义卡" if chosen == "custom" else chosen
             lines.append(f"\n> ✅ 用户选择：{label}\n")
-            if chosen == "custom":
+            if custom_text:
                 lines.append(f"\n{custom_text}\n")
+        # 目标字数与选择同一次落盘：断点续写/重启后要能取回用户生成前设的那个数
+        prev_target = self.load_cards(chapter) or {}
+        meta_target = target_words or prev_target.get("target_words")
+        if meta_target:
+            lines.append(f"\n> 🎯 本章预期字数：{meta_target} 字\n")
         self.pipe.store.write(
             cards_rel_path(chapter),
             "\n".join(lines),
@@ -167,6 +192,7 @@ class InteractiveRunner:
                 "cards": cards,
                 "chosen": chosen,
                 "custom_text": custom_text,
+                "target_words": meta_target,
             },
             commit_message=f"ch-{chapter:03d} 剧情卡"
                            + ("（已选卡）" if chosen else ""),
@@ -174,8 +200,13 @@ class InteractiveRunner:
 
     # ---------- 选卡 ----------
 
-    def choose_card(self, chapter: int, card_id: str, custom_text: str = "") -> dict:
-        """记录用户选择并返回本章计划 {title, outline, characters}。"""
+    def choose_card(self, chapter: int, card_id: str, custom_text: str = "",
+                    target_words: int | None = None) -> dict:
+        """记录用户选择并返回本章计划 {title, outline, characters}。
+
+        target_words：用户在选卡页设定的本章预期字数（生成前设定）——与选择同一次落盘，
+        断点续写/重启都读得回，避免"设了 5000、中断后续写变成默认值"。
+        """
         record = self.load_cards(chapter)
         if record is None:
             raise RuntimeError(f"第 {chapter} 章尚未生成剧情卡")
@@ -195,7 +226,8 @@ class InteractiveRunner:
                     "outline": card.get("outline", ""),
                     "characters": card.get("characters", []) or []}
             custom_text = ""
-        self._save_cards(chapter, cards, chosen=card_id, custom_text=custom_text)
+        self._save_cards(chapter, cards, chosen=card_id, custom_text=custom_text,
+                         target_words=target_words)
         return plan
 
     def chosen_plan(self, chapter: int) -> dict | None:
@@ -231,20 +263,68 @@ class InteractiveRunner:
 
         feedback 非空时为人工打回重写：携意见与上一稿走 Writer 重写链路。
         target_words 非空时覆盖 Writer 默认字数目标，用于互动模式按章自定义。
+
+        **字数门禁（非对称 · 用户要求）**：互动路径此前是"写一遍、超差只打一条日志
+        就算了"（`Layer 2 已达上限，请人工注意`）——用户实测"要求 5000 字、实际远小于"
+        的最直接原因就在这里。现在与自由创作走同一套门禁：**低于下限就带差额打回重写**
+        （上限 `max_length_retries`），上浮在 ceiling 以内视为合格，不再逼模型压缩。
         """
         ctx = self._chapter_context(chapter, plan)
-        revision_notes, previous_text = None, None
+        # 目标优先取调用方显式传入；未传则沿用本章已落盘的目标（打回重写时不再退回默认值，
+        # 否则"生成前设的 5000 字"会在第一次打回后静默变成别的数）。
         prev = self.draft_snapshot(chapter)
+        if target_words is None and prev and prev.get("target_words"):
+            target_words = int(prev["target_words"])
+        floor, ceiling = self.length_bounds(target_words)
+
+        revision_notes, previous_text = None, None
         if feedback:
             revision_notes = human_revision_notes(feedback, revision_mode)
+            # 整章重写不携带上一稿（与 graph 的 full_rewrite 分支同语义）；定向修订必须带，
+            # 否则"未点名处逐字保留"这条约束无从落地。
             if revision_mode == "targeted" and prev:
                 previous_text = prev["draft_text"]
-        result = self.pipe.writer.write_chapter(
-            ctx, revision_notes=revision_notes, previous_text=previous_text,
-            target_words_override=target_words,
-        )
-        words = chapter_length(result.content)
+
+        gen = generation_config(self.pipe)
+        max_attempts = max(1, int(gen.max_length_retries) + 1)
         attempt = (prev["attempt"] + 1) if prev else 1
+        result = None
+        note = revision_notes
+        words = 0
+        length_note = ""
+        for round_i in range(max_attempts):
+            result = self.pipe.writer.write_chapter(
+                ctx,
+                revision_notes=note,
+                previous_text=previous_text if note else None,
+                target_words_override=target_words,
+            )
+            words = chapter_length(result.content)
+            if target_words is None or not gen.length_gate_enabled:
+                break
+            state = length_assessment(target_words, words, floor, ceiling)
+            if state == "pass":
+                break
+            if round_i + 1 >= max_attempts:
+                logger.warning(
+                    "第 %d 章字数仍未达标：实际 %d 字 / 目标 %d 字（可接受 %d-%d），"
+                    "已重写 %d 轮，送人工裁决",
+                    chapter, words, target_words, floor, ceiling, round_i + 1,
+                )
+                break
+            length_note = length_revision_note(target_words, words, floor, ceiling)
+            logger.info(
+                "第 %d 章字数门禁触发（第 %d 轮）：实际 %d 字 / 目标 %d 字（可接受 %d-%d）→ 打回重写",
+                chapter, round_i + 1, words, target_words, floor, ceiling,
+            )
+            # 重写必须在上一稿基础上改：定向带原文，超上限压缩时也带原文
+            previous_text = result.content
+            # 第 2 轮起仍要带上**原始打回意见**，否则"按意见改"只发生在第一轮，
+            # 后续轮次会退化成"只补字数"（用户实测的"改了字数又丢了建议"）。
+            note = "\n\n".join(p for p in (revision_notes, length_note) if p)
+            attempt += 1
+
+
         rel = self.pipe.store.chapter_rel_path(VOLUME, chapter)
         self.pipe.store.write(
             rel,
@@ -265,15 +345,17 @@ class InteractiveRunner:
         )
         review = self.pipe.editor.review_chapter(
             ctx, result.content, attempt, target_words=target_words,
+            length_bounds=(floor, ceiling) if target_words else None,
         )
-        dev = length_deviation(words, target_words) if target_words is not None else None
-        if dev is not None and target_words is not None:
-            tolerance = getattr(self.pipe.writer, "_tolerance", 500)
-            if dev > tolerance:
-                logger.warning(
-                    "第 %d 章字数偏差 %+d 字（目标 %d 字），Layer 2 已达上限，请人工注意",
-                    chapter, words - target_words, target_words,
-                )
+        in_band = (
+            length_assessment(target_words, words, floor, ceiling) == "pass"
+            if target_words is not None else None
+        )
+        if target_words is not None and in_band is False:
+            logger.warning(
+                "第 %d 章字数落在可接受区间外：%d 字（目标 %d，可接受 %d-%d），请人工注意",
+                chapter, words, target_words, floor, ceiling,
+            )
         return {
             "draft_text": result.content,
             "attempt": attempt,
@@ -281,7 +363,10 @@ class InteractiveRunner:
             "model": f"{result.provider_name}/{result.model}",
             "words": words,
             "target_words": target_words,
-            "length_deviation": dev,
+            "length_deviation": (words - target_words) if target_words else None,
+            "length_floor": floor,
+            "length_ceiling": ceiling,
+            "length_ok": in_band,
         }
 
     def author_directive(self, chapter: int) -> str:

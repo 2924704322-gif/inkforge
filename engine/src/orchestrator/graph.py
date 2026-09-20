@@ -23,7 +23,7 @@ from src.agents.writer import (
     Writer,
     chapter_length,
     human_revision_notes,
-    length_deviation,
+    length_assessment,
     length_revision_note,
 )
 from src.config.app_config import GenerationConfig
@@ -129,6 +129,10 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
         outline = pipe.architect.generate_settings(
             brief, state["total_chapters"],
             custom_constraints=read_custom_constraints(pipe.store),
+            # 单章预期字数：管线级默认 → 大纲里逐章预算围绕它给出
+            # （用户若在 brief 里另行指定单章字数，提示词里以作者原话为准）
+            chapter_words=state.get("target_words")
+                           or getattr(pipe.writer, "target_words", None),
         )
         # 设定落盘后全量建立索引
         pipe.memory.rebuild_index()
@@ -194,14 +198,22 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
             len(ctx.unresolved_foreshadowing),
             len(ctx.worldview_rules),
         )
+        # 本章预期字数：**用户在逐章关卡上定过的值优先**。
+        # 由来（真实缺陷）：原实现无条件用大纲预算覆盖 state.chapter_target_words，
+        # 而 chapter_gate → assemble_context 正是"关卡上设定字数 → 开始写这一章"的路径，
+        # 于是"按此字数开写第 N 章"被下一跳静默改回大纲预算（用户改了没反应）。
+        # 无关卡设定时（本轮首章 / 断点续跑）才回落到大纲预算 → 全局默认。
+        preset_target = state.get("chapter_target_words")
+        chapter_target = preset_target or resolve_chapter_target(
+            plan, getattr(pipe.writer, "target_words", None)
+        )
+        if preset_target:
+            logger.info("第 %d 章沿用用户在关卡上设定的预期字数：%s", chapter, preset_target)
         return {
             "chapter_ctx": asdict(ctx),
             "current_volume": plan["volume"],
-            # 本章预期字数（问题3）：优先取大纲里该章的预算，缺失则回落全局默认。
             # 入 state 后成为本章**唯一**目标——写作、评分、字数门禁三者口径一致。
-            "chapter_target_words": resolve_chapter_target(
-                plan, getattr(pipe.writer, "target_words", None)
-            ),
+            "chapter_target_words": chapter_target,
             "attempt": 0,
             "partial_retries": 0,
             "full_retries": 0,
@@ -228,6 +240,7 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
         # 每稿即落盘（人工可随时查看），状态 draft
         plan = plan_for_chapter(state, ctx.chapter) or {}
         rel = pipe.store.chapter_rel_path(state["current_volume"], ctx.chapter)
+        written_words = chapter_length(result.content)
         pipe.store.write(
             rel,
             result.content,
@@ -240,6 +253,8 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
                 "attempt": attempt,
                 # 目标字数落 frontmatter = 事实源：断点续跑/看板/后续章节都读得到
                 "target_words": target,
+                # 实际字数一并落盘：审阅卡与看板直接读，不必再解析正文
+                "words": written_words,
                 "model": f"{result.provider_name}/{result.model}",
                 "used_fallback": result.used_fallback,
             },
@@ -258,19 +273,21 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
         gen = generation_config(pipe)
         # 逐章目标（问题3）：与 writer 用同一个值，评分口径才与写作口径一致
         target = state.get("chapter_target_words") or getattr(pipe.writer, "target_words", None)
-        tolerance = gen.tolerance_for(target) if target else gen.word_count_tolerance
+        # 字数区间（非对称）：下浮是硬线、上浮放宽；写作/评分/门禁/前端共用这一对边界
+        floor, ceiling = gen.length_bounds(target) if target else (None, None)
         review = pipe.editor.review_chapter(
             ctx, state["draft_text"], state["attempt"], target_words=target,
+            length_bounds=(floor, ceiling) if target else None,
         )
         verdict = verdict_of(review.overall)
         updates: dict = {"review": review.model_dump(), "verdict": verdict}
 
-        # 字数门禁：客观偏差超容差 → 强制修正（客观约束，不走协商）
+        # 字数门禁：客观偏差超区间 → 强制修正（客观约束，不走协商）
         length_note = ""
         if target is not None and gen.length_gate_enabled:
             actual = chapter_length(state["draft_text"])
-            if length_deviation(actual, target) > tolerance:
-                length_note = length_revision_note(target, actual, tolerance)
+            if length_assessment(target, actual, floor, ceiling) != "pass":
+                length_note = length_revision_note(target, actual, floor, ceiling)
 
         if verdict == "partial_rewrite":
             if state.get("partial_retries", 0) < gen.max_partial_retries:
@@ -304,12 +321,12 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
             else:
                 updates["retry_exceeded"] = True
         else:  # pass
-            # 字数门禁：质量 pass 但字数超差 → 强制打回修正
+            # 字数门禁：质量 pass 但字数落到区间外 → 强制打回修正
             if length_note and state.get("length_retries", 0) < gen.max_length_retries:
                 logger.info(
-                    "第 %d 章字数门禁触发：偏差 %+d 字 → 强制 partial_rewrite",
-                    state["current_chapter"],
-                    chapter_length(state["draft_text"]) - target,
+                    "第 %d 章字数门禁触发：实际 %d 字 / 目标 %d 字（可接受 %d-%d）→ 强制 partial_rewrite",
+                    state["current_chapter"], chapter_length(state["draft_text"]), target,
+                    floor, ceiling,
                 )
                 updates["length_retries"] = state.get("length_retries", 0) + 1
                 updates["verdict"] = "partial_rewrite"
@@ -331,6 +348,9 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
 
     def human_review_node(state: NovelState) -> dict:
         first_time = state.get("first_review_passed") is None
+        gen = generation_config(pipe)
+        target_now = state.get("chapter_target_words")
+        lo, hi = gen.length_bounds(target_now) if target_now else (None, None)
         decision = interrupt(
             {
                 "type": "chapter_review",
@@ -342,8 +362,11 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
                 "attempt": state.get("attempt", 1),
                 # 本章预期字数（问题3）：审阅卡上显示"目标/实际/偏差"，人工打回时
                 # 也可带新目标字数（decision.target_words）→ 下一稿按新目标写。
-                "target_words": state.get("chapter_target_words"),
+                "target_words": target_now,
                 "actual_length": chapter_length(state["draft_text"]),
+                # 可接受区间（非对称口径）：前端据此显示"合格线"，不再各自算一套
+                "length_floor": lo,
+                "length_ceiling": hi,
                 "model": state.get("model"),
                 "used_fallback": state.get("used_fallback", False),
             }
@@ -413,6 +436,10 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
         default_target = resolve_chapter_target(
             planned, getattr(pipe.writer, "target_words", None)
         )
+        gen = generation_config(pipe)
+        plan_lo, plan_hi = (
+            gen.length_bounds(default_target) if default_target else (None, None)
+        )
         decision = interrupt(
             {
                 "type": "chapter_gate",
@@ -420,6 +447,9 @@ def build_graph(pipe: Pipeline, checkpoint_db: Path):
                 "next_chapter": next_chapter,
                 "target_words": default_target,
                 "planned_target_words": default_target,
+                # 生成**之前**就把这一章的可接受区间摆出来（下浮 500 / 上浮 2000）
+                "length_floor": plan_lo,
+                "length_ceiling": plan_hi,
             }
         )
         if decision.get("action") == "approve":

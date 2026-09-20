@@ -3,7 +3,14 @@ import { NInput, useMessage } from 'naive-ui'
 import { computed, ref, watch } from 'vue'
 
 import { api } from '../api'
-import { appStore, type SideWindowId } from '../store'
+import { appStore, openBook as openWorkspaceBook, type SideWindowId } from '../store'
+import {
+  catSourceBook,
+  defaultSpawnPicks,
+  setCatSource,
+  spawnPool,
+  spawnSelectedIds,
+} from './spawnPick'
 import type {
   ActionAuditRecord,
   AgentPreset,
@@ -342,71 +349,154 @@ async function removeMaterial(m: Material): Promise<void> {
   else await loadMaterials()
 }
 
-// ── 二开建书（按分类混选：可"用书 A 的世界观 + 书 B 的人物"） ──
+// ── 二开建书 ──
+// 结构：**一个来源书** + 七个分类的内容清单（默认全部来自该来源书）。
+// 只有"参考其他书"是显式动作，不再让每个分类各自带一个下拉（那是杂乱的主要来源）。
 const spawnOpen = ref(false)
 const spawning = ref(false)
 const SPAWN_CATS = ['世界观', '人物', '道具', '地点', '技法', '文风', '桥段']
+/** 桥段是原著最"像"的部分：默认不导入，需显式打开（并说明它变成"续写起点"）。 */
+const SPAWN_PLOT = '桥段'
 const spawnForm = ref({
-  novel_id: '',
   title: '',
-  /** 分类 → { book: 来源书（空 = 不限）, ids: 勾选的素材 id } */
-  picks: {} as Record<string, { book: string; ids: string[] }>,
+  /** 目录名（可留空 → 引擎按书名派生；纯中文书名不会再 400） */
+  novel_id: '',
+  /** 唯一来源书（'' = 全部来源书，仅在显式切换时出现） */
+  sourceBook: '',
+  /** 分类 → 勾选的素材 id */
+  picks: {} as Record<string, string[]>,
+  /** 每个分类单独的来源书覆盖（跨书混搭；默认无） */
+  overrides: {} as Record<string, string>,
+  /** 高级：是否允许按分类指定来源书 */
+  advanced: false,
+  /** 展开查看条目的分类（默认全部收起，只看数量） */
+  expanded: {} as Record<string, boolean>,
 })
 
-function openSpawn(): void {
-  const picks: Record<string, { book: string; ids: string[] }> = {}
-  for (const c of SPAWN_CATS) {
-    // 桥段默认不勾选：它是原著最"像"的部分，导入后容易贴着原著情节走
-    picks[c] = {
-      book: '',
-      ids: c === '桥段'
-        ? []
-        : materials.value.filter((m) => m.category === c).map((m) => m.id),
-    }
-  }
-  spawnForm.value = { novel_id: '', title: '', picks }
-  spawnOpen.value = true
+/**
+ * 打开时的默认来源书 = **当前书**。
+ *
+ * 由来（用户实测）：默认落到"全部来源书"，于是别的书的素材会被一起勾上、一起导入。
+ * 现在两级回落，保证"打开就是当前书"：
+ *   ① `appStore.bookId`（工作台当前书）；
+ *   ② 素材库正打开的那本书（`activeBook`）—— 素材库书籍列表页点「二开建书」时
+ *      工作台可能没有当前书，此前就会静默退化成全库。
+ */
+const spawnDefaultBook = computed(() => appStore.bookId || activeBook.value || '')
+
+/** 当前生效的来源书（含"全部来源书"态）。 */
+const spawnSource = computed(() => spawnForm.value.sourceBook)
+
+/** 某分类实际使用的来源书（考虑按分类覆盖）。 */
+function catBook(cat: string): string {
+  return catSourceBook(spawnForm.value.overrides, cat, spawnSource.value)
 }
 
+/** 某分类的候选素材池。 */
 function spawnCatPool(cat: string): Material[] {
-  const book = spawnForm.value.picks[cat]?.book ?? ''
-  return materials.value.filter(
-    (m) => m.category === cat && (!book || m.source_book === book),
+  return spawnPool(materials.value, cat, catBook(cat)) as Material[]
+}
+
+/** 按当前来源书重新预勾选（桥段默认不勾）。 */
+function reselectForSource(): void {
+  spawnForm.value.overrides = {}
+  spawnForm.value.picks = defaultSpawnPicks(
+    materials.value, SPAWN_CATS, spawnSource.value,
   )
 }
 
+/** 切换来源书：来源变了就按新来源重勾（用户要的是"一键回到干净状态"）。 */
+function setSpawnSource(book: string): void {
+  spawnForm.value.sourceBook = book
+  reselectForSource()
+}
+
+function openSpawn(): void {
+  const book = spawnDefaultBook.value
+  spawnForm.value = {
+    title: '',
+    novel_id: '',
+    sourceBook: book,
+    picks: {},
+    overrides: {},
+    advanced: false,
+    expanded: {},
+  }
+  reselectForSource()
+  spawnOpen.value = true
+}
+
+/** 单分类改来源书（跨书混搭）：勾选清空，避免残留上一本书的 id。 */
+function setCatBook(cat: string, book: string): void {
+  const next = setCatSource(
+    spawnForm.value.picks, spawnForm.value.overrides, cat, book, spawnSource.value,
+  )
+  spawnForm.value.picks = next.picks
+  spawnForm.value.overrides = next.overrides
+}
+
 function toggleSpawnItem(cat: string, id: string): void {
-  const ids = spawnForm.value.picks[cat].ids
+  const ids = spawnForm.value.picks[cat] ?? (spawnForm.value.picks[cat] = [])
   const i = ids.indexOf(id)
   if (i >= 0) ids.splice(i, 1)
   else ids.push(id)
 }
 
+function toggleCatExpand(cat: string): void {
+  spawnForm.value.expanded[cat] = !spawnForm.value.expanded[cat]
+}
+
 function selectAllInCat(cat: string): void {
-  spawnForm.value.picks[cat].ids = spawnCatPool(cat).map((m) => m.id)
+  spawnForm.value.picks[cat] = spawnCatPool(cat).map((m) => m.id)
 }
 
 function clearCat(cat: string): void {
-  spawnForm.value.picks[cat].ids = []
+  spawnForm.value.picks[cat] = []
 }
 
-/** 某分类选中的素材来自哪些书（用于提示"这是跨书混搭"） */
-function pickedBooks(cat: string): string[] {
-  const ids = new Set(spawnForm.value.picks[cat]?.ids ?? [])
-  return [...new Set(materials.value.filter((m) => ids.has(m.id))
-    .map((m) => m.source_book ?? '?'))]
+/** 桥段总开关（默认关）：打开 = 导入全部桥段并生成"续写起点"。 */
+const spawnWithPlot = computed({
+  get: () => (spawnForm.value.picks[SPAWN_PLOT]?.length ?? 0) > 0,
+  set: (on: boolean) => {
+    spawnForm.value.picks[SPAWN_PLOT] = on
+      ? spawnCatPool(SPAWN_PLOT).map((m) => m.id)
+      : []
+  },
+})
+
+/** 只列出**有素材**的分类（空分类不占版面：这是"杂乱"的主要观感来源）。 */
+const spawnCatRows = computed(() =>
+  SPAWN_CATS.filter((c) => spawnCatPool(c).length > 0),
+)
+
+/** 分类 → 该书下该分类的素材总数（用于 "已选 x/y"）。 */
+function catPoolSize(cat: string): number {
+  return spawnCatPool(cat).length
 }
 
 const spawnTotal = computed(() =>
-  SPAWN_CATS.reduce((n, c) => n + (spawnForm.value.picks[c]?.ids.length ?? 0), 0),
+  SPAWN_CATS.reduce((n, c) => n + (spawnForm.value.picks[c]?.length ?? 0), 0),
 )
 
+/** 跨书混搭提示：列出实际用到的来源书。 */
+const spawnSourceList = computed(() => {
+  const books = [...new Set(SPAWN_CATS.map((c) => catBook(c)))]
+  return books.map((b) => (b ? `《${b}》` : '全部来源书'))
+})
+const spawnMixed = computed(() => spawnSourceList.value.length > 1)
+
+/** 落盘去向摘要（技术路径从正文里挪到这里，不再糊在按钮区）。 */
+const spawnDestSummary =
+  '世界观→设定 / 人物→角色 / 文风→文风指纹 / 道具·地点·技法→创作约束 / 桥段→续写起点'
+
 async function doSpawn(): Promise<void> {
-  if (!spawnForm.value.novel_id.trim()) {
-    message.warning('请填写新书标识（英文/数字/下划线，作为目录名）')
+  const title = spawnForm.value.title.trim()
+  const novelId = spawnForm.value.novel_id.trim()
+  if (!title && !novelId) {
+    message.warning('请填写新书书名')
     return
   }
-  const ids = SPAWN_CATS.flatMap((c) => spawnForm.value.picks[c]?.ids ?? [])
+  const ids = spawnSelectedIds(spawnForm.value.picks, SPAWN_CATS)
   if (!ids.length) {
     message.warning('至少选择一个分类里的素材')
     return
@@ -418,17 +508,23 @@ async function doSpawn(): Promise<void> {
       summary?: string
       source_summary?: string
       novel_id: string
+      title?: string
     }>('POST', '/api/materials/spawn-book', {
-      novel_id: spawnForm.value.novel_id.trim(),
-      title: spawnForm.value.title.trim() || spawnForm.value.novel_id.trim(),
+      // novel_id 留空 → 引擎按书名派生（纯中文书名不再 400）；填了就按填的用
+      novel_id: novelId,
+      title: title || novelId,
       material_ids: ids,
       mode: 'interactive',
     })
     message.success(
-      `${res.summary ?? ''}${res.source_summary ? `（${res.source_summary}）` : ''}`,
+      `《${res.title ?? res.novel_id}》${res.summary ?? ''}${res.source_summary ? `（${res.source_summary}）` : ''}`,
     )
     spawnOpen.value = false
     appStore.treeVersion += 1
+    // 建完直接进新书：否则用户停在素材库，看不到新书、也看不到书名（真实体感：
+    // "书没建成 / 名字也没了"）。openWorkspaceBook 同步引擎侧「当前书」，工作台立即切过去。
+    openWorkspaceBook(res.novel_id, res.title ?? '')
+    appStore.sideWindow = null
   } catch (err) {
     message.error(err instanceof Error ? err.message : String(err))
   } finally {
@@ -904,61 +1000,177 @@ watch(
             </div>
           </template>
 
-          <!-- 二开建书：按分类混选（可用书 A 的世界观 + 书 B 的人物） -->
-          <div v-if="spawnOpen" class="append-box">
+          <!-- ══════════ 二开建书（三段式：新书 → 来源 → 内容清单） ══════════
+               设计原则：一条主线、默认全对、技术细节收起。
+               ① 新书：只填书名（目录名自动派生，可展开手填）
+               ② 来源：**默认当前书**（一个来源，不是七个下拉）
+               ③ 内容：有素材的分类才出现，默认全选，展开才看条目
+               跨书混搭 / 落盘去向 / 目录名 一律收进「高级」，
+               主线上没有一个需要用户理解的内部概念（worldview / custom-skills 等）。 -->
+          <div v-if="spawnOpen" class="append-box spawn-panel">
             <div class="row-between">
               <b>二开建书</b>
               <span class="row-gap">
-                <span class="muted">已选 {{ spawnTotal }} 条</span>
+                <span class="muted">将导入 {{ spawnTotal }} 条素材</span>
                 <button class="ghost-btn" @click="spawnOpen = false">取消</button>
               </span>
             </div>
-            <div class="spawn-grid">
-              <NInput v-model:value="spawnForm.novel_id" size="small" placeholder="新书标识（英文/数字/下划线）" />
-              <NInput v-model:value="spawnForm.title" size="small" placeholder="书名（可留空）" />
-            </div>
-            <div class="muted">
-              每一行选一个分类的素材。**「来源书」可分别指定** —— 例如世界观取书 A、人物取书 B。
-              落盘去向：世界观→worldview、人物→characters、文风→style.md、技法/道具/地点→custom-skills.md。
-              <b>勾选「桥段」会额外生成「原文剧情线索」</b>（按章序排列），新书从最后一条之后接着往下写。
+
+            <!-- ① 新书 -->
+            <div class="spawn-block">
+              <div class="spawn-step">① 新书</div>
+              <NInput
+                v-model:value="spawnForm.title"
+                placeholder="书名，例：拆装时代"
+                @keyup.enter="doSpawn"
+              />
+              <div v-if="spawnForm.advanced" class="spawn-sub">
+                <span class="muted">目录名（可留空，将按书名自动生成）</span>
+                <NInput
+                  v-model:value="spawnForm.novel_id"
+                  size="small"
+                  placeholder="留空即可，例：chai-zhuang-shi-dai"
+                />
+              </div>
             </div>
 
-            <div v-for="cat in SPAWN_CATS" :key="cat" class="spawn-row">
-              <div class="row-between">
-                <span class="row-gap">
-                  <span class="tag cat">{{ cat }}</span>
-                  <select v-model="spawnForm.picks[cat].book" class="mini-select">
-                    <option value="">全部来源书</option>
-                    <option v-for="b in materialBooks" :key="b.book" :value="b.book">{{ b.book }}</option>
-                  </select>
-                  <span class="muted">{{ spawnForm.picks[cat].ids.length }}/{{ spawnCatPool(cat).length }}</span>
-                  <span v-if="pickedBooks(cat).length > 1" class="warn">
-                    跨 {{ pickedBooks(cat).length }} 本书混搭
+            <!-- ② 来源：默认当前书 -->
+            <div class="spawn-block">
+              <div class="spawn-step">② 素材来源</div>
+              <div class="spawn-source" :class="{ mixed: spawnMixed }">
+                <span class="spawn-source-main">
+                  <b v-if="spawnSource">《{{ spawnSource }}》</b>
+                  <b v-else>全部来源书（跨书混选）</b>
+                  <span class="muted">
+                    {{ spawnSource
+                      ? ' · 只取这本书的素材，不会混入别的书'
+                      : ' · 会混入所有书的素材' }}
+                  </span>
+                  <span v-if="spawnMixed" class="warn">
+                    · 各分类来源不同：{{ spawnSourceList.join(' + ') }}
                   </span>
                 </span>
                 <span class="row-gap">
-                  <button class="ghost-btn" @click="selectAllInCat(cat)">全选</button>
-                  <button class="ghost-btn" @click="clearCat(cat)">清空</button>
+                  <button
+                    v-if="spawnDefaultBook && spawnSource !== spawnDefaultBook"
+                    class="ghost-btn"
+                    @click="setSpawnSource(spawnDefaultBook)"
+                  >回到当前书</button>
+                  <select
+                    :value="spawnSource"
+                    class="mini-select"
+                    @change="setSpawnSource(($event.target as HTMLSelectElement).value)"
+                  >
+                    <option v-if="spawnDefaultBook" :value="spawnDefaultBook">
+                      当前书《{{ spawnDefaultBook }}》
+                    </option>
+                    <option value="">全部来源书（跨书混选）</option>
+                    <option
+                      v-for="b in materialBooks.filter((x) => x.book !== spawnDefaultBook)"
+                      :key="b.book"
+                      :value="b.book"
+                    >《{{ b.book }}》</option>
+                  </select>
                 </span>
-              </div>
-              <div class="cat-row">
-                <button
-                  v-for="m in spawnCatPool(cat)"
-                  :key="m.id"
-                  class="cat-chip"
-                  :class="{ on: spawnForm.picks[cat].ids.includes(m.id) }"
-                  @click="toggleSpawnItem(cat, m.id)"
-                  :title="m.source_book"
-                >
-                  {{ m.title }}
-                </button>
-                <span v-if="!spawnCatPool(cat).length" class="muted">（该分类暂无素材）</span>
               </div>
             </div>
 
-            <button class="primary-btn" :disabled="spawning" @click="doSpawn">
-              {{ spawning ? '建书中…' : `建书并导入 ${spawnTotal} 条` }}
-            </button>
+            <!-- ③ 内容清单：有素材的分类才出现；默认全选；展开才看条目 -->
+            <div class="spawn-block">
+              <div class="row-between">
+                <div class="spawn-step">③ 导入内容</div>
+                <span class="row-gap">
+                  <button class="link-btn" @click="reselectForSource">全部重选</button>
+                  <button
+                    class="link-btn"
+                    @click="SPAWN_CATS.forEach((c) => clearCat(c))"
+                  >全部清空</button>
+                </span>
+              </div>
+
+              <div
+                v-for="cat in spawnCatRows"
+                :key="cat"
+                class="spawn-row"
+                :class="{ off: !(spawnForm.picks[cat]?.length) }"
+              >
+                <div class="row-between">
+                  <span class="row-gap">
+                    <span class="tag cat">{{ cat }}</span>
+                    <span class="muted">
+                      已选 {{ spawnForm.picks[cat]?.length ?? 0 }} / {{ catPoolSize(cat) }}
+                    </span>
+                    <span v-if="cat === SPAWN_PLOT" class="muted">
+                      · 导入后作为续写起点（按原章序）
+                    </span>
+                  </span>
+                  <span class="row-gap">
+                    <button class="ghost-btn" @click="selectAllInCat(cat)">全选</button>
+                    <button class="ghost-btn" @click="clearCat(cat)">清空</button>
+                    <button class="link-btn" @click="toggleCatExpand(cat)">
+                      {{ spawnForm.expanded[cat] ? '收起条目' : '选择条目' }}
+                    </button>
+                  </span>
+                </div>
+                <div v-if="spawnForm.expanded[cat]" class="cat-row">
+                  <button
+                    v-for="m in spawnCatPool(cat)"
+                    :key="m.id"
+                    class="cat-chip"
+                    :class="{ on: spawnForm.picks[cat]?.includes(m.id) }"
+                    @click="toggleSpawnItem(cat, m.id)"
+                    :title="m.source_book || '无来源'"
+                  >
+                    {{ m.title }}
+                  </button>
+                </div>
+              </div>
+              <div v-if="!spawnCatRows.length" class="muted">
+                当前来源下没有素材。换一个来源，或先去上方「学习仿写」提取素材。
+              </div>
+
+              <label v-if="spawnCatPool(SPAWN_PLOT).length" class="spawn-plot">
+                <input v-model="spawnWithPlot" type="checkbox" />
+                <span>
+                  <b>同时导入「桥段」</b>
+                  <small class="muted">
+                    桥段是原著最"像"的部分，默认不导入。勾上后新书会带一份
+                    <b>续写起点</b>，从原文最后一条之后接着往下写。
+                  </small>
+                </span>
+              </label>
+            </div>
+
+            <!-- 高级：跨书混搭 / 落盘去向 / 目录名 -->
+            <details class="spawn-advanced">
+              <summary>高级（跨书混搭 · 落盘去向 · 目录名）</summary>
+              <div class="muted">落盘去向：{{ spawnDestSummary }}</div>
+              <div v-for="cat in spawnCatRows" :key="cat" class="advanced-row">
+                <span class="tag cat">{{ cat }}</span>
+                <select
+                  :value="catBook(cat)"
+                  class="mini-select"
+                  @change="setCatBook(cat, ($event.target as HTMLSelectElement).value)"
+                >
+                  <option value="">全部来源书</option>
+                  <option
+                    v-for="b in materialBooks"
+                    :key="b.book"
+                    :value="b.book"
+                  >《{{ b.book }}》</option>
+                </select>
+                <span class="muted">该分类单独指定来源书（会清空该分类勾选）</span>
+              </div>
+            </details>
+
+            <div class="spawn-footer">
+              <span class="muted">
+                来源：{{ spawnSourceList.join(' + ') }} · 共 {{ spawnTotal }} 条
+              </span>
+              <button class="primary-btn" :disabled="spawning" @click="doSpawn">
+                {{ spawning ? '建书中…' : '建书并进入新书' }}
+              </button>
+            </div>
           </div>
         </template>
 
@@ -1298,6 +1510,102 @@ export default { name: 'SideWindows' }
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 8px;
+}
+/* 默认素材来源说明条：明确"这批素材来自哪本书"，避免误以为全库都会被导入 */
+.spawn-source {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: #eef5ff;
+  border: 1px solid #d6e4ff;
+  color: #24405f;
+}
+.spawn-source.mixed {
+  background: #fff7ed;
+  border-color: #fed7aa;
+  color: #92400e;
+}
+.spawn-source-main {
+  display: block;
+  line-height: 1.7;
+}
+/* ══ 二开建书面板：三段式（新书 → 来源 → 内容清单），高级选项收起 ══ */
+.spawn-panel {
+  gap: 12px;
+}
+.spawn-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid #e8ecf3;
+  border-radius: 10px;
+  background: #fcfdff;
+}
+.spawn-step {
+  font-size: 13px;
+  font-weight: 600;
+  color: #24405f;
+}
+.spawn-sub {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+/* 一行分类：默认只显示"已选 x/y"与三个操作；展开才显示条目 chips */
+.spawn-row.off {
+  opacity: 0.62;
+}
+.spawn-plot {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12.5px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #fffaf0;
+  border: 1px solid #f6e3c0;
+  color: #7a4b00;
+}
+.spawn-plot input {
+  margin-top: 3px;
+}
+.spawn-plot small {
+  display: block;
+  line-height: 1.6;
+  margin-top: 2px;
+  color: #8a6320;
+}
+.spawn-advanced {
+  font-size: 12.5px;
+  color: #5c6470;
+}
+.spawn-advanced > summary {
+  cursor: pointer;
+  padding: 4px 0;
+}
+.spawn-advanced .muted {
+  margin: 4px 0 8px;
+}
+.advanced-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+.spawn-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 .spawn-row {
   border: 1px solid #e5e7eb;

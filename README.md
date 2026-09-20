@@ -28,11 +28,15 @@ Inkforge 既有**全自动生产线**（大纲 → 写作 → 四维审校 → �
 ```
 inkforge/
 ├── apps/desktop/        # Electron 壳（main / preload / renderer）
+│   ├── src/renderer/src/composables/  # 渲染层可测纯逻辑（useWordTarget 等）
+│   ├── scripts/         #   渲染层回归（node 直跑真实源码，无需浏览器）
+│   └── ui-probe/        #   真实浏览器 UI 探针（开发期脚手架，不参与产品构建）
 ├── engine/              # Python 引擎 sidecar（自包含：src + configs + data + tests + scripts）
 │   ├── src/             #   流水线 / 记忆 / 蒸馏 / Skill / Web API
 │   ├── configs/         #   分层配置 + models.yaml（按角色绑定模型）
 │   ├── tests/           #   回归测试（零真实 LLM 调用）
 │   ├── scripts/         #   verify_env.py（依赖自检）
+│   ├── smoke_*.py       #   真实端到端冒烟（跑在临时沙箱，不碰作品数据）
 │   └── data/            #   用户数据：novels（MD 事实源）、skills（技能包）、custom_skills
 ├── .github/workflows/   # CI：lint + 测试 + 依赖一致性 + 密钥扫描
 ├── scripts/             # 仓库级守卫脚本（依赖清单比对 / 文档路径校验）
@@ -80,22 +84,59 @@ Windows 下可直接双击根目录 `启动Inkforge.bat`（自动设置解释器
 
 ```bash
 cd apps/desktop
-npm run dev          # 开发模式（热更新）
-npm run build        # 生产构建
-npm run typecheck    # vue-tsc + tsc 双重类型检查
+npm run dev            # 开发模式（热更新）
+npm run build          # 生产构建
+npm run typecheck      # vue-tsc + tsc 双重类型检查
+npm run check:renderer # 渲染层纯逻辑回归（字数编辑态 / 二开建书来源选择，无需浏览器）
 
 cd engine
-pytest -q            # 引擎回归测试（零真实 LLM 调用，< 60s）
+pytest -q              # 引擎回归测试（零真实 LLM 调用，< 60s）
 python scripts/verify_env.py --optional
+
+# 真实端到端冒烟（会消耗真实 LLM 调用；跑在临时沙箱目录里，不碰你的作品数据）
+python smoke_length_and_revision.py --target-words 5000   # 字数门禁 + 打回重写落实
+python smoke_pipeline_gate_words.py --gate-words 1500     # 逐章关卡设定字数是否真生效
+python smoke_spawn_book.py                                # 二开建书（书名落盘 / 素材来源）
+python smoke_reality_policy.py                            # 审校不得因"不符合现实"要求改稿
+python smoke_test.py --with-llm                           # 全链路冒烟（82 项，含 1 次真实调用）
 ```
 
 ### 使用流程
 
 1. **设置** → 填好接入点 API Key、确认各角色模型绑定；
-2. **书架** → 新建作品（填写 brief；推荐勾选「先生成设定 Demo」逐字段审核世界观与人物）；
+2. **书架** → 新建作品（填写 brief；推荐勾选「先生成设定 Demo」逐字段审核世界观与人物；
+   若你的设定本就不符合现实逻辑，**不要**勾「要求现实合理性约束」，见下方「两条创作口径」）；
 3. **工作台** → 大纲人审（通过/打回附意见）→ 章节循环：每稿即落盘，Editor 四维评分 + 问题清单 + 与上一稿的行级 diff，通过才定稿，打回可定向修订或整章重写；
 4. **蒸馏工坊** → 上传一本完整书籍（TXT/EPUB）→ 16 维蒸馏 → 得到可复用、可导出的技能包；
-5. 一切数据在 `engine/data/` 下：`novels/<id>/`（章节/大纲/角色/伏笔，**每本书一个独立 Git 仓库**）、`workspace/chats/`（工作区会话）、`skills/`（技能包）、`custom_skills/`（自定义创作约束）。
+5. **素材库** → 按来源书籍浏览七维素材，可「二开建书」用现有素材直接开一本新书；
+6. 一切数据在 `engine/data/` 下：`novels/<id>/`（章节/大纲/角色/伏笔，**每本书一个独立 Git 仓库**）、`workspace/chats/`（工作区会话）、`skills/`（技能包）、`custom_skills/`（自定义创作约束）。
+
+## 两条创作口径（默认按你的目标走）
+
+这两条是硬契约，写在提示词的最高优先级区，并由回归测试锁死；改动它们等于改产品行为，请先读 [HANDOVER.md](HANDOVER.md) §5。
+
+### 一、字数门禁：下浮是硬线，上浮放宽
+
+- 每章有独立的**预期字数**，写作、评分、字数门禁、界面显示**共用同一个数**（`settings/` 的大纲预算 → 章节 frontmatter `target_words`）。
+- 可接受区间 = `目标字数 - 500` **到** `目标字数 + 2000`：
+  - **低于下限判不合格**，系统自动带差额打回扩写（多轮，直到落进区间），不做"只写一遍、超差只记日志"；
+  - **上浮 2000 字以内视为合格**，不因"超出目标"打回或扣分（内容完整性优先）；只有超出上限才算灌水并压缩；
+  - 区间可用 `engine/configs/base.yaml → generation.word_count_floor_offset / ceiling_offset` 调整。
+- **生成之前**就能设定这一章写多少字：逐章确认关卡（自由创作）与选卡页（互动创作）都有输入框；打回重写时可改，改了就按新目标重写。
+
+### 二、现实性：以你的创作目标为唯一基准
+
+- 默认档（**关闭**「要求现实合理性约束」）：设定、能力体系、社会规则、事件走向**只需与你给的 brief / 自定义约束 / 已确认设定自洽**；审校**不得**以"不符合现实 / 不合理 / 现实中不可能"为由扣分或要求改稿，所有建议只能是在你的框架内"怎么写更好"。
+- 唯一例外：**违反你自己已确认的设定**（吃书、自相矛盾）照常算缺陷。
+- 需要按现实逻辑审稿时，在建书/创作需求处勾选「要求现实合理性约束」即可（该开关落盘在 `settings/brief.md`，可随时改）。
+- 这条口径同时注入**正文写作 / 审校评分 / 打回协商 / 互动出卡**四条链路，不是只在某一条上做样子。
+
+### 二开建书：默认只取「当前书」的素材
+
+- 打开面板时，素材来源默认是**当前书**（工作台当前书 → 素材库正打开的那本书，两级回落）；没有当前书时明确显示"全部来源书"，不冒充。
+- 面板结构：① 新书（只填书名，目录名可留空、自动派生）→ ② 素材来源（一个下拉）→ ③ 导入内容（只列有素材的分类，默认全选，展开才看条目）。
+- 跨书混搭 / 落盘去向 / 逐分类来源书都在「高级」里；「桥段」是显式开关（默认不导入，打开后会生成"续写起点"，从原文最后一条之后接着写）。
+- 书名会落盘并显示在书架上（`settings/story-overview.md`）；中文书名不再要求你另想一个英文目录名。
 
 ### 墨师全域总控（不用先建书也能干活）
 

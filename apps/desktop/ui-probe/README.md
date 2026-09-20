@@ -30,6 +30,24 @@ python ui-probe/review_probe_check.py
 - Python 3.10+ 与 `playwright`、`Pillow`
 - Chromium：`playwright install chromium`
 
+## 对话框可用性探针（`dialogs_probe_check.py` + `dialogs-main.ts`）
+
+真实 `App.vue` 外壳 + 内存桥桩，把每个对话框从头走到尾（书架 → 新建作品 → 设定 Demo 向导 → 同意并开始生成、
+智能体输入框、模型配置、风格工坊），退出码 1 = 有失败。
+
+**2026-09-19 新增 [E2] 段：风格工坊第三个模块「约束提炼」**（9 项断言 + 一张截图
+`out/ui-probe-shots/dialogs-e2-style-forge-constraint.png`）：
+
+| 断言 | 期望 |
+|---|---|
+| 顶部标签数 | **3** 个同级（`技能包与约束` / `绑定到当前作品` / `约束提炼 智能体`） |
+| 第三页要素 | 要求输入框 + 提取指向下拉 + 条数下拉 + 「提炼约束」按钮齐备 |
+| 隔离边界可见 | `.scope-no` 渲染且含「看不到」（把"不读你的小说内容"变成用户可见的声明） |
+| 提炼链路 | 点「提炼约束」→ `POST /api/style-forge/constraints` → 结果区出现 `- ` 条目 + 「复制」/「存入约束库」 |
+
+> 该段当场抓到并修掉一个观感缺陷：结果行把按钮挤到换行（「复制」竖排、按钮文案断成两行），
+> 修法见 `StyleForgeDialog.vue` 的 `.forge-result-head`（输入框 `flex:1;min-width:0` + 按钮 `flex-shrink:0`）。
+
 ## 当前覆盖的用例
 
 「书架 → 新建作品 → 创建（勾选先生成 Demo）」这条路径的向导弹窗，断言：

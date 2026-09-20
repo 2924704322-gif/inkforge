@@ -22,6 +22,8 @@ export default defineConfig({
         review: fileURLToPath(new URL('./review.html', import.meta.url)),
         // 对话框可用性探针
         dialogs: fileURLToPath(new URL('./dialogs.html', import.meta.url)),
+        // 互动创作正文预览框（可拉伸）探针
+        interactive: fileURLToPath(new URL('./interactive.html', import.meta.url)),
       },
     },
   },

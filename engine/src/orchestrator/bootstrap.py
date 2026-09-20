@@ -59,7 +59,9 @@ def build_pipeline(novel_id: str, target_words: int | None = None) -> Pipeline:
         writer=Writer(
             registry,
             target_words=words,
-            tolerance=gen.word_count_tolerance,
+            # 非对称字数口径（下浮硬线 / 上浮放宽）：tolerance=最低可接受，ceiling=最高可接受
+            tolerance=gen.length_floor(words),
+            ceiling=gen.length_ceiling(words),
             max_continuation_attempts=gen.max_continuation_attempts,
         ),
         editor=Editor(registry, store, tolerance=gen.word_count_tolerance),

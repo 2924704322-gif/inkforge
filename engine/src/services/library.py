@@ -40,6 +40,8 @@ NOVEL_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
 SKILL_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
 BOOK_SUBDIRS = ("chapters", "settings", "summaries", "reviews")
 CUSTOM_SKILLS_REL = "settings/custom-skills.md"
+#: 书名落盘位置（书架 list_books 的事实源之一；书名优先级：outline.md:title → 本文件 book_title）
+BOOK_OVERVIEW_REL = "settings/story-overview.md"
 UPLOAD_ROOTS_ENV = "INKFORGE_UPLOAD_ROOTS"
 UPLOAD_SUFFIXES = (".txt", ".epub", ".md", ".markdown")
 CREATION_MODES = ("pipeline", "interactive")
@@ -202,14 +204,53 @@ def book_exists(novel_id: str) -> bool:
     return novel_dir(novel_id).exists()
 
 
-def create_book(novel_id: str, mode: str = "pipeline") -> str:
+def derive_novel_id(title: str, taken: set[str] | None = None) -> str:
+    """由书名派生一个合法的本书标识（目录名）。
+
+    为什么需要它：二开建书是"给新书起个名"的轻量动作，用户填的多半是中文书名，
+    而标识必须匹配 ``NOVEL_ID_RE``（纯 ASCII）。原实现把"英文目录名"硬塞给用户填，
+    中文书名直接 400——体感就是"这功能还得先想个英文目录名"。
+    派生规则（确定性、可预期）：
+      1. 取书名的 ASCII 字母/数字部分（小写化，其余转 -）；
+      2. 一个 ASCII 字符都不剩（纯中文书名）→ 回落 ``book-YYYYMMDD``；
+      3. ``taken`` 里已存在 → 追加 -2/-3…（避免建书 409 让用户自己改）。
+    """
+    import datetime as _dt
+    import re as _re
+
+    raw = (title or "").strip().lower()
+    slug = _re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    slug = _re.sub(r"-{2,}", "-", slug)[:40].strip("-")
+    used = taken or set()
+
+    def _free(base: str) -> str:
+        if base and base not in used:
+            return base
+        n = 2
+        while f"{base}-{n}" in used:
+            n += 1
+        return f"{base}-{n}"
+
+    if slug and NOVEL_ID_RE.match(slug):
+        return _free(slug)
+    stamp = _dt.date.today().strftime("%Y%m%d")
+    return _free(f"book-{stamp}")
+
+
+def create_book(novel_id: str, mode: str = "pipeline", title: str = "") -> str:
     """创建空书目录骨架（纯文件系统；会话注册由调用方负责）。
 
     创作模式：
     · ``pipeline``（默认）＝自由创作：大纲 → 章节流水线；
     · ``interactive`` ＝互动创作：只做世界观/人物设定（不产大纲），
       落地方式就是建一个 ``<书>/interactive/`` 目录。
-    返回规范化后的 novel_id。
+
+    `title`：作者给的书名。**必须落盘**（`settings/story-overview.md` 的
+    `book_title` 字段）——书架/资源树的书名只认 `outline.md` 与
+    `story-overview.md` 两处事实源，缺了就只能回落目录名。
+    由来（用户实测）："二开建书只填了书名，结果书名消失、书架显示目录名"——
+    修复前 `title` 参数在调用方算出来就被丢掉，从没落过盘。
+    该文件**不带** `demo_confirmed`，因此不会被误判成"已确认的设定 Demo"。
     """
     nid = validate_novel_id(novel_id)
     if mode not in CREATION_MODES:
@@ -221,7 +262,16 @@ def create_book(novel_id: str, mode: str = "pipeline") -> str:
         (book_dir / sub).mkdir(parents=True, exist_ok=True)
     if mode == "interactive":
         (book_dir / "interactive").mkdir(parents=True, exist_ok=True)
-    logger.info("新建书目 %s（mode=%s）", nid, mode)
+    logger.info("新建书目 %s（mode=%s，title=%r）", nid, mode, title or "")
+    if title.strip():
+        store = open_store(book_dir, writable=True)
+        store.write(
+            BOOK_OVERVIEW_REL,
+            f"# {title.strip()}\n\n> 书名由建书时填写；本书尚未生成设定或大纲。\n",
+            metadata={"title": title.strip(), "book_title": title.strip(),
+                      "theme": "", "created_from": "create_book"},
+            commit_message=f"记录书名：{title.strip()}",
+        )
     return nid
 
 

@@ -919,6 +919,10 @@ def _run_gen_decide(ctx: ActionContext, args: dict) -> ActionExec:
     nid = resolve_book(ctx, args)
     decision = _arg_str(args, "action")
     payload = {"action": decision}
+    # 预期字数（生成前设定 / 打回时改目标）：与 /api/decision 同一语义，一并透传给图
+    target = _arg_int(args, "target_words", required=False, default=0)
+    if target:
+        payload["target_words"] = target
     if decision == "reject":
         payload["feedback"] = _arg_str(args, "feedback")
         payload["revision_mode"] = str(args.get("revision_mode") or "targeted")
@@ -1149,7 +1153,7 @@ def _bootstrap_registry() -> None:
     _register_write("gen_pause", "暂停生成", ("novel",),
                     _preview_gen_pause, _run_gen_pause)
     _register_write("gen_decide", "章节人审裁决",
-                    ("novel", "action", "feedback", "revision_mode"),
+                    ("novel", "action", "feedback", "revision_mode", "target_words"),
                     _preview_gen_decide, _run_gen_decide)
     _register_write("demo_run", "生成设定 Demo", ("novel", "brief", "chapters", "skill_ids"),
                     _preview_demo_run, _run_demo_run)

@@ -51,23 +51,77 @@ def write_brief(store: MdStore, brief: str, fields: dict | None = None) -> bool:
 
     `fields`：结构化 brief 字段（X1）。落盘时**逐项原样**渲染进正文，
     使"写入"与"读取"路径都保留作者原文，不经任何摘要。
+
+    `allow_realism`（现实性口径开关）有两处落点，缺一不可：
+    - frontmatter `brief_fields.allow_realism` → 程序用 `allow_realism(store)` 读回；
+    - 正文里一行可读标记 → 人看得见"这本书的评分口径是什么"，也兼容字段机制之前的旧书。
     """
     from src.agents.architect import render_brief_fields
+    from src.agents.reality_policy import BRIEF_FIELD_KEY, normalize_allow_realism
 
     text = (brief or "").strip()
     structured = render_brief_fields(fields) if fields else ""
-    body = "\n\n".join(p for p in (structured, text) if p).strip()
+    want_realism = normalize_allow_realism((fields or {}).get(BRIEF_FIELD_KEY))
+    marker = (
+        f"- {BRIEF_FIELD_KEY}：true（已开启「要求现实合理性约束」）"
+        if want_realism else ""
+    )
+    body = "\n\n".join(p for p in (structured, marker, text) if p).strip()
     if not body:
         return False
-    if store.exists(BRIEF_REL) and store.read(BRIEF_REL).content.strip() == body:
-        return False
+    metadata = {"title": "作者创作需求（brief）", "brief_fields": fields or {}}
+    if store.exists(BRIEF_REL):
+        doc = store.read(BRIEF_REL)
+        # 幂等判据必须**同时**比对正文与结构化字段：只比正文的话，
+        # 单独改开关（正文不变）会被判成"没变化"而静默丢弃（真实易踩的坑）。
+        if (doc.content.strip() == body
+                and (doc.metadata.get("brief_fields") or {}) == (fields or {})):
+            return False
     store.write(
         BRIEF_REL,
         body,
-        metadata={"title": "作者创作需求（brief）", "brief_fields": fields or {}},
+        metadata=metadata,
         commit_message="记录作者创作需求（brief）",
     )
     return True
+
+
+def read_brief_fields(store: MdStore) -> dict:
+    """直读 brief 的结构化字段（frontmatter `brief_fields`）。
+
+    为什么需要单独一个入口：正文渲染时结构化字段已经被渲染进 brief 正文（人读友好），
+    但**布尔开关类字段**（如 `allow_realism`）必须能被程序读回，不能靠解析自然语言。
+    文件缺失/字段缺失/脏值一律返回空 dict（旧书向后兼容）。
+    """
+    if not store.exists(BRIEF_REL):
+        return {}
+    try:
+        fields = store.read(BRIEF_REL).metadata.get("brief_fields")
+    except Exception as exc:  # noqa: BLE001 - 元数据损坏不得阻断生成
+        logger.warning("读取 brief 结构化字段失败（按未设置处理）：%s", exc)
+        return {}
+    return fields if isinstance(fields, dict) else {}
+
+
+def allow_realism(store: MdStore) -> bool:
+    """作者是否要求「现实合理性约束」（默认 **否** = 以作者创作目标为准）。
+
+    真实来源优先级：brief 结构化字段 → brief 正文里的显式行 → 默认 False。
+    正文兜底是为了兼容"字段机制之前就写好的旧书"（用户手写一行也能生效）。
+    """
+    from src.agents.reality_policy import BRIEF_FIELD_KEY, normalize_allow_realism
+
+    fields = read_brief_fields(store)
+    if BRIEF_FIELD_KEY in fields:
+        return normalize_allow_realism(fields.get(BRIEF_FIELD_KEY))
+    if not store.exists(BRIEF_REL):
+        return False
+    for line in store.read(BRIEF_REL).content.splitlines():
+        text = line.strip().lstrip("-*").strip()
+        if text.startswith(f"{BRIEF_FIELD_KEY}：") or text.startswith(f"{BRIEF_FIELD_KEY}:"):
+            _, _, value = text.replace("：", ":").partition(":")
+            return normalize_allow_realism(value)
+    return False
 
 
 def read_custom_constraints(store: MdStore) -> str:
@@ -120,6 +174,9 @@ class ChapterContext:
     style_guide: str = ""                                        # ⑥文风指纹（style.md 直读）
     custom_constraints: str = ""                                 # ⑦自定义 Skill 约束（custom-skills.md 直读）
     brief: str = ""                                              # ⑧作者创作需求（brief.md 直读，最高优先级）
+    # ⑨现实性评判口径（默认"以作者目标为准"，不得因"不符合现实"改稿）——
+    # 与 ⑦⑧ 同源（brief.md 的字段），由 reality_policy 单一定义文本。
+    reality_policy: str = ""
 
 
 class MemoryManager:
@@ -273,6 +330,12 @@ class MemoryManager:
         # 与 ⑦ 同级并列（都是"作者指定"），同样**不经向量检索/摘要/裁剪**——
         # 这是问题1 的修法：让每一章生成都能看到作者原话，而不是只看蒸馏物。
         ctx.brief = read_brief(self.store)
+
+        # ⑨ 现实性评判口径（用户要求）：以作者创作目标为准，默认不得因"不符合现实"改稿。
+        # 与 ⑦⑧ 同源同读法（brief.md 的字段），逐章注入写作/审查链路。
+        from src.agents.reality_policy import reality_policy_text
+
+        ctx.reality_policy = reality_policy_text(allow_realism(self.store))
 
         return ctx
 

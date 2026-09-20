@@ -291,6 +291,19 @@ watch(show, (opened) => {
             </label>
           </div>
         </div>
+        <!-- 现实性口径（用户要求）：默认以作者创作目标为准，勾上才允许按现实逻辑提建议 -->
+        <label class="field realism">
+          <span class="realism-row">
+            <input v-model="createForm.fields.allow_realism" type="checkbox" />
+            <span>
+              <b>要求现实合理性约束</b>
+              <small class="muted">
+                默认关闭：审校只以你的创作目标为准，不会因为「不符合现实 / 不合理」要求你改设定或改稿。
+                勾上后才会按现实逻辑（物理 / 生理 / 社会 / 常识）提建议。
+              </small>
+            </span>
+          </span>
+        </label>
         <div class="row">
           <label v-if="createForm.mode === 'pipeline'" class="field half">
             <span class="label">总章数</span>
@@ -475,6 +488,26 @@ watch(show, (opened) => {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 8px 14px;
+}
+/* 现实性口径开关：一行勾选 + 说明（默认关闭 = 以作者创作目标为准） */
+.realism-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 13px;
+  color: #3a3d44;
+  padding: 8px 10px;
+  border: 1px solid #eceef1;
+  border-radius: 8px;
+  background: #f9fafb;
+}
+.realism-row input {
+  margin-top: 3px;
+}
+.realism-row small {
+  display: block;
+  line-height: 1.6;
+  margin-top: 2px;
 }
 .row {
   display: flex;

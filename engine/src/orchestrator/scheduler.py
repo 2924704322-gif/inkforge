@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 
 from src.agents.editor import Editor, negotiate_revision, verdict_of
-from src.agents.writer import chapter_length, length_deviation, length_revision_note
+from src.agents.writer import chapter_length, length_assessment, length_revision_note
 from src.config.app_config import GenerationConfig, get_app_config
 from src.memory.memory_manager import ChapterContext
 from src.orchestrator.state import NovelState, chapter_plans, resolve_chapter_target
@@ -100,7 +100,8 @@ def draft_chapter(pipe, plan: dict, ctx: ChapterContext,
     # 逐章预期字数（问题3）：与主图同一解析入口（大纲预算优先 → 全局默认）；
     # 并行路径此前只用管线级 target，导致"大纲里写了 5000、并行写出来按 3000 判"。
     target = resolve_chapter_target(plan, getattr(pipe.writer, "target_words", None))
-    tolerance = gen.tolerance_for(target) if target else gen.word_count_tolerance
+    # 字数区间（非对称）：与 graph/interactive 同源，落 frontmatter 的数字就是门禁用的数字
+    floor, ceiling = gen.length_bounds(target) if target else (None, None)
     attempt = start_attempt
     draft_text = previous_text
     partial_retries = 0
@@ -109,6 +110,7 @@ def draft_chapter(pipe, plan: dict, ctx: ChapterContext,
     retry_exceeded = False
     review = None
     verdict = "pass"
+    length_note = ""
 
     while True:
         result = pipe.writer.write_chapter(
@@ -126,6 +128,7 @@ def draft_chapter(pipe, plan: dict, ctx: ChapterContext,
             "status": "draft",
             "attempt": attempt,
             "target_words": target,
+            "words": chapter_length(draft_text),
             "model": f"{result.provider_name}/{result.model}",
             "used_fallback": result.used_fallback,
         }
@@ -138,21 +141,24 @@ def draft_chapter(pipe, plan: dict, ctx: ChapterContext,
             pipe.store.write(rel, draft_text, metadata=meta,
                              commit_message=f"ch-{chapter:03d} 第 {attempt} 稿（并行起草）")
 
-        review = pipe.editor.review_chapter(ctx, draft_text, attempt, target_words=target)
+        review = pipe.editor.review_chapter(
+            ctx, draft_text, attempt, target_words=target,
+            length_bounds=(floor, ceiling) if target else None,
+        )
         verdict = verdict_of(review.overall)
 
-        # 字数门禁：质量 pass 但字数超差 → 追加一次字数修正（保留上一稿，不协商）
+        # 字数门禁：质量 pass 但字数落到区间外 → 追加一次字数修正（保留上一稿，不协商）
         length_note = ""
         if target is not None and gen.length_gate_enabled:
             actual = chapter_length(draft_text)
-            if length_deviation(actual, target) > tolerance:
-                length_note = length_revision_note(target, actual, tolerance)
+            if length_assessment(target, actual, floor, ceiling) != "pass":
+                length_note = length_revision_note(target, actual, floor, ceiling)
 
         if verdict == "pass":
             if length_note and length_retries < gen.max_length_retries:
                 logger.info(
-                    "第 %d 章字数门禁触发：偏差 %+d 字 → 追加字数修正",
-                    chapter, chapter_length(draft_text) - target,
+                    "第 %d 章字数门禁触发：实际 %d / 目标 %d（可接受 %d-%d）→ 追加字数修正",
+                    chapter, chapter_length(draft_text), target, floor, ceiling,
                 )
                 length_retries += 1
                 revision_notes = length_note
@@ -191,7 +197,11 @@ def draft_chapter(pipe, plan: dict, ctx: ChapterContext,
             break
 
     actual_words = chapter_length(draft_text)
-    dev = length_deviation(actual_words, target) if target is not None else None
+    dev = (actual_words - target) if target is not None else None
+    in_band = (
+        length_assessment(target, actual_words, floor, ceiling) == "pass"
+        if target is not None else None
+    )
     return {
         "chapter": chapter,
         "volume": volume,
@@ -204,9 +214,12 @@ def draft_chapter(pipe, plan: dict, ctx: ChapterContext,
         # 实际生成用的接入点/模型与降级标记（随记录传递到人审展示）
         "model": f"{result.provider_name}/{result.model}",
         "used_fallback": result.used_fallback,
-        # 字数统计
+        # 字数统计：带符号偏差 + 是否落在可接受区间（前端审阅卡据此显示"合格/不合格"）
         "words": actual_words,
         "length_deviation": dev,
+        "length_floor": floor,
+        "length_ceiling": ceiling,
+        "length_ok": in_band,
         # 上下文随记录传递：人审通过后 finalize（摘要/回写）需要伏笔清单等
         "ctx": asdict(ctx),
     }

@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 
-import { NInput, useMessage } from 'naive-ui'
-import { api, scoreColor, withNovel } from '../api'
+import { NInput, NInputNumber, NRadio, NRadioGroup, useMessage } from 'naive-ui'
+import { api, lengthBounds, scoreColor, withNovel } from '../api'
+import { useWordTarget } from '../composables/useWordTarget'
 import type { InteractiveState, PlotCard } from '../types'
 
 /**
@@ -24,6 +25,86 @@ const rejectFeedback = ref('')
 const busy = ref(false)
 const showCustom = ref(false)
 const message = useMessage()
+
+// ---------- 预期字数（生成前可设；打回可改）----------
+// 走 useWordTarget：用户改过之后，**任何服务端快照刷新/组件重挂载都不会把数字顶回去**
+// （用户实测：手改后点一下输入框外面就弹回 3000 —— 根因就是轮询快照覆盖编辑态）。
+/** 引擎当前生效的目标（未开始时为服务默认值）。 */
+const serverTarget = computed(() => props.state.target_words ?? null)
+/** 本条草稿回带的目标（写作/评分/门禁实际用的那个数）。 */
+const draftTarget = computed(() => props.state.draft?.target_words ?? null)
+const draftKey = computed(
+  () => `${props.state.chapter}-${props.state.draft?.attempt ?? 0}`,
+)
+
+/** 生成前设定（选卡阶段）：随章重置，避免上一章的字数悄悄带进新章。 */
+const preTarget = useWordTarget({
+  suggested: serverTarget,
+  effective: serverTarget,
+  resetWhen: computed(() => props.state.chapter),
+})
+/** 打回重写时改目标：随章/随稿重置，未改则沿用引擎生效值。 */
+const reviewTarget = useWordTarget({
+  suggested: computed(() => draftTarget.value ?? serverTarget.value),
+  effective: computed(() => draftTarget.value ?? serverTarget.value),
+  resetWhen: draftKey,
+})
+/** 打回模式：定向修订（保留未点名内容）/ 整章重写（不携带上一稿）。 */
+const revisionMode = ref<'targeted' | 'rewrite'>('targeted')
+
+// 顶层化 ref（模板里不必写 .value；组合式函数内部仍是完整对象）
+const preWords = preTarget.display
+const preWordsDirty = preTarget.dirty
+const reviewWords = reviewTarget.display
+const reviewWordsDirty = reviewTarget.dirty
+
+/** 本条草稿的字数体检：目标 / 实际 / 可接受区间。 */
+const draftBounds = computed(() =>
+  lengthBounds(
+    draftTarget.value ?? serverTarget.value,
+    props.state.draft?.words ?? (props.state.draft?.draft_text || '').length,
+    props.state.draft?.length_floor,
+    props.state.draft?.length_ceiling,
+  ),
+)
+
+/** 生成前设定的字数落到区间上的提示（下浮 500 是硬线，上浮 2000 内都算合格）。 */
+const boundsHint = computed(() => {
+  const t = preTarget.display.value ?? serverTarget.value
+  if (!t) return '生成前可设定本章预期字数'
+  const b = lengthBounds(t, null, props.state.length_floor, props.state.length_ceiling)
+  return b ? `可接受 ${b.floor}-${b.ceiling} 字（下浮不超过 500）` : ''
+})
+
+const DIMS = [
+  { key: 'consistency', label: '设定一致性' },
+  { key: 'plot', label: '大纲符合度' },
+  { key: 'continuity', label: '衔接连贯性' },
+  { key: 'prose', label: '文笔质量' },
+] as const
+
+/**
+ * 一键把审校建议并入打回意见。
+ *
+ * 由来（用户实测）：多维评分给出的「建议」是分散条目，用户手动复制贴进打回框时
+ * 容易漏项、也容易被自己重写措辞——Writer 收到的意见与审校实际建议不一致，
+ * 于是"再次生成的内容仍有较大问题"。这里把逐条建议按序号原样合并，保证
+ * 送进重写链路的意见 == 审校看到的建议。
+ */
+const mergeSuggestions = (): void => {
+  const issues = props.state.draft?.review?.issues ?? []
+  const lines = issues.map((it, i) => {
+    const dim = DIMS.find((d) => d.key === it.dimension)?.label ?? it.dimension
+    const head = `${i + 1}. [${dim}] ${it.description}`
+    return it.suggestion ? `${head}\n   → 建议：${it.suggestion}` : head
+  })
+  if (!lines.length) return
+  const block = `【按审校建议逐条修改】\n${lines.join('\n')}`
+  rejectFeedback.value = rejectFeedback.value.trim()
+    ? `${rejectFeedback.value.trim()}\n\n${block}`
+    : block
+  message.success(`已并入 ${lines.length} 条审校建议，可再补充你自己的要求`)
+}
 
 const STATUS_LABEL: Record<string, string> = {
   idle: '未开始',
@@ -92,6 +173,8 @@ const choose = (cardId: string, custom = ''): void => {
     await api('POST', withNovel('/api/interactive/choose', props.novelId), {
       card_id: cardId,
       custom_text: custom,
+      // 生成前设定的预期字数（undefined 时省略该键 → 引擎回落默认值）
+      target_words: preTarget.payload.value,
     })
     customText.value = ''
   }, '选卡写章')
@@ -111,18 +194,14 @@ const decide = (action: 'approve' | 'reject'): void => {
     await api('POST', withNovel('/api/interactive/decision', props.novelId), {
       action,
       feedback: rejectFeedback.value.trim(),
-      revision_mode: 'targeted',
+      // 打回时可选「整章重写」（此前硬编码 targeted，用户拿大面积意见也换不来重写）
+      revision_mode: revisionMode.value,
+      // 打回时改了预期字数 → 按新目标重写；未改则沿用引擎生效值
+      target_words: action === 'reject' ? reviewTarget.payload.value : undefined,
     })
     rejectFeedback.value = ''
   }, action === 'approve' ? '定稿入库' : '打回重写')
 }
-
-const DIMS = [
-  { key: 'consistency', label: '设定一致性' },
-  { key: 'plot', label: '大纲符合度' },
-  { key: 'continuity', label: '衔接连贯性' },
-  { key: 'prose', label: '文笔质量' },
-] as const
 
 /** 四维均分（与自由创作的人审同一口径）。 */
 function avgScore(): number | null {
@@ -198,6 +277,23 @@ function pickCard(card: PlotCard): void {
     <!-- 选卡 -->
     <template v-else-if="state.status === 'awaiting_choice' && state.cards?.length">
       <div class="ic-body">我为第 {{ state.chapter }} 章设计了三条方向互斥的主线走向，请选择其一：</div>
+      <!-- 预期字数（生成**之前**设定）：写作 / 评分 / 字数门禁读的都是这个数 -->
+      <div class="ic-target-row">
+        <span class="ic-target-label">本章预期字数</span>
+        <NInputNumber
+          v-model:value="preWords"
+          size="small"
+          :min="500"
+          :max="20000"
+          :step="500"
+          :placeholder="serverTarget ? String(serverTarget) : '默认'"
+          style="width: 140px"
+        />
+        <span class="muted">{{ boundsHint }}</span>
+        <button v-if="preWordsDirty" class="link-btn" @click="preTarget.reset()">
+          恢复默认
+        </button>
+      </div>
       <div
         v-for="card in state.cards"
         :key="card.card_id"
@@ -261,6 +357,34 @@ function pickCard(card: PlotCard): void {
           {{ d.label }} {{ state.draft.review[d.key] }}
         </span>
         <span class="ic-score is-default">字数 {{ state.draft.review.length }}</span>
+        <!-- 目标 vs 实际：把"字数是否达标"从模型自评分变成可核对的两个数字 -->
+        <span
+          v-if="draftBounds"
+          class="ic-score"
+          :class="draftBounds.ok ? 'is-success' : 'is-error'"
+        >
+          目标 {{ draftBounds.target }}
+          / 实际 {{ draftBounds.actual }}（{{ draftBounds.deviation >= 0 ? '+' : '' }}{{ draftBounds.deviation }} 字，
+          可接受 {{ draftBounds.floor }}-{{ draftBounds.ceiling }} 字）
+          {{ draftBounds.ok ? '✓' : (draftBounds.actual < draftBounds.floor ? '· 不足' : '· 超出') }}
+        </span>
+      </div>
+      <div class="ic-target-row">
+        <span class="ic-target-label">预期字数</span>
+        <NInputNumber
+          v-model:value="reviewWords"
+          size="small"
+          :min="500"
+          :max="20000"
+          :step="500"
+          style="width: 140px"
+        />
+        <span class="muted">
+          打回时按此目标重写（下浮 500 是硬线）<template v-if="reviewWordsDirty"> · 已改</template>
+        </span>
+        <button v-if="reviewWordsDirty" class="link-btn" @click="reviewTarget.reset()">
+          恢复默认
+        </button>
       </div>
       <div v-if="state.draft.review?.comment" class="ic-comment">{{ state.draft.review.comment }}</div>
       <div v-if="state.draft.review?.issues?.length" class="ic-issues">
@@ -271,15 +395,37 @@ function pickCard(card: PlotCard): void {
           <span>{{ it.description }}</span>
           <div v-if="it.suggestion" class="ic-sug">建议：{{ it.suggestion }}</div>
         </div>
+        <!-- 一键并入：避免"手动复制建议时漏项/改词"导致重写不按建议走 -->
+        <button class="ghost-btn" :disabled="busy" @click="mergeSuggestions">
+          ↳ 把以上 {{ state.draft.review.issues.length }} 条建议并入打回意见
+        </button>
+      </div>
+      <!-- 正文预览：可**上下拉伸**（右下角拖拽）。
+           由来（用户实测）：固定 max-height:260px 太矮，长正文看不方便；
+           这里给 resize:vertical + 最小/最大高度，拖高后正文跟着长高、不再各处挤着看。 -->
+      <div class="draft-head">
+        <span class="muted">正文预览（右下角可上下拖拽调整高度）</span>
+        <span class="muted">{{ (state.draft.draft_text || '').length }} 字</span>
       </div>
       <div class="draft-box pre-wrap">{{ state.draft.draft_text }}</div>
       <NInput
         v-model:value="rejectFeedback"
         type="textarea"
-        :rows="2"
+        :rows="3"
         size="small"
-        placeholder="打回意见（打回时必填）"
+        placeholder="打回意见（打回时必填）：写清要改什么；也可点上面的「并入建议」把审校意见一次带进来"
       />
+      <div class="ic-actions">
+        <NRadioGroup v-model:value="revisionMode" size="small">
+          <NRadio value="targeted">定向修订</NRadio>
+          <NRadio value="rewrite">整章重写</NRadio>
+        </NRadioGroup>
+        <span class="muted">
+          {{ revisionMode === 'targeted'
+            ? '保留未点名的内容，只改意见涉及处'
+            : '不携带上一稿，按意见重新写一章（大改意见用这个）' }}
+        </span>
+      </div>
       <div class="ic-actions">
         <button class="ghost-btn warn" :disabled="busy" @click="decide('reject')">打回重写</button>
         <button class="primary-btn" :disabled="busy" @click="decide('approve')">通过，定稿入库</button>
@@ -413,6 +559,22 @@ function pickCard(card: PlotCard): void {
   display: flex;
   gap: 8px;
 }
+/* 预期字数（生成前设定 / 打回时改目标）：写作、评分、门禁读的都是这个数 */
+.ic-target-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: #ffffff;
+  border: 1px solid #e2e8f5;
+  font-size: 12px;
+}
+.ic-target-label {
+  font-weight: 600;
+  color: #3a3d44;
+}
 .ic-scores {
   display: flex;
   gap: 6px;
@@ -472,9 +634,23 @@ function pickCard(card: PlotCard): void {
 .ic-sug {
   color: #116932;
 }
+.draft-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 8px 0 4px;
+  font-size: 12px;
+}
 .draft-box {
-  max-height: 260px;
-  overflow-y: auto;
+  /* 可上下拉伸：resize 需要 overflow != visible 才生效（原先就是 overflow-y:auto ✓）。
+     高度用**兜底 320px + 可拉伸 1200px 上限**：拖大后正文整段放得下，
+     拖到最小也不会挤成一条缝；拉伸只影响本框，不改变对话框整体布局。 */
+  height: 320px;
+  min-height: 120px;
+  max-height: 1200px;
+  resize: vertical;
+  overflow: auto;
   border: 1px solid #e5e7eb;
   border-radius: 8px;
   padding: 10px 12px;

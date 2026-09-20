@@ -88,6 +88,8 @@ def ensure_outline(pipe, brief: str, total_chapters: int,
             outline_out = pipe.architect.generate_settings(
                 effective_brief, total_chapters,
                 custom_constraints=read_custom_constraints(pipe.store),
+                # 单章预期字数：与串行路径同源（管线级默认/作者指定）
+                chapter_words=getattr(pipe.writer, "target_words", None),
             )
             outline = outline_out.model_dump()
         pipe.memory.rebuild_index()

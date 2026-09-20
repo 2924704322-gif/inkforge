@@ -8,7 +8,10 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
-    "typecheck": "vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json"
+    "typecheck": "vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json",
+    "check:word-target": "node scripts/check-word-target.mjs",
+    "check:spawn-pick": "node scripts/check-spawn-pick.mjs",
+    "check:renderer": "npm run check:word-target && npm run check:spawn-pick"
   },
   "dependencies": {
     "diff": "^8.0.2",

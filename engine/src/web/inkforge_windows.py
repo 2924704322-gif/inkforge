@@ -292,11 +292,19 @@ def register_windows_api(app: Any, hub: Any, default_novel: str) -> None:
 
         novel_id = body.novel_id.strip()
         title = body.title.strip() or novel_id
-        if not novel_id:
-            raise HTTPException(400, "请填写新书标识（目录名，仅限字母/数字/下划线/连字符）")
+        if not title:
+            raise HTTPException(400, "请填写新书书名")
+        # 标识缺省/非法一律**由书名派生**（§5.A4）：二开建书是"给新书起个名"的轻量动作，
+        # 用户填的多半是中文书名；原先非 ASCII 标识直接 400，等于逼用户先想英文目录名。
+        if not library_svc.NOVEL_ID_RE.match(novel_id):
+            taken = {b["novel_id"] for b in library_svc.list_books()}
+            novel_id = library_svc.derive_novel_id(title, taken)
+            logger.info("二开建书：标识缺失/非法，按书名派生 novel_id=%s（title=%r）",
+                        novel_id, title)
         mode = body.mode if body.mode in ("pipeline", "interactive") else "interactive"
         try:
-            library_svc.create_book(novel_id, mode)
+            # title 必须落盘：修复前它算出来只进了回执，书架只能回落目录名（用户实测"书名消失"）
+            library_svc.create_book(novel_id, mode, title=title)
         except library_svc.LibraryError as exc:
             raise HTTPException(409 if exc.code == "conflict" else 400, exc.message) from exc
         except ValueError as exc:
@@ -356,7 +364,10 @@ def register_windows_api(app: Any, hub: Any, default_novel: str) -> None:
         for m in picked:
             cat = m.category
             counts[cat] = counts.get(cat, 0) + 1
-            by_book[m.source_book] = by_book.get(m.source_book, 0) + 1
+            # 来源书可能为空（手工素材 / 旧数据）：归一到 NO_SOURCE_BOOK，
+            # 否则 by_book 里会出现 None 键，回执 JSON 序列化不安全。
+            src_book = (m.source_book or "").strip() or materials_svc.NO_SOURCE_BOOK
+            by_book[src_book] = by_book.get(src_book, 0) + 1
             if cat == materials_svc.CAT_STYLE:
                 style_blocks.append(f"- 【{m.title}】{m.content}")
             elif cat in (materials_svc.CAT_TECHNIQUE, materials_svc.CAT_PLOT,
