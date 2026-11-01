@@ -1,6 +1,6 @@
 # Inkforge 引擎依赖锁文件（S1-1）
 #
-# 由开发验证环境（conda env langchain1.2 / Python 3.13.12）实测导出并人工收敛。
+# 由开发验证环境（Python 3.13.12）实测导出并人工收敛。
 # 用途：`pip install -r engine/requirements.lock` 得到与验证环境一致的依赖树，
 # 消除 requirements.txt 只写 `>=` 带来的「构建不可复现」问题。
 #

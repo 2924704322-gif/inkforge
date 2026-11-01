@@ -50,7 +50,6 @@ engine/.smoke/
 # 冒烟测试写出的临时文件（历史遗留：曾经把 e2e 日志写在仓库根内）
 engine/e2e.txt
 engine/smoke-state.json
-engine/smoke-state.json
 docs/_*.png
 docs/step*.png
 
@@ -60,9 +59,17 @@ docs/step*.png
 .DS_Store
 Thumbs.db
 
-# �ύ��Ϣ��ʱ�ļ�
+# 提交信息临时文件
 COMMIT_MSG_TMP.txt
 .git/COMMIT_MSG_TMP
+
+# ─────────── 备份 / 临时副本（不随仓库分发） ───────────
+*.bak
+*.bak-*
+*.orig
+*.rej
+*~
+
 # ─────────── 本地内部文档 ───────────
 # docs/ 是本地内部文档（架构/状态/测试报告/历史分析），**不随公开仓库分发**。
 # 注意：scripts/check_doc_paths.py 已适配——该目录不存在时自动跳过相关引用校验。

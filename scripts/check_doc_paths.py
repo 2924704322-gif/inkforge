@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import glob
 import re
-import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -34,7 +33,7 @@ _HAS_LOCAL_DOCS = (REPO / "docs").exists()
 RESOLVE_ROOTS = [Path("."), Path("engine"), Path("apps/desktop"), Path("apps/desktop/src")]
 
 # 只把「看起来确实是本仓库文件」的引用纳入校验：
-# 必须带下列后缀之一。否则 `conda env langchain1.2` 这类带点的词会被误判为路径。
+# 必须带下列后缀之一。否则 `conda env xxx` 这类带点的词会被误判为路径。
 PATH_EXTENSIONS = (
     ".py", ".ts", ".vue", ".js", ".md", ".json", ".yaml", ".yml",
     ".txt", ".css", ".html", ".toml", ".sh", ".bat", ".lock", ".cfg", ".ini",
@@ -58,7 +57,6 @@ IGNORE_SUBSTRINGS = (
 
 # 已知的外部工具/约定文件名，不作为本仓库路径校验
 SKIP_EXACT = {
-    "deepwrite.json",
     "catalog-registry.json",
     "models.yaml",       # 已按 configs/models.yaml 校验
     "requirements.txt",
