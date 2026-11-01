@@ -54,9 +54,47 @@ const STATUS_IDLE = {
   metrics: { total_chapters: 12, approved: 0, first_pass_rate: null, avg_score: null },
 }
 
+/** 模型配置桩：一个真实形状的接入点 + 三个角色绑定（含对话输入框徽标用的 master/prose）。
+ *
+ *  api_key 特意写成 `${PROBE_API_KEY}` 而不是 `****`：引擎对占位符是不掩码的
+ *  （它本来就不是秘密），所以「编辑接入点」弹窗拿到的就是这串占位符。探针据此守住
+ *  「点获取模型时不得把占位符当字面量密钥回传」（2026-09-21 线上实测的报错来源）。
+ */
+const MODEL_CONFIG = {
+  providers: [
+    {
+      name: 'probe-provider',
+      type: 'openai_compat',
+      base_url: 'http://probe.invalid/v1',
+      api_key: '${PROBE_API_KEY}',
+      headers: { 'x-opencode-session': 'probe-session-1' },
+    },
+    // 第二个接入点：用来验「行内换接入点」（新增接入点后必须能在角色行里选到它）
+    {
+      name: 'probe-second',
+      type: 'openai_compat',
+      base_url: 'http://probe.invalid/v2',
+      api_key: '****',
+      // 也带头：探针点「编辑」时命中的是最后一个接入点行，两边都带头断言才稳定
+      headers: { 'x-opencode-session': 'probe-session-2' } as Record<string, string>,
+    },
+  ],
+  roles: [
+    { role: 'master', provider: 'probe-provider', model: 'probe-master-model', temperature: 0.8 },
+    { role: 'prose', provider: 'probe-provider', model: 'probe-prose-model', temperature: 0.7 },
+    { role: 'writer', provider: 'probe-provider', model: 'probe-old-model', temperature: 0.7 },
+  ],
+  path: '/tmp/models.yaml',
+}
+
+/** 接入点 /models 的返回：故意不含 probe-old-model 之外的其它型号，便于断言「候选来自接口」。
+ *  probe-second 给一份完全不同的清单，用来验「换接入点后模型也跟着落到新清单里的值」。 */
+const MODEL_LIST = ['probe-large', 'probe-old-model', 'probe-small']
+const MODEL_LIST_SECOND = ['probe-alt-1', 'probe-alt-2']
+
 const calls: string[] = []
 
-function route(method: string, path: string): { status: number; data: unknown } {
+function route(method: string, path: string, body?: unknown): { status: number; data: unknown } {
   calls.push(`${method} ${path}`)
   const p = (path.split('?')[0] ?? path).replace(/\/$/, '')
   if (p === '/api/books') return { status: 200, data: BOOKS }
@@ -115,8 +153,47 @@ function route(method: string, path: string): { status: number; data: unknown } 
   if (p === '/api/settings/tree') return { status: 200, data: { items: [] } }
   if (p === '/api/chapters') return { status: 200, data: { chapters: [] } }
   if (p === '/api/outline') return { status: 200, data: { html: null } }
-  if (p === '/api/model-config') {
-    return { status: 200, data: { providers: [], roles: [], path: '/tmp/models.yaml' } }
+  if (p === '/api/model-config') return { status: 200, data: MODEL_CONFIG }
+  // 「获取模型」：GET /api/model-config/providers/{name}/models
+  if (p.startsWith('/api/model-config/providers/') && p.endsWith('/models')) {
+    const name = p.split('/')[4] ?? 'probe-provider'
+    const list = name === 'probe-second' ? MODEL_LIST_SECOND : MODEL_LIST
+    return {
+      status: 200,
+      data: { ok: true, provider: name, models: list, count: list.length },
+    }
+  }
+  // 接入点保存：回带改动 + 记录请求头（「保存时是否真的带上了自定义头」要能被断言）
+  if (method === 'PUT' && p.startsWith('/api/model-config/providers/')) {
+    const name = decodeURIComponent(p.split('/').pop() ?? '')
+    const patch = (body ?? {}) as {
+      type?: string
+      base_url?: string
+      headers?: Record<string, string>
+    }
+    const cfg = structuredClone(MODEL_CONFIG)
+    const row = cfg.providers.find((x) => x.name === name)
+    if (row) {
+      if (patch.type) row.type = patch.type
+      if (patch.base_url) row.base_url = patch.base_url
+      if (patch.headers) row.headers = patch.headers
+    }
+    calls.push(`HEADERS ${JSON.stringify(patch.headers ?? null)}`)
+    return { status: 200, data: { ok: true, ...cfg } }
+  }
+  // 角色绑定保存：把改动回带（前端会把返回值直接当新的 config 视图用），
+  // 于是「选完模型后行内下拉要显示新值」这条断言才验得到真东西。
+  if (method === 'PUT' && p.startsWith('/api/model-config/roles/')) {
+    const role = decodeURIComponent(p.split('/').pop() ?? '')
+    const cfg = structuredClone(MODEL_CONFIG)
+    const patch = (body ?? {}) as { provider?: string; model?: string; temperature?: number }
+    const row = cfg.roles.find((r) => r.role === role)
+    if (row) {
+      if (patch.provider) row.provider = patch.provider
+      if (patch.model) row.model = patch.model
+      if (typeof patch.temperature === 'number') row.temperature = patch.temperature
+    }
+    return { status: 200, data: { ok: true, ...cfg } }
   }
   if (p === '/api/dashboard') {
     return {
@@ -132,7 +209,7 @@ function route(method: string, path: string): { status: number; data: unknown } 
 }
 
 ;(window as unknown as Record<string, unknown>)['inkforge'] = {
-  request: async (method: string, path: string) => {
+  request: async (method: string, path: string, body?: unknown) => {
     // POST /api/chats 要回一个会话对象，前端才会拿到 chatId
     const p = (path.split('?')[0] ?? path).replace(/\/$/, '')
     if (method === 'POST' && p === '/api/chats') {
@@ -142,7 +219,7 @@ function route(method: string, path: string): { status: number; data: unknown } 
         data: { ok: true, chat: { id: 'c-probe', agent: 'master', title: '', created: 0, messages: [] } },
       }
     }
-    return route(method, path)
+    return route(method, path, body)
   },
   engineState: async () => ({ state: 'ready', port: 8137, message: '探针就绪' }),
   onEngineState: () => () => undefined,

@@ -1,8 +1,8 @@
-"""Inkforge 提案-审阅流（照抄 DeepWrite 的 proposal-first 逻辑）。
+"""Inkforge 提案-审阅流（proposal-first 逻辑）。
 
 对话智能体的改稿动作不直接写盘：产出「变更提案」（原文快照 + 提案全文 + 行级
 hunk diff + 增删统计），由用户接受或拒绝；接受时校验基础版本（文档若已被人工
-改动则返回 conflict，不覆盖最新内容）。提案状态机与 DeepWrite 对齐：
+改动则返回 conflict，不覆盖最新内容）。提案状态机：
 pending → accepting → accepted / rejected / conflict / error。
 
 审批模式：request-approval（每次审批）与 auto-approve（替我审批——接受动作
@@ -87,7 +87,7 @@ def _score(value: object, default: float = 0.0) -> float:
         return default
 
 
-# ---------- 行级 diff（DeepWrite 的 hunk 结构） ----------
+# ---------- 行级 diff（hunk 结构） ----------
 
 
 def _build_hunks(original: str, proposed: str) -> tuple[list[dict], int, int, bool]:

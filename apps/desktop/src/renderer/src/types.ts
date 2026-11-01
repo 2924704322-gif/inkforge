@@ -282,6 +282,24 @@ export interface ProviderInfo {
   type: string
   base_url?: string
   api_key?: string
+  /** api_key 是 ${ENV_VAR} 时，该环境变量是否已在引擎进程里配置（null=不是占位符）。 */
+  key_env_set?: boolean | null
+  /** 自定义请求头（如 OpenCode Go 必需 `x-opencode-session`）。 */
+  headers?: Record<string, string>
+}
+
+/**
+ * 接入点可用模型清单（GET /api/model-config/providers/{name}/models）。
+ *
+ * ok=false 时不是 HTTP 错误而是**可读原因**（缺环境变量 / Key 被拒 / 网络不通 /
+ * 端点没实现 /models），直接展示 error 即可。
+ */
+export interface ProviderModels {
+  ok: boolean
+  provider: string
+  models: string[]
+  count: number
+  error?: string
 }
 
 export interface ModelConfigView {
@@ -474,6 +492,138 @@ export interface ForgeResult {
   isolation: string
 }
 
+/* ══════════ 正文改写（创作功能第四项） ══════════ */
+
+/**
+ * 正文改写智能体的名片（`GET /api/revision/agent`）。
+ *
+ * 与约束提炼的名片同形，但多一条 `book_reads`：本模块**默认读不到作品库**，
+ * 只有作者显式打开「读当前书」时才会读这一本的两份文件 —— UI 用橙色声明把它显出来。
+ */
+export interface RevisionAgentInfo {
+  key: string
+  label: string
+  role: string
+  prompt: string
+  limits: {
+    source_max: number
+    source_min: number
+    requirement_max: number
+    constraints_max: number
+    anchors_max: number
+    lock_max: number
+  }
+  modes: { value: string; label: string }[]
+  sees: string[]
+  never_sees: string[]
+  /** 打开「读当前书」后会读到的文件（中文说明，直接展示） */
+  book_reads: string[]
+}
+
+/** 改动对照里的一段（keep / edit / insert / delete 四类）。 */
+export interface RevisionSegment {
+  kind: 'keep' | 'edit' | 'insert' | 'delete'
+  /** 原文段号（1 起；insert 无此字段，用 after_index） */
+  index?: number
+  /** insert 的插入位置（在其后） */
+  after_index?: number
+  /** 改后文本（keep / edit / insert） */
+  text?: string
+  /** 改前文本（edit / delete） */
+  before?: string
+}
+
+/** 一次改写的统计与自检。 */
+export interface RevisionChecks {
+  minimal_edit: {
+    ok: boolean
+    hard: boolean
+    soft: boolean
+    out_of_scope: { index: number; head: string; kind?: 'merged' | 'changed' }[]
+    tolerance: number
+    /** 被并进其它段落的源段号（内容还在，只告警） */
+    merged?: number[]
+    /** 内容真的消失了的源段号（硬违规） */
+    lost?: number[]
+    /** 本轮按哪个作用范围判的：local（只准动点名处）/ global（整篇都该动） */
+    scope?: 'local' | 'global'
+    /** 收敛过程中放宽过什么（如实回报，不悄悄降要求） */
+    relaxed?: string[]
+  }
+  locked: { ok: boolean; missing: string[] }
+  whole_returned: { ok: boolean; similarity: number }
+}
+
+export interface RevisionStats {
+  paras: number
+  kept: number
+  edited: number
+  inserted: number
+  deleted: number
+  before_chars: number
+  after_chars: number
+  /** 并段处数（内容仍在，只是段结构变了） */
+  merged?: number
+  /** 内容丢失的段数（硬违规计数） */
+  lost?: number
+  unchanged: boolean
+}
+
+export interface RevisionStyleShift {
+  ok: boolean
+  before: Record<string, number>
+  after: Record<string, number>
+  delta: Record<string, number>
+}
+
+/** 一次改写的完整结果（`POST /api/revision/rewrite`）。 */
+export interface RevisionResult {
+  ok: boolean
+  agent: { key: string; label: string }
+  /** 生效模式（expand / rewrite / insert / replace / rewrite_all） */
+  mode: string
+  mode_label: string
+  /** 模式是怎么定的：命中的关键词，或「用户指定」 */
+  mode_reason: string
+  /** 要求的作用范围：local 局部（只动点名处）/ global 全篇（整篇都该动） */
+  scope: 'local' | 'global'
+  scope_label: string
+  /** 范围是怎么判的（命中的判据） */
+  scope_reason: string
+  /** 改好后的整篇正文 */
+  revised: string
+  segments: RevisionSegment[]
+  stats: RevisionStats
+  checks: RevisionChecks
+  summary: string
+  style_shift: RevisionStyleShift
+  constraints: { count: number; declared_priority: boolean }
+  anchors: { index: number; text: string; quote: string }[]
+  locked: number
+  role: string
+  model: string
+  provider: string
+  elapsed: number
+  /** 引擎回执的输入边界复述（读了什么、没读什么） */
+  isolation: string
+}
+
+/** 跨组件交接：把某处的原文/要求预填进侧窗（创作空间 / 人审卡 / 墨师动作都用它）。 */
+export interface RevisionPrefill {
+  /** 原文 */
+  source: string
+  /** 改写要求（可为空，由用户自己写） */
+  requirement?: string
+  /** 模式（auto 或缺省 = 自动判定） */
+  mode?: string
+  /** 锚点：原文段落序号（1 起，表示"在它之后改"） */
+  anchorIndex?: number
+  /** 来源标签（面包屑：从哪打开的这个模块） */
+  origin?: string
+  /** 回填目标：人审卡回填草稿用 */
+  fillBack?: { chapter: number; novelId: string } | null
+}
+
 export interface PlotCard {
   card_id: string
   title: string
@@ -517,6 +667,18 @@ export interface InteractiveState {
   error_hint?: string
   /** 本次会话绑定的 角色→provider/model，排障用 */
   models?: Record<string, string>
+  /**
+   * 最近一次「删除本章工作内容并回退到出卡」的结果（无则为 null）。
+   * removed = 实际删掉的文件（本书根目录下的相对路径）；missing = 本来就不存在、跳过删除的。
+   */
+  last_discard?: { chapter: number; removed: string[]; missing: string[] } | null
+  /**
+   * 快照版本（引擎按状态算的哈希）：内容没变时前端整帧跳过，
+   * 避免每 2.5 秒把整章正文重新渲染一遍（用户实测的输入卡顿）。
+   */
+  version?: string
+  /** 草稿/卡片状态的单调版本号（与 version 配合用于判断"这一帧有没有实质变化"）。 */
+  draft_version?: number
 }
 
 

@@ -15,9 +15,10 @@ import {
   NTag,
   useMessage,
 } from 'naive-ui'
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 
 import { api, lengthBounds, scoreColor, withNovel } from '../api'
+import { openRevision } from '../store'
 import { useWordTarget } from '../composables/useWordTarget'
 import type { PendingItem, StatusSnapshot } from '../types'
 import DiffView from './DiffView.vue'
@@ -148,6 +149,34 @@ const revisionMode = ref<'targeted' | 'rewrite'>('targeted')
 const submitting = ref(false)
 const pausing = ref(false)
 
+/**
+ * 等待计时 + 逃生出口：遮罩期间若请求挂住，超 20 秒允许用户把界面拿回来。
+ * 只清**本地** submitting，不取消服务端任务（下一次轮询会带回真实状态）。
+ */
+const submittingStartedAt = ref(0)
+const nowTick = ref(Date.now())
+const submittingSeconds = computed(() =>
+  submitting.value
+    ? Math.max(0, Math.round((nowTick.value - submittingStartedAt.value) / 1000))
+    : 0,
+)
+const canGiveUp = computed(() => submitting.value && submittingSeconds.value >= 20)
+let tickTimer: ReturnType<typeof setInterval> | null = null
+watch(submitting, (v) => {
+  if (v) {
+    submittingStartedAt.value = Date.now()
+    nowTick.value = Date.now()
+    if (!tickTimer) tickTimer = setInterval(() => (nowTick.value = Date.now()), 1000)
+  } else if (tickTimer) {
+    clearInterval(tickTimer)
+    tickTimer = null
+  }
+})
+function giveUpWaiting(): void {
+  submitting.value = false
+  message.info('已停止等待；若引擎仍在处理，状态会在下一次刷新时更新')
+}
+
 /** 暂停生成：请求引擎在当前章写完后停下（已停在关卡则立即结束本轮）。 */
 async function pauseRun(): Promise<void> {
   if (pausing.value) return
@@ -186,8 +215,28 @@ function dimensionLabel(dimension: string): string {
   }
 }
 
-async function decide(action: 'approve' | 'reject'): Promise<void> {
-  if (action === 'reject' && !feedback.value.trim()) {
+/**
+ * 「✎ 局部改写」：把这一稿交给「正文改写」，改完回填草稿，再回来决定通过或打回。
+ *
+ * 为什么要有它：人审只有「定向修订 / 整章重写」两个档 —— 前者按意见整章重写，
+ * 后者不携带上一稿。而"这稿总体没问题，就是第 3 段的雨写得太少"这类诉求，
+ * 用哪个都过重。局部改写走的是**最小改动闸门**：只改你点名的地方，其余逐字保留。
+ *
+ * 人审闸门不放松：回填只动**草稿**，通过/打回仍由你点。
+ */
+function openLocalRevision(): void {
+  const c = chapter.value
+  if (!c) return
+  openRevision({
+    source: c.draft_text,
+    requirement: feedback.value.trim(),
+    origin: `自由创作 · 第 ${c.chapter} 章人审`,
+    fillBack: { chapter: c.chapter, novelId: props.novelId },
+  })
+  message.info('已把这一稿送进「正文改写」：改完点「回填本章草稿」，再回来点通过或打回')
+}
+
+async function decide(action: 'approve' | 'reject'): Promise<void> {  if (action === 'reject' && !feedback.value.trim()) {
     message.warning('打回需要填写审阅意见')
     return
   }
@@ -383,7 +432,7 @@ async function decide(action: 'approve' | 'reject'): Promise<void> {
       >
     </template>
 
-    <NDivider style="margin: 10px 0" />
+    <NDivider v-if="gate" style="margin: 10px 0" />
 
     <!-- 逐章确认关卡的决策区：一句话或一个按钮即可放行 -->
     <div v-if="gate" class="decision-area">
@@ -398,33 +447,63 @@ async function decide(action: 'approve' | 'reject'): Promise<void> {
       </div>
     </div>
 
-    <!-- 审阅决策区（sticky：无论正文多长都悬浮可见） -->
-    <div v-if="!gate" class="decision-area">
-      <NInput
-        v-model:value="feedback"
-        type="textarea"
-        :rows="2"
-        placeholder="审阅意见（打回时必填）：例如『第 3 段与角色状态冲突，主角此时应当还在城南』"
-      />
-      <div class="decision-row">
-        <NRadioGroup v-model:value="revisionMode" size="small">
-          <NRadio value="targeted">定向修订</NRadio>
-          <NRadio value="rewrite">整章重写</NRadio>
-        </NRadioGroup>
-        <NSpace>
-          <NButton type="primary" :loading="submitting" @click="decide('approve')">
-            通过
-          </NButton>
-          <NButton type="warning" secondary :loading="submitting" @click="decide('reject')">
-            打回
-          </NButton>
-        </NSpace>
+    <!--
+      审阅决策区：**投送到对话列底部**（ChatPanel 的 #decision-host）。
+      它原来长在卡片末尾：卡片实测 1000~1156px 高、可视只有 597~829px，
+      「通过 / 打回」永远在视野外，用户得先滚 1.5 屏才能做决定。
+      投送后它常驻在输入框上方，且不在 .stream 滚动容器里，永远不会压住正文预览框。
+    -->
+    <Teleport defer to="#decision-host">
+      <div v-if="!gate" class="decision-area">
+        <div class="decision-target">
+          <span class="decision-target-label">审阅</span>
+          <span v-if="chapter">第 {{ chapter.chapter }} 章 · 第 {{ chapter.attempt }} 稿</span>
+          <span v-else-if="outline">《{{ outline.book_title }}》大纲</span>
+          <span v-if="chapter" class="muted">{{ chapter.model }}</span>
+        </div>
+        <NInput
+          v-model:value="feedback"
+          type="textarea"
+          :rows="2"
+          placeholder="审阅意见（打回时必填）：例如『第 3 段与角色状态冲突，主角此时应当还在城南』"
+        />
+        <div class="decision-row">
+          <NRadioGroup v-model:value="revisionMode" size="small">
+            <NRadio value="targeted">定向修订</NRadio>
+            <NRadio value="rewrite">整章重写</NRadio>
+          </NRadioGroup>
+          <NSpace>
+            <NButton type="primary" :loading="submitting" @click="decide('approve')">
+              通过
+            </NButton>
+            <NButton type="warning" secondary :loading="submitting" @click="decide('reject')">
+              打回
+            </NButton>
+            <NButton
+              secondary
+              :disabled="submitting"
+              title="只改你点名的地方（最小改动闸门），改完回填本章草稿，再回来决定通过或打回"
+              @click="openLocalRevision"
+            >
+              ✎ 局部改写
+            </NButton>
+          </NSpace>
+        </div>
       </div>
-    </div>
+    </Teleport>
 
-    <!-- 加载态 -->
-    <NModal v-model:show="submitting" :mask-closable="false">
-      <NSpin size="large" />
+    <!-- 加载态：**必须留逃生口**。
+         由来（用户实测 2026-09-22）：这个遮罩 mask-closable=false，若请求挂住
+         （主进程给长请求的超时可达 30 分钟），遮罩会一直盖住整个界面，
+         表现就是"点不动、打不了字"。现在：①Esc 可关；②超 20 秒给出「放弃等待」。 -->
+    <NModal v-model:show="submitting" :mask-closable="false" :close-on-esc="true">
+      <div class="loading-box">
+        <NSpin size="large" />
+        <div v-if="canGiveUp" class="loading-escape">
+          <span>已等待 {{ submittingSeconds }} 秒…</span>
+          <button class="mini-btn" @click="giveUpWaiting">放弃等待（拿回界面）</button>
+        </div>
+      </div>
     </NModal>
   </div>
 </template>
@@ -486,7 +565,7 @@ async function decide(action: 'approve' | 'reject'): Promise<void> {
 .issue-box {
   background: #f9fafb;
   flex-shrink: 0;
-  max-height: 26vh;
+  max-height: 22vh;
   overflow-y: auto;
   scrollbar-width: thin;
 }
@@ -537,7 +616,7 @@ async function decide(action: 'approve' | 'reject'): Promise<void> {
    */
   flex: 1 1 auto;
   min-height: 140px;
-  max-height: 52vh;
+  max-height: 46vh;
   overflow-y: auto;
   border: 1px solid #e5e7eb;
   border-radius: 6px;
@@ -547,24 +626,51 @@ async function decide(action: 'approve' | 'reject'): Promise<void> {
 }
 .decision-area {
   /*
-   * 决策区曾用 position:sticky; bottom:0 悬浮，代价是它永远盖在滚动内容上——
-   * 卡片被压扁时正好糊住正文预览框（实测重叠 6490–8294px²）。
-   * 改为正常文档流的页脚：正文永不被遮挡，需要时滚动 .stream 即可。
+   * 已经投送到对话列底部（#decision-host），所以这里不再是"卡中卡"，
+   * 而是一条横贯对话列的常驻操作条：不占滚动区、不压正文、不需要滚 1.5 屏才能点。
    */
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
   gap: 8px;
-  background: #ffffff;
-  padding: 10px 12px;
-  border: 1px solid #e5e7eb;
-  border-radius: 10px;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  background: var(--bg-0);
+  padding: 10px 18px 12px;
+}
+.decision-target {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fs-12);
+  color: var(--ink-3);
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.decision-target-label {
+  font-weight: 700;
+  color: var(--ink-4);
+  letter-spacing: 0.04em;
 }
 .decision-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+/* naive-ui 的单选组默认会竖着堆，窄列下「定向修订 / 整章重写」各占一行 */
+.decision-row :deep(.n-radio-group) {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 14px;
+}
+.decision-row :deep(.n-radio) {
+  white-space: nowrap;
+}
+.decision-row :deep(.n-space) {
+  flex-wrap: wrap;
+  row-gap: 6px;
 }
 /* 预期字数（问题3）：生成前/打回时都能改，写作-评分-门禁同一目标 */
 .target-row {
@@ -594,6 +700,23 @@ async function decide(action: 'approve' | 'reject'): Promise<void> {
 }
 .mini-btn:hover:not(:disabled) {
   background: #f0f1f3;
+}
+/* 加载遮罩里的逃生出口：请求挂住时用户能立刻把界面拿回来 */
+.loading-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+.loading-escape {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: #fff;
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 12.5px;
+  color: #3a3d44;
 }
 .mini-btn.primary {
   background: #1d4ed8;

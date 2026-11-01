@@ -11,6 +11,7 @@ from src.llm.openai_compat import (  # 网络错误判定/文案归一：单一�
     CHAT_TIMEOUT_SECONDS,
     NETWORK_ATTEMPTS,
     PROBE_TIMEOUT_SECONDS,
+    _describe_models_error,
     _describe_network_error,
     _is_network_error,
 )
@@ -22,12 +23,20 @@ logger = get_logger(__name__)
 class AnthropicProvider(ModelProvider):
     """Anthropic Messages API 接入。system 消息单独提升为 system 参数。"""
 
-    def __init__(self, name: str, api_key: str, base_url: str | None = None):
+    def __init__(
+        self,
+        name: str,
+        api_key: str,
+        base_url: str | None = None,
+        headers: dict[str, str] | None = None,
+    ):
         super().__init__(name)
         # max_retries=0：重试节奏由本类统一控制；timeout 显式设置，避免网络黑洞下
         # 界面被 SDK 默认的 10 分钟超时拖成「假死」。
         kwargs: dict = {
             "api_key": api_key,
+            # 接入点自定义请求头（与 OpenAI 兼容点同一语义，见 ProviderConfig.headers）
+            "default_headers": headers or None,
             "max_retries": 0,
             "timeout": CHAT_TIMEOUT_SECONDS,
         }
@@ -78,6 +87,7 @@ class AnthropicProvider(ModelProvider):
                         "prompt_tokens": resp.usage.input_tokens,
                         "completion_tokens": resp.usage.output_tokens,
                     },
+                    finish_reason=getattr(resp, "stop_reason", "") or "",
                 )
             except anthropic.APIStatusError as e:
                 last_err = e
@@ -129,6 +139,34 @@ class AnthropicProvider(ModelProvider):
         raise ProviderError(
             self.name,
             f"探活失败（model={model}，已重试 {NETWORK_ATTEMPTS} 次）: "
+            f"{_describe_network_error(last_err) if last_err else '未知网络错误'}",
+        ) from last_err
+
+    def list_models(self) -> list[str]:
+        """GET /v1/models：拉取该接入点当前可用的模型名清单。
+
+        与 probe 同源：短超时 + 网络类重试。Anthropic 的 models 接口是分页的，
+        故显式给到上限 limit=1000（远大于实际模型数），避免默认只返回首页 20 个
+        造成「模型列表缺一半」的错觉。
+        """
+        last_err: Exception | None = None
+        for attempt in range(NETWORK_ATTEMPTS):
+            try:
+                resp = self._client.models.list(
+                    limit=1000, timeout=PROBE_TIMEOUT_SECONDS
+                )
+                return sorted({m.id for m in resp.data if getattr(m, "id", "")})
+            except Exception as e:  # noqa: BLE001 - 统一判网络类，与 chat 同口径
+                if not _is_network_error(e):
+                    raise ProviderError(
+                        self.name, f"拉取模型列表失败: {_describe_models_error(e)}"
+                    ) from e
+                last_err = e
+                if attempt < NETWORK_ATTEMPTS - 1:
+                    time.sleep(2**attempt)
+        raise ProviderError(
+            self.name,
+            f"拉取模型列表失败（已重试 {NETWORK_ATTEMPTS} 次）: "
             f"{_describe_network_error(last_err) if last_err else '未知网络错误'}",
         ) from last_err
 

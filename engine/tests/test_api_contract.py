@@ -246,6 +246,10 @@ class TestConstitutionCoverage:
         由来（2026-09-19 真机排查）：原判定是 `any(marker in text)`，词表只有四个词且任意位置命中：
         · 漏判：真实拒答「抱歉，我不能创作这类内容」一个词都不含 → 被当成正文落盘；
         · 误判：正文里角色说「我做不到」→ 整章被判拒答，重试 4 次全废。
+
+        2026-09-22 定稿：**完全对齐原版** —— 词表、长度阈值与判定逻辑逐字一致；
+        曾经加过的"尾部 120 字窗口 / 剥引号 / 强弱词分级 / 空产出与预算耗尽分档"全部撤回
+        （真机上那套加强两头都不对：该判的没判到，正常正文反而被误判成拒答）。
         """
         from src.agents.architect import _looks_like_refusal
 
@@ -256,6 +260,15 @@ class TestConstitutionCoverage:
         # 长正文里的礼貌词/否定词不得触发（角色台词与旁白都会出现）
         assert not _looks_like_refusal("她低声道：「抱歉，我来晚了。」" + "正文" * 900)
         assert not _looks_like_refusal("这一段超出了他给自己的范围，他做不到回头。" + "正文" * 900)
+        # 长产出（>400 字）**不再做任何位置扫描**：结尾出现礼貌词也不判 —— 这是原版口径，
+        # "尾部窗口"曾把"章节以对白收尾"整章判成拒答，已撤回。
+        assert not _looks_like_refusal(
+            "第一章。剑光掠过他的肩胛，血顺着袖口滴在青石上。"
+            + "正文" * 300 + "她低声道：「抱歉。」"
+        )
+        assert not _looks_like_refusal("第一章。" + "正文" * 300 + "她笑了。我做不到。")
+        # 短产出（≤400 字）按全文判：命中任一措辞即拒答（原版口径，保召回）
+        assert _looks_like_refusal("她低声道：「抱歉，我来晚了。」")
 
     def test_writer_entry_point_injects_fidelity_block(self, monkeypatch):
         """走**真实 Writer 入口**验证注入（不是只渲染模板）：抓取真正发给模型的 prompt。
@@ -1429,8 +1442,18 @@ class TestConstraintRendering:
         assert "1." in block, "清单必须带序号，便于逐条核对"
 
     def test_writer_prompt_puts_constraint_high_and_keeps_pointer(self):
-        """约束块必须在【本章大纲】之前（高位），末尾只留指针 —— 不再是被稀释的尾段。"""
-        from src.agents.prompt_loader import CONSTRAINT_HEADING, render_prompt
+        """约束必须在【本章大纲】之前（高位）**并在末尾再锚一次实体清单**。
+
+        2026-10-04 升级：旧契约是"高位块 + 末尾一句指针"（`完整约束与执行清单见上文`）。
+        用户实测该契约不成立——末尾只有**指针**、不携带内容，模型生成时最后看到的是
+        【文风指纹】【待审正文】而不是约束，长文（本模板渲染 ≈6.8k 字）下注意力回收失败。
+        新契约：末位锚点必须**复现清单实体**，形成双锚点。
+        """
+        from src.agents.prompt_loader import (
+            CONSTRAINT_HEADING,
+            CONSTRAINT_TAIL_HEADING,
+            render_prompt,
+        )
         from src.agents.reality_policy import reality_policy_text
 
         prompt = render_prompt(
@@ -1459,7 +1482,16 @@ class TestConstraintRendering:
         assert at < prompt.index("本章大纲占位"), "约束块必须在大纲之前（高位注入）"
         assert at < len(prompt) // 2, "约束块不应落在提示词后半段"
         assert "执行清单" in prompt
-        assert "完整约束与执行清单见上文" in prompt, "末尾必须留指针，便于长文注意力回收"
+        # 末位锚点：必须在提示词最末段，且**携带清单实体**而非指针
+        tail_at = prompt.rindex(CONSTRAINT_TAIL_HEADING)
+        assert tail_at > len(prompt) * 0.8, "末位锚点必须落在提示词尾部（recency 位）"
+        tail_zone = prompt[tail_at:]
+        assert "力量体系称呼" in tail_zone, "末位锚点必须复现清单实体，不能只是指针"
+        assert "- [ ]" in tail_zone
+        # 三重压制（概念 / 流程 / 执行）必须在场
+        assert "【概念压制】" in prompt
+        assert "【流程压制 · 强制预读】" in prompt
+        assert "【执行压制 · 冲突裁决】" in prompt
 
     def test_editor_prompt_puts_constraint_before_outline(self):
         from src.agents.prompt_loader import CONSTRAINT_HEADING, render_prompt
@@ -1824,6 +1856,98 @@ class TestStatusAndQueue:
         assert client.get("/api/cross-volume?novel=demo-web").status_code == 200
 
 
+class TestInteractiveDiscard:
+    """「删除本章工作内容与产出，回退到出卡」：删除清单、定稿保护、索引同步、缺文件容错。
+
+    由来（用户需求）：一轮里反复重试会把上一稿、坏卡与旧评分留在事实源里，
+    下一轮出卡/写章又被它们牵着走——需要一条"把这一章抹掉重来"的出口，
+    与「重试（保留已出剧情卡与草稿）」并列，由用户当场选。
+    """
+
+    @staticmethod
+    def _runner(store, index):
+        """只装配 discard 用得到的两件东西：store 与 memory.index（出卡器不参与本操作）。"""
+        from types import SimpleNamespace
+
+        from src.orchestrator.interactive import InteractiveRunner
+
+        pipe = SimpleNamespace(store=store, memory=SimpleNamespace(index=index))
+        return InteractiveRunner(pipe, plotter=object())
+
+    def test_removes_draft_cards_review_summary_and_purges_index(self, make_memory):
+        from src.orchestrator.interactive import cards_rel_path
+
+        store, memory = make_memory("discard-book")
+        chapter_rel = store.chapter_rel_path(1, 7)
+        store.write(chapter_rel, "草稿正文。", {"status": "draft", "chapter": 7})
+        store.write(cards_rel_path(7), "---\ncards: []\n---\n", {"chosen": "c1"})
+        store.write(store.review_rel_path(7), "---\nscores: {}\n---\n", {})
+        store.write(store.summary_rel_path(7), "摘要", {})
+        memory.index.upsert_document(store.read(chapter_rel), "chapter")
+
+        result = self._runner(store, memory.index).discard_chapter_work(7)
+
+        expected = {cards_rel_path(7), chapter_rel,
+                    store.review_rel_path(7), store.summary_rel_path(7)}
+        assert result["chapter"] == 7
+        assert set(result["removed"]) == expected
+        assert result["missing"] == []
+        for rel in expected:
+            assert not store.exists(rel), f"{rel} 应已删除"
+        # 索引侧同步删除：否则被删章节仍会被 RAG 检索回来（上下文污染）
+        assert all(u[0] != chapter_rel for u in memory.index.upserted)
+
+    def test_rejects_approved_chapter(self, make_memory):
+        from types import SimpleNamespace
+
+        store, _ = make_memory("discard-approved")
+        chapter_rel = store.chapter_rel_path(1, 3)
+        store.write(chapter_rel, "已定稿正文。", {"status": "approved", "chapter": 3})
+
+        with pytest.raises(ValueError, match="已定稿"):
+            self._runner(store, SimpleNamespace(delete_document=lambda rel: None)
+                         ).discard_chapter_work(3)
+        assert store.exists(chapter_rel), "定稿章节一律不得被本操作删除"
+
+    def test_missing_files_reported_not_raised(self, make_memory):
+        from types import SimpleNamespace
+
+        store, _ = make_memory("discard-empty")
+        result = self._runner(store, SimpleNamespace(delete_document=lambda rel: None)
+                              ).discard_chapter_work(2)
+        assert result["removed"] == []
+        assert len(result["missing"]) == 4, "四个目标文件都不存在时应如实报告而非报错"
+
+    def test_index_failure_does_not_block_rollback(self, make_memory):
+        """索引是可重建的派生物：它删不动，也不能挡住「回退」这条出路。"""
+        from types import SimpleNamespace
+
+        store, _ = make_memory("discard-index-boom")
+        chapter_rel = store.chapter_rel_path(1, 1)
+        store.write(chapter_rel, "草稿。", {"status": "draft", "chapter": 1})
+
+        def _boom(rel):
+            raise RuntimeError("index down")
+
+        result = self._runner(store, SimpleNamespace(delete_document=_boom)
+                              ).discard_chapter_work(1)
+        assert chapter_rel in result["removed"]
+        assert not store.exists(chapter_rel)
+
+    def test_discard_endpoint_requires_started_session(self, app_client):
+        """会话还没开始（没有当前章）→ 409，而不是悄悄"删了个不存在的章"。"""
+        client, _ = app_client
+        res = client.post("/api/interactive/discard?novel=demo-web")
+        assert res.status_code == 409
+        assert "没有可删除的工作内容" in res.json()["detail"]
+
+    def test_state_exposes_last_discard_field(self, app_client):
+        """快照带 last_discard：UI 用它如实回显"删了哪几个文件"。"""
+        client, _ = app_client
+        body = client.get("/api/interactive/state?novel=demo-web").json()
+        assert "last_discard" in body
+
+
 class TestDashboardBindingsHistory:
     def test_dashboard_metrics(self, app_client):
         client, _ = app_client
@@ -2013,6 +2137,161 @@ class TestCustomSkillsAndModelConfig:
         )
         assert res.status_code == 400
 
+
+class TestProviderModelListApi:
+    """「获取模型」端点：让 UI 能拉到接入点的模型清单来选择目标模型。
+
+    全部用例都替换掉 provider 构造（不发真实请求），只验端点契约与错误透出口径。
+    """
+
+    def test_lists_models(self, app_client, monkeypatch):
+        client, server_mod = app_client
+
+        class _Fake:
+            def list_models(self):
+                return ["deepseek-chat", "deepseek-reasoner"]
+
+        monkeypatch.setattr(
+            server_mod, "_provider_for_model_list", lambda *a, **k: _Fake()
+        )
+        res = client.get("/api/model-config/providers/deepseek/models")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["ok"] is True
+        assert body["provider"] == "deepseek"
+        assert body["models"] == ["deepseek-chat", "deepseek-reasoner"]
+        assert body["count"] == 2
+
+    def test_failure_is_readable_not_500(self, app_client, monkeypatch):
+        """拉取失败要给可读原因（200 + ok=false），不是把 UI 打成 500。"""
+        client, server_mod = app_client
+
+        class _Boom:
+            def list_models(self):
+                raise RuntimeError("拉取模型列表失败: API Key 被拒绝")
+
+        monkeypatch.setattr(
+            server_mod, "_provider_for_model_list", lambda *a, **k: _Boom()
+        )
+        res = client.get("/api/model-config/providers/deepseek/models")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["ok"] is False and body["models"] == []
+        assert "API Key 被拒绝" in body["error"]
+
+    def test_unset_env_placeholder_is_named(self, app_client, monkeypatch):
+        """api_key 是未解析的 ${ENV_VAR} 时，报错要点名差哪个环境变量（全程不发请求）。
+
+        故意用**替换 models.yaml 原文**的方式构造：直接删环境变量是测不住的——
+        get_settings 在缓存失效时会重新 load_dotenv，把 .env 里的真实 Key 再灌回
+        os.environ，于是这个用例就变成了一次真实网络调用（实测会命中 DeepSeek）。
+        """
+        client, server_mod = app_client
+        monkeypatch.setattr(
+            server_mod,
+            "_load_models_raw",
+            lambda: {
+                "providers": {
+                    "ghost": {
+                        "type": "openai_compat",
+                        "base_url": "http://127.0.0.1:9/v1",
+                        "api_key": "${INKFORGE_NO_SUCH_ENV_VAR}",
+                    }
+                }
+            },
+        )
+        body = client.get("/api/model-config/providers/ghost/models").json()
+        assert body["ok"] is False, body
+        assert "INKFORGE_NO_SUCH_ENV_VAR" in body["error"]
+
+    def test_placeholder_api_key_override_resolves_from_env(self, app_client, monkeypatch):
+        """UI 回传的 ${ENV_VAR} 不是字面量密钥，而是「沿用环境变量」。
+
+        由来（2026-09-21 用户实测）：GET /api/model-config 对占位符**不掩码**（它不是秘密），
+        「编辑接入点」弹窗于是把 ${DEEPSEEK_API_KEY} 原样回传；早先的实现把它当字面量 Key，
+        一个真实可用的 DeepSeek 接入点点一下「获取模型」就报「环境变量未设置」。
+        """
+        from src.llm.openai_compat import OpenAICompatProvider
+
+        _, server_mod = app_client
+        monkeypatch.setenv("INKFORGE_PROBE_KEY", "sk-from-env")
+        provider = server_mod._provider_for_model_list(
+            "ghost", "openai_compat", "http://127.0.0.1:9/v1", "${INKFORGE_PROBE_KEY}"
+        )
+        assert isinstance(provider, OpenAICompatProvider)
+        assert provider._client.api_key == "sk-from-env"
+
+    def test_unsaved_provider_uses_form_values(self, app_client):
+        """接入点还没保存也能先拉：表单值优先，直接构造出对应类型的 provider。"""
+        from src.llm.openai_compat import OpenAICompatProvider
+
+        _, server_mod = app_client
+        provider = server_mod._provider_for_model_list(
+            "brand-new", "openai_compat", "http://127.0.0.1:9/v1", "sk-test"
+        )
+        assert isinstance(provider, OpenAICompatProvider)
+
+    def test_rejects_illegal_provider_name(self, app_client):
+        client, _ = app_client
+        res = client.get("/api/model-config/providers/bad.name/models")
+        assert res.status_code == 400
+
+    def test_provider_headers_roundtrip(self, app_client, sandbox):
+        """接入点自定义请求头：能存、能取回、能落到 models.yaml。
+
+        没有它，OpenCode Go 这类网关就是「/models 200、/chat/completions 400」。
+        """
+        client, _ = app_client
+        res = client.put(
+            "/api/model-config/providers/deepseek",
+            json={
+                "type": "openai_compat",
+                "base_url": "https://api.deepseek.com/v1",
+                "api_key": "****",
+                "headers": {"x-opencode-session": "s-1"},
+            },
+        )
+        assert res.status_code == 200
+        info = next(p for p in res.json()["providers"] if p["name"] == "deepseek")
+        assert info["headers"] == {"x-opencode-session": "s-1"}
+        content = (sandbox.configs / "models.yaml").read_text(encoding="utf-8")
+        assert "x-opencode-session" in content
+        assert "${DEEPSEEK_API_KEY}" in content, "掩码回传不得覆盖密钥占位符"
+
+    def test_provider_headers_kept_when_field_omitted(self, app_client):
+        """老客户端不带 headers 字段时，不能把已存的请求头抹掉。"""
+        client, _ = app_client
+        payload = {
+            "type": "openai_compat",
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key": "****",
+        }
+        client.put(
+            "/api/model-config/providers/deepseek",
+            json={**payload, "headers": {"x-keep": "1"}},
+        )
+        res = client.put("/api/model-config/providers/deepseek", json=payload)
+        info = next(p for p in res.json()["providers"] if p["name"] == "deepseek")
+        assert info["headers"] == {"x-keep": "1"}
+
+    def test_provider_headers_can_be_cleared(self, app_client):
+        """显式传空对象 = 清空（删掉一行就是删掉这个头）。"""
+        client, _ = app_client
+        payload = {
+            "type": "openai_compat",
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key": "****",
+        }
+        client.put(
+            "/api/model-config/providers/deepseek",
+            json={**payload, "headers": {"x-drop": "1"}},
+        )
+        res = client.put(
+            "/api/model-config/providers/deepseek", json={**payload, "headers": {}}
+        )
+        info = next(p for p in res.json()["providers"] if p["name"] == "deepseek")
+        assert info["headers"] == {}
+
     def test_agent_presets_listed(self, app_client):
         client, _ = app_client
         presets = client.get("/api/agent-presets").json()["presets"]
@@ -2134,3 +2413,113 @@ class TestDistillGuards:
     def test_distill_start_unknown_skill_404(self, app_client):
         client, _ = app_client
         assert client.post("/api/distill/start", json={"skill_id": "ghost"}).status_code in (400, 404)
+
+
+class TestFinishReasonPlumbing:
+    """`ChatResult.finish_reason` 必须从厂商响应透出（2026-09-22 真机冒烟补的硬缺口）。
+
+    由来：全链此前不透出 finish_reason，于是"正文被截断"与"模型不肯写长"无法区分——
+    实测 max_tokens=8000 时 5000 字目标的产出 50~67% 被 `length` 截断，只能靠
+    `completion_tokens ≥ max_tokens` 近似猜（该近似会被推理 token 干扰）。
+    透出后，冒烟才能把"截断率"当硬指标判定。
+    """
+
+    def test_openai_compat_passes_finish_reason(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from src.llm.base import ChatMessage
+        from src.llm.openai_compat import OpenAICompatProvider
+
+        choice = SimpleNamespace(finish_reason="length",
+                                 message=SimpleNamespace(content="正文被截断的产出"))
+        resp = SimpleNamespace(choices=[choice],
+                               usage=SimpleNamespace(prompt_tokens=10, completion_tokens=8000))
+
+        class _Completions:
+            def create(self, **kwargs):
+                return resp
+
+        provider = OpenAICompatProvider("t", base_url="http://127.0.0.1:9/v1", api_key="k")
+        monkeypatch.setattr(
+            provider, "_client", SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+        )
+        out = provider.chat([ChatMessage("user", "hi")], model="m", max_tokens=8000)
+        assert out.finish_reason == "length"
+        assert out.usage["completion_tokens"] == 8000
+
+    def test_json_mode_blank_output_self_heals_without_response_format(self, monkeypatch):
+        """json_mode 拿到「纯空白」时，当场摘掉 response_format 重发同一条请求。
+
+        2026-09-27 真机签名：`response_format=json_object` 下返回 194~263 个 **ASCII 空格**、
+        finish=stop、completion_tokens 396~517（而 max_tokens=16000，预算远未用尽）。
+        上层"3 次解析重试 + 2 轮保真链"全是同一堵墙 → 用户看到「生成失败」。
+        """
+        from types import SimpleNamespace
+
+        from src.llm.base import ChatMessage
+        from src.llm.openai_compat import OpenAICompatProvider
+
+        seen: list[dict] = []
+
+        class _Completions:
+            def create(self, **kwargs):
+                seen.append(dict(kwargs))
+                if "response_format" in kwargs:
+                    return SimpleNamespace(
+                        choices=[SimpleNamespace(
+                            finish_reason="stop",
+                            message=SimpleNamespace(content=" " * 248))],
+                        usage=SimpleNamespace(prompt_tokens=100, completion_tokens=494))
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(content='{"book_title": "x"}'))],
+                    usage=SimpleNamespace(prompt_tokens=100, completion_tokens=40))
+
+        provider = OpenAICompatProvider("t", base_url="http://127.0.0.1:9/v1", api_key="k")
+        monkeypatch.setattr(
+            provider, "_client",
+            SimpleNamespace(chat=SimpleNamespace(completions=_Completions())),
+        )
+        out = provider.chat([ChatMessage("user", "hi")], model="m", json_mode=True)
+        assert out.content == '{"book_title": "x"}', "没有摘掉 response_format 重发"
+        assert [("response_format" in k) for k in seen] == [True, False], f"请求序列不对：{seen}"
+        assert provider._json_blank_streak == 1, "单次空白不该立刻把 json_mode 永久降级"
+
+    def test_json_mode_downgrades_after_two_blank_outputs(self, monkeypatch):
+        """连续两次空白才永久降级：平时 json_mode 是好的（探针 3/3），不能被一次抖动误杀。"""
+        from types import SimpleNamespace
+
+        from src.llm.base import ChatMessage
+        from src.llm.openai_compat import OpenAICompatProvider
+
+        seen: list[dict] = []
+
+        class _Completions:
+            def create(self, **kwargs):
+                seen.append(dict(kwargs))
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(content=" " * 200))],
+                    usage=SimpleNamespace(prompt_tokens=10, completion_tokens=400))
+
+        provider = OpenAICompatProvider("t", base_url="http://127.0.0.1:9/v1", api_key="k")
+        monkeypatch.setattr(
+            provider, "_client",
+            SimpleNamespace(chat=SimpleNamespace(completions=_Completions())),
+        )
+        provider.chat([ChatMessage("user", "hi")], model="m", json_mode=True)
+        assert provider._json_mode_ok is not False, "第一次空白就永久降级了"
+        provider.chat([ChatMessage("user", "hi")], model="m", json_mode=True)
+        assert provider._json_mode_ok is False, "连续两次空白后没有降级"
+
+        seen.clear()
+        provider.chat([ChatMessage("user", "hi")], model="m", json_mode=True)
+        assert all("response_format" not in k for k in seen), "降级后仍在下发 response_format"
+
+    def test_default_is_empty_string_not_none(self):
+        """默认值必须是空串：下游大量 `not finish_reason` 的真值判断不该被 None 干扰。"""
+        from src.llm.base import ChatResult
+
+        assert ChatResult(content="x", model="m", provider_name="p").finish_reason == ""

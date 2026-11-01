@@ -32,6 +32,10 @@ import re
 
 from src.agents.prompt_loader import ensure_constitution
 from src.llm.base import ChatMessage
+
+#: 拒答词表**直接复用判定层的同一份**（单一源）：不在本模块再抄一套，
+#: 否则"整份产出像不像拒答"这条口径会在两处悄悄漂移。
+from src.llm.refusal_probe import REFUSAL_META, REFUSAL_PHRASES
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -114,6 +118,15 @@ _GARBAGE_RE = re.compile(
     r"|internal server error|gateway timeout|\{\s*[\"']?error[\"']?\s*:|upstream"
     r"|请求过于频繁|服务暂时不可用|无法访问此网站"
 )
+#: 「像模型拒答」的签名：由判定层的同一份词表编译而成，**锚定在条目开头**。
+#: 为什么必须锚定（而不是像 `_GARBAGE_RE` 那样任意位置匹配）：拒答措辞是通用词汇，
+#: 正常约束里出现它是常态——「禁止写『抱歉』这类道歉台词」就是一条完全合法的约束。
+#: 而真正的拒答产出一定是**以它开场**的（「抱歉，我不能…」「作为 AI，我无法…」），
+#: 被 `normalize_constraints` 的句读兜底切开后，首条仍然以它开头。
+_REFUSAL_HEAD_RE = re.compile(
+    r"^\s*(?:" + "|".join(re.escape(m) for m in (*REFUSAL_META, *REFUSAL_PHRASES)) + ")",
+    re.IGNORECASE,
+)
 
 
 def clamp_max_items(value: int | None) -> int:
@@ -135,6 +148,23 @@ def looks_like_garbage(items: list[str]) -> bool:
     （比如作者自己要求"禁止写服务器报错台词"）不该被误杀。
     """
     return bool(items) and all(_GARBAGE_RE.search(it) for it in items)
+
+
+def looks_like_refusal(items: list[str]) -> bool:
+    """整份条目是否**像模型拒答**而不是提炼结果（纵深防御，2026-10-03 补）。
+
+    判据与 `looks_like_garbage` 同构（**每一条都命中**才判整份不可用），但匹配方式不同：
+    `_GARBAGE_RE` 是任意位置匹配（HTML 标签这类签名足够特异），本函数是**开头锚定**——
+    因为拒答措辞是通用词汇，正常约束里出现它是常态
+    （`- 禁止写「抱歉」这类道歉台词` 就是一条完全合法的约束），
+    而真正的拒答产出一定以它开场。
+
+    为什么需要它：主防线是 `generate_faithful`，它在**原始产出**上判一次拒答，
+    但那条判据带 400 字豁免线（`REFUSAL_MAX_CHARS`，为保护长正文里的角色台词而设）——
+    一段啰嗦的长拒答能绕过它，随后被 normalize 按句读切成"条目"回给用户。
+    本函数在**规范化之后**再兜一层，与长度无关。
+    """
+    return bool(items) and all(_REFUSAL_HEAD_RE.match(it) for it in items)
 
 
 def normalize_constraints(raw: str, max_items: int | None = None) -> list[str]:
@@ -268,11 +298,24 @@ def extract_constraints(
     """跑一次提炼：正文 + 需求 → 条目。
 
     返回 {title, items, constraints, count, role, model, provider}。
-    仅经 ModelRegistry.chat_as 发一次调用；不落盘、不读库（调用方决定是否入库）。
+    不落盘、不读库（调用方决定是否入库）。
 
     `temperature=None` 表示**沿用角色绑定**（models.yaml / 「模型配置」里改的就是它）——
     这里不硬编码温度，否则用户在界面上改 `constraint` 角色的温度会毫无效果。
+
+    **零拒绝保真链（2026-10-03）**：本链路此前是本项目**唯一一条裸调 `chat_as` 的自由文本
+    链路**，于是模型"成功返回一段拒绝文本"时既触发不了异常重试、也过不了任何拒答判定，
+    最终被 `normalize_constraints` 的句读兜底切成「条目」原样回给用户——这正是用户实测到的
+    「明显拒绝」（与 plotter 出卡修复前的 bug 完全同类，见 `agents/plotter.py` 的注释）。
+    现与 architect / writer / plotter 同口径走 `generate_faithful`：4 轮重试 + 末轮降温，
+    拒答/空产出在系统内消化，不落成对用户的答复。
     """
+    from src.agents.architect import (
+        GENERATE_RETRIES,
+        OUTPUT_QUALITY_FAILURES,
+        BriefFidelityError,
+        generate_faithful,
+    )
     from src.config.settings import load_models_config
     from src.llm.registry import ModelRegistry
 
@@ -281,10 +324,35 @@ def extract_constraints(
         requirement, source_text, max_items=limit, system_prompt=system_prompt
     )
     registry = ModelRegistry(load_models_config())
-    # 不传 temperature（None）= 用角色绑定值；传了才覆盖
-    kwargs = {} if temperature is None else {"temperature": temperature}
-    result = registry.chat_as(role, messages, **kwargs)
-    items = normalize_constraints(result.content, limit)
+    # 显式传了 temperature 时**每一轮都用它**（用户在界面上定的口径优先）；
+    # 否则交给保真链：非末轮传 None（`chat_as` 回落角色绑定值），末轮由链降到重试温度。
+    explicit = temperature
+
+    def _call(msgs: list[ChatMessage], temp: float | None):
+        # 返回 ChatResult 而不是 .content：保真链的 `_output_text` 已能取到 content，
+        # 而回执里的 model / provider 归因需要它（原来裸调也是这么拿的）。
+        #
+        # 温度口径（与改动前逐字保持）：**"沿用角色绑定"时不传这个 kwarg**，而不是传 None。
+        # `chat_as` 两者等价（None 也回落 binding.temperature），但既有回归用例
+        # `test_happy_path_returns_copyable_bullets` 钉的是 kwarg 形状，显式传 None 会破它。
+        t = explicit if explicit is not None else temp
+        kwargs: dict = {} if t is None else {"temperature": t}
+        return registry.chat_as(role, msgs, **kwargs)
+
+    try:
+        result = generate_faithful(_call, messages)
+    except BriefFidelityError as exc:
+        # 保真链耗尽。**只**把"产出质量问题（拒答/空回）"归到既有的 422 口径；
+        # 接入点异常照旧上抛，走 502 归因与凭据脱敏那条链路（回归依赖它）。
+        if any(marker in str(exc) for marker in OUTPUT_QUALITY_FAILURES):
+            logger.warning("约束提炼保真链耗尽（产出质量问题）：%s", exc)
+            raise ValueError(
+                f"模型连续 {GENERATE_RETRIES + 2} 轮未产出可用条目（疑似拒答或空回）。"
+                "可把需求写得更具体，或换一段正文后重试。"
+            ) from exc
+        raise
+
+    items = normalize_constraints(getattr(result, "content", "") or "", limit)
     if not items:
         # 模型空回/全是围栏：抛出去让端点回 422，而不是把空结果当成成功反馈给用户
         raise ValueError("模型未返回可用条目（输出为空或无法解析为条目）")
@@ -293,6 +361,16 @@ def extract_constraints(
         raise ValueError(
             "模型返回的内容像是接入点错误页而不是提炼结果"
             f"（原文开头：{items[0][:60]!r}）"
+        )
+    if looks_like_refusal(items):
+        # 长拒答绕过保真链 400 字豁免线后的兜底。**只记条数与通用措辞，不记正文。**
+        logger.warning(
+            "约束提炼产出被判为拒答（%d 条全部命中拒答措辞，绕过了保真链的短产出判据）",
+            len(items),
+        )
+        raise ValueError(
+            "模型返回的内容像是拒答而不是提炼结果。"
+            "可把需求写得更具体、或换一段正文后重试。"
         )
     return {
         "title": suggest_title(requirement, title_hint),

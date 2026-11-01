@@ -131,6 +131,18 @@ MEASURE_JS = """
     const y = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
     return Math.round(x * y);
   };
+  /*
+   * 重叠要按**可见**算：正文框在 .stream 里滚动，它的布局矩形可能延伸到滚动视口之外，
+   * 那部分肉眼根本看不见。所以先把正文框裁到 .stream 的可视区，再和决策区求交。
+   * 决策区（改造后已投送到对话列底部的 #decision-host）不裁 —— 它压在可见正文上就
+   * 必须报出来。
+   */
+  const clipToStream = (r) => {
+    if (!r || !stream) return r;
+    const x1 = Math.max(r.x, stream.x), x2 = Math.min(r.x + r.w, stream.x + stream.w);
+    const y1 = Math.max(r.y, stream.y), y2 = Math.min(r.y + r.h, stream.y + stream.h);
+    return x2 > x1 && y2 > y1 ? { x: x1, y: y1, w: x2 - x1, h: y2 - y1 } : null;
+  };
   // 被裁掉的元素：右边界超出窗口
   const clipped = kids.filter(k => k.x + k.w > window.innerWidth + 1).map(k => k.cls);
   const draft = box('.draft-scroll-box') || box('.draft-box');
@@ -149,7 +161,7 @@ MEASURE_JS = """
     shellClientW: shell ? shell.clientWidth : null,
     clipped,
     stream, card, draft, decision, inputBox,
-    overlapDraftDecision: overlap(draft, decision),
+    overlapDraftDecision: overlap(clipToStream(draft), decision),
   };
 }
 """
@@ -398,14 +410,9 @@ def main() -> int:
                 if state["backBtn"]:
                     mx.locator(".back-to-book").first.click()
                     mx.wait_for_timeout(900)
-                    back = mx.evaluate(
-                        """async () => {
-                            const btns = Array.from(document.querySelectorAll('.ghost-btn'));
-                            const h = btns.find(b => (b.textContent || '').includes('历史对话'));
-                            if (h) h.click();
-                            return null;
-                        }"""
-                    )
+                    # 历史按钮已改成图标按钮（无可见文字，靠 aria-label），
+                    # 这里与上面第 390 行保持同一口径：按角色+可访问名定位。
+                    mx.get_by_role("button", name="历史对话").click()
                     mx.wait_for_timeout(300)
                     book_titles = mx.evaluate(
                         "() => Array.from(document.querySelectorAll('.history-item .h-title'))"
@@ -413,7 +420,6 @@ def main() -> int:
                     )
                     print(
                         f"[1600x1000/mainchat] 回到《探针样板书》后历史会话：{book_titles}"
-                        f"（back={back}）"
                     )
                     if not any("大纲改稿" in str(t) for t in book_titles):
                         failures.append(

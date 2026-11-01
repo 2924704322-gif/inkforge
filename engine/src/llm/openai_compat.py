@@ -57,10 +57,30 @@ def _describe_network_error(exc: BaseException) -> str:
     return f"{hint}（{text}）"
 
 
+def _describe_models_error(exc: BaseException) -> str:
+    """把「拉模型列表」的非网络失败说成人话。
+
+    实测最常见两种：404（兼容端点没有 /models 路由）与 401（Key 无效/无权限）。
+    这两种情况下用户该做的是「手填模型名」或「换 Key」，必须直说。
+    """
+    status = getattr(exc, "status_code", None)
+    if status == 404:
+        return f"该接入点未提供 /models 接口（可手动填写模型名）: {exc}"
+    if status in (401, 403):
+        return f"API Key 被拒绝：检查 Key 是否有效、余额与权限: {exc}"
+    return str(exc)
+
+
 class OpenAICompatProvider(ModelProvider):
     """只需 base_url + api_key + model 即可挂载任意 OpenAI 兼容端点。"""
 
-    def __init__(self, name: str, base_url: str, api_key: str = "none"):
+    def __init__(
+        self,
+        name: str,
+        base_url: str,
+        api_key: str = "none",
+        headers: dict[str, str] | None = None,
+    ):
         super().__init__(name)
         # max_retries=0：SDK 自带重试与本类的退避重试会叠加成倍数等待，故此处统一关掉，
         # 由本类显式控制重试节奏（见 chat()）。timeout 必须显式设置：SDK 默认 10 分钟，
@@ -68,10 +88,16 @@ class OpenAICompatProvider(ModelProvider):
         self._client = OpenAI(
             base_url=base_url,
             api_key=api_key or "none",
+            # default_headers：把接入点自定义头（如 OpenCode Go 的 x-opencode-session）
+            # 挂到每个请求上。网关要求的头缺一个，/chat/completions 就 400，而
+            # /models 照样 200——正是这种「列表拿得到、模型用不了」的坑。
+            default_headers=headers or None,
             max_retries=0,
             timeout=CHAT_TIMEOUT_SECONDS,
         )
         self._json_mode_ok: bool | None = None  # None=未探测
+        #: json_mode 下连续几次拿到「纯空白」产出（2026-09-27 真机自愈用）
+        self._json_blank_streak = 0
 
     def chat(
         self,
@@ -92,9 +118,39 @@ class OpenAICompatProvider(ModelProvider):
             kwargs["response_format"] = {"type": "json_object"}
 
         last_err: Exception | None = None
+        json_dropped = False  # 本轮是否已因"纯空白"摘掉 response_format
         for attempt in range(NETWORK_ATTEMPTS):  # 指数退避重试（R7）
             try:
                 resp = self._client.chat.completions.create(**kwargs)
+                content = resp.choices[0].message.content or ""
+                # ── JSON mode 空产出自愈（2026-09-27 真机排障）────────────────────
+                # 真机签名：`response_format=json_object` 下返回**纯 ASCII 空格**
+                # （12 次调用全是 194~263 个空格 / finish=stop / completion_tokens 396~517
+                #  而 max_tokens=16000 —— 预算远未用尽）。此时上层的"3 次解析重试 + 2 轮
+                # 保真链"全是同一堵墙，用户看到的就是「生成失败」。
+                # 处置：**当场摘掉 response_format 重发一次**（同一个 prompt，换一条代码路径），
+                # 并把该接入点计入降级计数——连续 2 次即永久降级（json_mode 不再下发），
+                # 单次则只自愈、不误杀（实测 json_mode 平时是好的：探针 3/3 正常）。
+                # 判定用 `content.strip()`：`json.loads(" ")` 与 `json.loads("")` 报的
+                # 都是同一个 `Expecting value: line 1 column 1 (char 0)`，不可能从错误里分辨。
+                if "response_format" in kwargs and not content.strip() and not json_dropped:
+                    self._json_blank_streak += 1
+                    json_dropped = True
+                    kwargs.pop("response_format", None)
+                    if self._json_blank_streak >= 2:
+                        self._json_mode_ok = False
+                    logger.warning(
+                        "[%s] JSON mode 返回纯空白（%d 字 / finish=%s），已摘掉 response_format "
+                        "重发同一条请求（第 %d 次连续空产出%s）",
+                        self.name, len(content),
+                        getattr(resp.choices[0], "finish_reason", "") or "?",
+                        self._json_blank_streak,
+                        "，该接入点已永久降级为提示词约束模式" if self._json_mode_ok is False else "",
+                    )
+                    resp = self._client.chat.completions.create(**kwargs)
+                    content = resp.choices[0].message.content or ""
+                elif "response_format" in kwargs and content.strip():
+                    self._json_blank_streak = 0
                 usage = {}
                 if resp.usage:
                     usage = {
@@ -104,10 +160,11 @@ class OpenAICompatProvider(ModelProvider):
                 if json_mode and self._json_mode_ok is None:
                     self._json_mode_ok = True
                 return ChatResult(
-                    content=resp.choices[0].message.content or "",
+                    content=content,
                     model=model,
                     provider_name=self.name,
                     usage=usage,
+                    finish_reason=getattr(resp.choices[0], "finish_reason", "") or "",
                 )
             except Exception as e:  # noqa: BLE001 - 统一判网络类，见 _is_network_error
                 # 顺序至关重要：在 openai>=1.x/2.x 中 APIConnectionError / APITimeoutError
@@ -178,6 +235,31 @@ class OpenAICompatProvider(ModelProvider):
         raise ProviderError(
             self.name,
             f"探活失败（model={model}，已重试 {NETWORK_ATTEMPTS} 次）: "
+            f"{_describe_network_error(last_err) if last_err else '未知网络错误'}",
+        ) from last_err
+
+    def list_models(self) -> list[str]:
+        """GET {base_url}/models：拉取该接入点当前可用的模型名清单。
+
+        与 probe 同源：短超时 + 网络类重试。拉列表是「点一下就要有反应」的交互，
+        不能像正文生成那样等几分钟；网络黑洞下必须变成有界失败而不是界面假死。
+        """
+        last_err: Exception | None = None
+        for attempt in range(NETWORK_ATTEMPTS):
+            try:
+                resp = self._client.models.list(timeout=PROBE_TIMEOUT_SECONDS)
+                return sorted({m.id for m in resp.data if getattr(m, "id", "")})
+            except Exception as e:  # noqa: BLE001 - 统一判网络类，与 chat 同口径
+                if not _is_network_error(e):
+                    raise ProviderError(
+                        self.name, f"拉取模型列表失败: {_describe_models_error(e)}"
+                    ) from e
+                last_err = e
+                if attempt < NETWORK_ATTEMPTS - 1:
+                    time.sleep(2**attempt)
+        raise ProviderError(
+            self.name,
+            f"拉取模型列表失败（已重试 {NETWORK_ATTEMPTS} 次）: "
             f"{_describe_network_error(last_err) if last_err else '未知网络错误'}",
         ) from last_err
 

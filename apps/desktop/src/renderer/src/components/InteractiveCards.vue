@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 
-import { NInput, NInputNumber, NRadio, NRadioGroup, useMessage } from 'naive-ui'
+import { NInput, NInputNumber, NRadio, NRadioGroup, useDialog, useMessage } from 'naive-ui'
 import { api, lengthBounds, scoreColor, withNovel } from '../api'
 import { useWordTarget } from '../composables/useWordTarget'
+import { openRevision } from '../store'
 import type { InteractiveState, PlotCard } from '../types'
 
 /**
@@ -25,6 +26,7 @@ const rejectFeedback = ref('')
 const busy = ref(false)
 const showCustom = ref(false)
 const message = useMessage()
+const dialog = useDialog()
 
 // ---------- 预期字数（生成前可设；打回可改）----------
 // 走 useWordTarget：用户改过之后，**任何服务端快照刷新/组件重挂载都不会把数字顶回去**
@@ -140,6 +142,7 @@ const modelText = computed(() => {
 async function call(action: () => Promise<void>, label: string): Promise<void> {
   if (busy.value) return
   busy.value = true
+  busyStartedAt.value = Date.now()
   try {
     await action()
     emit('refresh')
@@ -151,6 +154,69 @@ async function call(action: () => Promise<void>, label: string): Promise<void> {
   } finally {
     busy.value = false
   }
+}
+
+/**
+ * 等待计时 + 逃生出口。
+ * 由来（用户实测）：请求挂住时 `busy` 一直是 true，卡片按钮全灰、界面像死了一样；
+ * 请求侧的 30 分钟超时意味着这种"假死"可能持续很久。这里每秒计时，
+ * 超过 20 秒就给出「放弃等待」按钮，让用户随时把界面拿回来（服务端后台任务不受影响，
+ * 下一次轮询会带回真实状态）。
+ */
+const busyStartedAt = ref(0)
+const nowTick = ref(Date.now())
+const busySeconds = computed(() =>
+  busy.value ? Math.max(0, Math.round((nowTick.value - busyStartedAt.value) / 1000)) : 0,
+)
+const canGiveUp = computed(() => busy.value && busySeconds.value >= 20)
+
+/**
+ * 生成阶段的"已耗时"：只统计**引擎报告在生成中**的时长（用户报"变慢"时要能看见在等什么）。
+ * 阶段或章节切换即归零，避免把上一段的等待算进来。
+ */
+const GENERATING = ['generating_cards', 'writing', 'committing']
+const phaseStartedAt = ref(0)
+const phaseSeconds = computed(() =>
+  phaseStartedAt.value
+    ? Math.max(0, Math.round((nowTick.value - phaseStartedAt.value) / 1000))
+    : 0,
+)
+const ticking = computed(() => busy.value || GENERATING.includes(props.state.status))
+let clockTimer: ReturnType<typeof setInterval> | null = null
+watch(
+  ticking,
+  (on) => {
+    if (on) {
+      nowTick.value = Date.now()
+      if (!clockTimer) clockTimer = setInterval(() => (nowTick.value = Date.now()), 1000)
+    } else if (clockTimer) {
+      clearInterval(clockTimer)
+      clockTimer = null
+    }
+  },
+  { immediate: true },
+)
+watch(
+  () => `${props.state.status}|${props.state.chapter}`,
+  () => {
+    phaseStartedAt.value = GENERATING.includes(props.state.status) ? Date.now() : 0
+  },
+  { immediate: true },
+)
+let tickTimer: ReturnType<typeof setInterval> | null = null
+watch(busy, (v) => {
+  if (v) {
+    nowTick.value = Date.now()
+    if (!tickTimer) tickTimer = setInterval(() => (nowTick.value = Date.now()), 1000)
+  } else if (tickTimer) {
+    clearInterval(tickTimer)
+    tickTimer = null
+  }
+})
+function giveUpWaiting(): void {
+  // 只清**本地**等待态：后台任务照常跑，下一次轮询会把真实状态带回来。
+  busy.value = false
+  message.info('已停止等待；后台若仍在生成，状态会在下一次刷新时显示')
 }
 
 const start = (): void => {
@@ -166,6 +232,62 @@ const retry = (): void => {
     await api('POST', withNovel('/api/interactive/reset', props.novelId))
     await api('POST', withNovel('/api/interactive/start', props.novelId))
   }, '重试')
+}
+
+/**
+ * 删除本章未定稿的工作内容与产出，回到出卡阶段（**破坏性动作，必须先二次确认**）。
+ *
+ * 由来（用户需求）：一轮里反复重试会把上一稿、坏卡与旧评分留在事实源里，
+ * 下一轮出卡/写章又被它们牵着走（上下文污染）——需要一条"把这一章抹掉重来"的出口，
+ * 与「重试（保留已出的剧情卡与草稿）」并列，由用户当场选。
+ *
+ * 删除清单由引擎侧 `InteractiveRunner.DISCARD_TARGETS` 定义：
+ * 本章剧情卡与选择、未定稿草稿、本章审查报告、本章摘要（存在才删）。
+ * 定稿章节一概不动；每次删除都经 `MdStore.delete()` 进 Git 写作历史，**可从历史回滚**。
+ */
+const discard = (): void => {
+  dialog.warning({
+    title: `删除第 ${props.state.chapter} 章的工作内容与产出`,
+    content: [
+      '将删除（存在才删）：本章剧情卡与你的选择、未定稿草稿、本章审查报告、本章摘要。',
+      '已定稿章节不受影响；每次删除都会记入本书的写作历史，可从历史回滚。',
+      '删除后我会立刻为这一章重新设计三张剧情卡。确认删除吗？',
+    ].join('\n'),
+    positiveText: '删除并重新出卡',
+    negativeText: '取消',
+    onPositiveClick: () => {
+      if (busy.value) return
+      busy.value = true
+      busyStartedAt.value = Date.now()
+      // 直接用 api()：结果要**当场**展示（引擎同步返回删除清单），不走 call() 的统一刷新。
+      void (async () => {
+        try {
+          const res = await api<{
+            removed?: string[]
+            missing?: string[]
+            index_purged?: boolean
+          }>('POST', withNovel('/api/interactive/discard', props.novelId))
+          const removed = res.removed ?? []
+          const skipped = res.missing ?? []
+          const lines = [
+            removed.length ? `已删除 ${removed.length} 个文件：${removed.join('、')}` : '没有可删的文件（本来就不存在）',
+            skipped.length ? `跳过（不存在）：${skipped.join('、')}` : '',
+            res.index_purged ? '索引条目已同步清理。' : '索引未清理（会话尚未装配，重开时会重建）。',
+            '正在为这一章重新设计剧情卡……',
+          ].filter(Boolean)
+          message.success(lines.join('\n'), { duration: 8000 })
+          emit('refresh')
+        } catch (err) {
+          message.error(
+            `删除本章产出失败：${err instanceof Error ? err.message : String(err)}`,
+          )
+          emit('refresh')
+        } finally {
+          busy.value = false
+        }
+      })()
+    },
+  })
 }
 
 const choose = (cardId: string, custom = ''): void => {
@@ -201,6 +323,27 @@ const decide = (action: 'approve' | 'reject'): void => {
     })
     rejectFeedback.value = ''
   }, action === 'approve' ? '定稿入库' : '打回重写')
+}
+
+/**
+ * 「✎ 局部改写」：把本章草稿交给「正文改写」，改完回填草稿，再回来决定通过或打回。
+ *
+ * 为什么要有它：人审只有「定向修订 / 整章重写」两档，而"这稿总体没问题，
+ * 就是开篇三句板结"这类诉求用哪个都过重 —— 局部改写走最小改动闸门，只改点名处。
+ *
+ * 人审闸门不放松：回填只动**草稿**（走既有章节保存，status 仍是 draft），
+ * 通过/打回仍由你点。预览会在下一次状态轮询（2-5 秒）时刷新。
+ */
+const openLocalRevision = (): void => {
+  const draft = props.state.draft
+  if (!draft?.draft_text) return
+  openRevision({
+    source: draft.draft_text,
+    requirement: rejectFeedback.value.trim(),
+    origin: `互动创作 · 第 ${props.state.chapter} 章人审`,
+    fillBack: { chapter: props.state.chapter, novelId: props.novelId },
+  })
+  message.info('已把这一稿送进「正文改写」：改完点「回填本章草稿」，再回来点通过或打回')
 }
 
 /** 四维均分（与自由创作的人审同一口径）。 */
@@ -241,6 +384,9 @@ function pickCard(card: PlotCard): void {
          error 状态有专门的兜底块，这里不重复渲染。 -->
     <div v-if="state.error && state.status !== 'error'" class="ic-error">{{ state.error }}</div>
 
+    <!-- 回退结果不再常驻卡片（用户实测：删完字样一直挂着、看不出到底删了什么）：
+         现在删除是引擎同步返回的，结果当场用 toast 报明细，卡片不留残影。 -->
+
     <!-- 未开始 / 完本 -->
     <template v-if="state.status === 'idle'">
       <div class="ic-body">
@@ -266,12 +412,22 @@ function pickCard(card: PlotCard): void {
       <div class="ic-actions">
         <button class="primary-btn" :disabled="busy" @click="retry">重试（保留已出的剧情卡与草稿）</button>
         <button class="ghost-btn" :disabled="busy" @click="start">从断点继续</button>
+        <!-- 反复重试会把上一稿/坏卡/旧评分留在事实源里，下一轮被它们牵着走：
+             这条出口把本章未定稿的工作内容与产出删掉，重新出卡（二次确认 + 可回滚）。 -->
+        <button class="ghost-btn danger" :disabled="busy" @click="discard">
+          删除本章产出，重新出卡
+        </button>
+      </div>
+      <!-- 等待逃生：请求挂住时不让界面一直"假死"（超 20 秒给出口） -->
+      <div v-if="canGiveUp" class="ic-actions">
+        <span class="muted">已等待 {{ busySeconds }} 秒…</span>
+        <button class="ghost-btn" @click="giveUpWaiting">放弃等待（拿回界面）</button>
       </div>
     </template>
 
-    <!-- 出卡中 / 写章中 / 入库中 -->
+    <!-- 出卡中 / 写章中 / 入库中：带**已耗时**，让人知道在等什么、等了多久 -->
     <div v-else-if="state.status === 'generating_cards' || state.status === 'writing' || state.status === 'committing'" class="ic-body">
-      {{ statusText }}…（约 1-3 分钟）
+      {{ statusText }}…（约 1-3 分钟<template v-if="phaseSeconds > 0">，已 {{ phaseSeconds }} 秒</template>）
     </div>
 
     <!-- 选卡 -->
@@ -429,6 +585,33 @@ function pickCard(card: PlotCard): void {
       <div class="ic-actions">
         <button class="ghost-btn warn" :disabled="busy" @click="decide('reject')">打回重写</button>
         <button class="primary-btn" :disabled="busy" @click="decide('approve')">通过，定稿入库</button>
+        <button
+          class="ghost-btn"
+          :disabled="busy"
+          title="只改你点名的地方（最小改动闸门），改完回填本章草稿，再回来决定通过或打回"
+          @click="openLocalRevision"
+        >
+          ✎ 局部改写
+        </button>
+      </div>
+      <div class="muted">
+        「局部改写」把你的要求交给「正文改写」（带最小改动闸门 + 约束 + 文风继承），
+        改完<b>回填本章草稿</b>，你再决定通过还是打回 —— 它不会替你定稿。
+      </div>
+      <div class="ic-actions">
+        <span class="muted">
+          这一稿反复改不动、或旧评分一直在干扰下一轮？直接删掉本章未定稿的工作内容与产出，从出卡重来。
+        </span>
+        <!-- 与「重试窗口」同一个出口：审核阶段也能一次性抹掉本章（含旧评分/坏卡），
+             让下一轮出卡不再被上一稿牵着走。二次确认 + 每次删除进 Git 写作历史（可回滚）。 -->
+        <button class="ghost-btn danger" :disabled="busy" @click="discard">
+          删除本章产出，重新出卡
+        </button>
+      </div>
+      <!-- 等待逃生：审核动作挂住时也能拿回界面（服务端后台任务不受影响） -->
+      <div v-if="canGiveUp" class="ic-actions">
+        <span class="muted">已等待 {{ busySeconds }} 秒…</span>
+        <button class="ghost-btn" @click="giveUpWaiting">放弃等待（拿回界面）</button>
       </div>
     </template>
   </div>
@@ -683,5 +866,10 @@ function pickCard(card: PlotCard): void {
 .ghost-btn.warn {
   color: #b45309;
   border-color: #fde68a;
+}
+/* 破坏性动作：删除本章工作内容并回退到出卡（红色，与「打回重写」的警示色区分） */
+.ghost-btn.danger {
+  color: #b91c1c;
+  border-color: #fecaca;
 }
 </style>

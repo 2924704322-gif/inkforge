@@ -391,6 +391,63 @@ class TestEndpointContract:
         assert not looks_like_garbage(["- 禁止写服务器报错台词：不要出现 500/服务不可用 之类字样"])
         assert not looks_like_garbage([])
 
+    def test_refusal_output_is_not_returned_as_constraints(self, app_client, spy_registry):
+        """模型拒答时不得把拒答文本当成约束回给用户（2026-10-03 修复）。
+
+        由来：本链路此前是本项目**唯一一条裸调 `chat_as` 的自由文本链路**——拒答文本
+        既触发不了异常重试，也过不了任何拒答判定，最终被 `normalize_constraints` 的
+        句读兜底切成「条目」**原样 200 返回**。用户实测在风格工坊看到的"明显拒绝"
+        就是这个（与 plotter 出卡修复前的 bug 完全同类）。
+        现与 architect / writer / plotter 同口径走 `generate_faithful`。
+        """
+        from src.agents.architect import GENERATE_RETRIES
+
+        client, _ = app_client
+        captured = spy_registry("抱歉，我不能完成这个提炼任务。")
+        res = client.post(
+            "/api/style-forge/constraints",
+            json={"source_text": self.SRC, "requirement": "不要系统流"},
+        )
+        assert res.status_code == 422, res.text
+        assert res.headers.get("X-Inkforge-Error-Source") == "parse"
+        # 关键：走满保真链。改动前是**一次调用就放弃**（1 次），且把拒答文本当成功返回。
+        assert len(captured) == GENERATE_RETRIES + 2, f"未走满保真链：{len(captured)} 次"
+        assert "拒答" in res.json()["detail"] or "可用条目" in res.json()["detail"]
+
+    def test_long_refusal_is_caught_after_normalisation(self, app_client, spy_registry):
+        """绕过 400 字豁免线的长拒答仍不得落成约束（纵深防御）。
+
+        保真链的拒答判据带 400 字豁免线（`REFUSAL_MAX_CHARS`，为保护长正文里的角色台词
+        而设，见 docs/13），一段啰嗦的长拒答能绕过它、被当合格产出返回；
+        随后 `looks_like_refusal` 在**规范化之后**再兜一层，与长度无关。
+        """
+        client, _ = app_client
+        long_refusal = "抱歉。" + "我无法在不触及安全边界的前提下完成这个提炼任务。" * 30
+        assert len(long_refusal) > 400, "夹具必须真的超过 400 字豁免线"
+        spy_registry(long_refusal)
+        res = client.post(
+            "/api/style-forge/constraints",
+            json={"source_text": self.SRC, "requirement": "不要系统流"},
+        )
+        assert res.status_code == 422, res.text
+        assert "拒答" in res.json()["detail"]
+
+    def test_refusal_signature_is_head_anchored(self):
+        """判据是「每一条都以拒答措辞**开头**」：正常约束里提到「抱歉」不得被误杀。
+
+        拒答措辞是通用词汇——「禁止写『抱歉』这类道歉台词」是一条完全合法的约束。
+        真正的拒答产出一定以它开场（「抱歉，我不能…」「作为 AI，我无法…」），
+        被句读兜底切开后首条仍以它开头，故用开头锚定而不是任意位置匹配。
+        """
+        from src.services.constraint_forge import looks_like_refusal
+
+        assert looks_like_refusal(["抱歉，我不能完成这个提炼任务"])
+        assert looks_like_refusal(["作为AI助手，我无法处理这类内容"])
+        # 合法约束：拒答措辞出现在中间 / 引号内 —— 不得误杀
+        assert not looks_like_refusal(["- 禁止在正文里写「抱歉」这类道歉台词"])
+        assert not looks_like_refusal(["- **禁忌**：不要出现「我做不到」式台词"])
+        assert not looks_like_refusal([])
+
     def test_provider_error_detail_is_redacted(self, app_client, spy_registry):
         """回给前端的 502 detail 不得把凭据带出去（上游错误里回显 Key 的情形）。"""
         client, _ = app_client

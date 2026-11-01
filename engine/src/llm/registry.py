@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from src.config.settings import ModelsConfig, ProviderConfig
 from src.llm.anthropic_provider import AnthropicProvider
 from src.llm.base import ChatMessage, ChatResult, ModelProvider, ProviderError
@@ -11,11 +13,32 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _log_call(role: str, provider: str, model: str, prompt_chars: int, max_tokens,
+              res: ChatResult, elapsed: float, fallback: bool = False) -> None:
+    """每次模型调用打一行**内容无关**的诊断（模型名 / 提示词长度 / 收尾原因 / 耗时）。
+
+    由来（2026-09-22 真机排障）：日志里只有"产出不合格"这类结论，没有"这次调用给了多长
+    的提示词、被谁服务、为什么收尾"，导致"上下文越长越容易被拒"这类假设无法验证。
+    这里只记长度与枚举值，**不记任何产出正文**。
+    """
+    logger.info(
+        "[调用] role=%s %s/%s%s prompt_chars=%d max_tokens=%s → %d 字 / %s tokens / "
+        "finish=%s / %.1fs",
+        role, provider, model, "（降级）" if fallback else "", prompt_chars, max_tokens,
+        len(res.content or ""), (res.usage or {}).get("completion_tokens", "?"),
+        res.finish_reason or "（未透出）", elapsed,
+    )
+
+
 def _build_provider(name: str, cfg: ProviderConfig) -> ModelProvider:
     if cfg.type == "openai_compat":
-        return OpenAICompatProvider(name, base_url=cfg.base_url, api_key=cfg.api_key)
+        return OpenAICompatProvider(
+            name, base_url=cfg.base_url, api_key=cfg.api_key, headers=cfg.headers
+        )
     if cfg.type == "anthropic":
-        return AnthropicProvider(name, api_key=cfg.api_key, base_url=cfg.base_url)
+        return AnthropicProvider(
+            name, api_key=cfg.api_key, base_url=cfg.base_url, headers=cfg.headers
+        )
     raise ValueError(f"未知接入点类型: {cfg.type}")
 
 
@@ -30,8 +53,9 @@ class ModelRegistry:
             if pcfg.api_key.startswith("${"):
                 raise ProviderError(
                     name,
-                    f"api_key 占位符 {pcfg.api_key} 对应的环境变量未设置，"
-                    f"请在 .env 中填写",
+                    f"api_key 占位符 {pcfg.api_key} 对应的环境变量未设置："
+                    f"请在 engine/.env 里填写后**重启引擎**"
+                    f"（引擎进程只在启动时读取 .env）",
                 )
             self._providers[name] = _build_provider(name, pcfg)
 
@@ -106,11 +130,15 @@ class ModelRegistry:
             max_tokens=max_tokens or binding.max_tokens,
             json_mode=json_mode,
         )
+        prompt_chars = sum(len(m.content or "") for m in messages)
+        t0 = time.perf_counter()
         try:
-            return self._providers[binding.provider].chat(messages, **kwargs)
+            res = self._providers[binding.provider].chat(messages, **kwargs)
         except ProviderError as e:
             fb = binding.fallback
             if not fb:
+                logger.warning("[调用] role=%s %s/%s prompt_chars=%d → 失败：%s",
+                               role, binding.provider, kwargs["model"], prompt_chars, e)
                 raise
             logger.warning(
                 "角色[%s]主接入点[%s]调用失败，降级到[%s/%s]: %s",
@@ -133,13 +161,19 @@ class ModelRegistry:
             try:
                 res = self._providers[fb.provider].chat(messages, **fb_kwargs)
                 res.used_fallback = True  # 标记本次产出来自降级接入点（可追溯）
-                return res
             except ProviderError as e2:
                 raise ProviderError(
                     fb.provider,
                     f"角色[{role}]主接入点[{binding.provider}]与降级接入点"
                     f"[{fb.provider}]均失败；主: {e}；降级: {e2}",
                 ) from e2
+            _log_call(role, fb.provider, fb_kwargs["model"], prompt_chars,
+                      fb_kwargs.get("max_tokens"), res, time.perf_counter() - t0,
+                      fallback=True)
+            return res
+        _log_call(role, binding.provider, kwargs["model"], prompt_chars,
+                  kwargs.get("max_tokens"), res, time.perf_counter() - t0)
+        return res
 
     def json_mode_available(self, role: str) -> bool:
         return self.provider_for(role).supports_json_mode()

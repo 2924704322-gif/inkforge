@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -33,6 +34,7 @@ from src.config.settings import (
     get_settings,
 )
 from src.memory.md_store import MdStore
+from src.orchestrator.interactive import discard_chapter_work
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -252,6 +254,22 @@ _MODELS_YAML_HEADER = (
     "# 模型接入配置（可在工具页「Agent 模型配置」面板查看/修改）\n"
     "# providers 定义接入点；roles 将 Agent 角色绑定到 接入点/模型/参数。\n"
     "# api_key 推荐使用 ${ENV_VAR} 占位符从环境变量（.env）读取，不落明文。\n"
+    "#\n"
+    "# ⚠ 本文件由「Agent 模型配置」面板整体重写（`_save_models_raw` = 本注释头 + yaml.safe_dump）：\n"
+    "#   手写的行内注释会在下一次保存时被抹掉 —— 需长期留存的说明请写进本注释头或 docs/13。\n"
+    "#\n"
+    "# ⚠ 模型名一律写显式 id，不要写别名：官方端点上的 `deepseek-chat` / `deepseek-reasoner`\n"
+    "#   已被静默改道到 `deepseek-flash`（实测请求 deepseek-chat 返回的 model 就是 deepseek-flash）。\n"
+    "#   别名会让「配置文件一个字没动、线上行为却变了」。\n"
+    "#\n"
+    "# ⚠ 角色绑定定稿（2026-09-22 三臂实测后拍板，数据见 docs/13 §8.3）：全部角色保持官方\n"
+    "#   `deepseek / deepseek-flash`。网关 `opencode-go/deepseek-v4-flash` 出卡 p50 206s（最长 286s），\n"
+    "#   会把「变慢」放大 4~6 倍 → 不采用；网关 `opencode-go/deepseek-flash` 更快但多一层外部\n"
+    "#   网关依赖，只作为可选轮换臂，不设为默认。\n"
+    "# ⚠ 上述结论基于**合成上下文**。同日追加的**真实作品上下文**对照（docs/13 §9）显示：\n"
+    "#   三臂各 2 轮里，官方 flash 1/2 成功、网关 flash 0/2（含 1 次真拒答）、网关 v4-flash **2/2**\n"
+    "#   且 0 结构化失败、调用数最少（4~5 次），代价是墙钟约 2 倍。默认绑定**暂未改动**，\n"
+    "#   n=2 不足以拍板 —— 换绑前请先看 docs/13 §9.3 的修订建议。\n"
 )
 _PROVIDER_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
 _ENV_PLACEHOLDER_RE = re.compile(r"^\$\{(\w+)\}$")
@@ -300,6 +318,8 @@ def _model_config_view(raw: dict) -> dict:
             "base_url": p.get("base_url") or "",
             "api_key": _mask_api_key(key),
             "key_env_set": bool(os.environ.get(m.group(1))) if m else None,
+            # 自定义请求头原样回传（UI 要能编辑）：它们不是凭据字段，而是路由/会话信息
+            "headers": p.get("headers") or {},
         })
     roles = []
     for role, b in (raw.get("roles") or {}).items():
@@ -313,6 +333,47 @@ def _model_config_view(raw: dict) -> dict:
         })
     return {"providers": providers, "roles": roles,
             "path": str(_models_yaml_path())}
+
+
+def _provider_for_model_list(name: str, ptype: str, base_url: str, api_key: str):
+    """为「获取模型」组装一个只用于拉列表的接入点实例（表单值优先、models.yaml 兜底）。
+
+    为什么不用 ModelRegistry：它的构造函数会对**全部**接入点做 Fail-Fast
+    （任一 provider 的 ${ENV_VAR} 未设置就整表构造失败），而拉列表只需要目标接入点
+    自己可用——否则「只想看看某接入点有哪些模型」会被无关的接入点拖死。
+
+    四个入参的语义：
+    - name：接入点名，仅用于实例命名与报错定位；
+    - ptype/base_url/api_key：来自 UI 表单/查询参数，未保存的接入点也能先拉一次；
+      空值（或 api_key 为掩码 ****）时回落到 models.yaml 里已存的值。
+    """
+    from src.config.settings import ProviderConfig
+    from src.llm.registry import _build_provider  # noqa: PLC2701 - 复用唯一构造入口
+
+    stored = _resolve_env_placeholders(
+        ((_load_models_raw().get("providers") or {}).get(name)) or {}
+    )
+    kind = (ptype or str(stored.get("type") or "openai_compat")).strip()
+    url = (base_url or str(stored.get("base_url") or "")).strip()
+    key = api_key.strip()
+    if not key or key == "none" or "****" in key:
+        key = str(stored.get("api_key") or "none")
+    else:
+        # **关键**：GET /api/model-config 对 ${ENV_VAR} 占位符是**不掩码**的（它本来就不是
+        # 秘密），于是「编辑接入点」弹窗会把 ${DEEPSEEK_API_KEY} 原样回传。那不是用户新填
+        # 的字面密钥，而是「沿用环境变量」——必须按占位符语义去环境里取，否则一个真实的
+        # DeepSeek 接入点会因为一次「获取模型」被判定成缺 Key（2026-09-21 实测复现）。
+        m = _ENV_PLACEHOLDER_RE.match(key)
+        if m:
+            key = os.environ.get(m.group(1)) or key
+    # 占位符未被 .env 解析 → 直说差哪个环境变量，别把一个 ${...} 当成 Key 发出去
+    if key.startswith("${"):
+        raise ValueError(
+            f"接入点 [{name}] 的 api_key 占位符 {key} 对应的环境变量未设置，"
+            f"请在 engine/.env 中填写后重启引擎"
+        )
+    cfg = ProviderConfig(type=kind, base_url=url or None, api_key=key)
+    return _build_provider(name, cfg)
 
 
 # ---------- 请求体模型（须在模块级定义：from __future__ import annotations 下，
@@ -390,6 +451,8 @@ class ProviderBody(BaseModel):
     type: str              # openai_compat / anthropic
     base_url: str = ""
     api_key: str = "none"  # 含 **** 视为「保持原值」（编辑时无需重填密钥）
+    #: 自定义请求头；None = 不改动已存的（老客户端不带该字段时不能把已有的头抹掉）
+    headers: dict[str, str] | None = None
 
 
 class OutlineChapterBody(BaseModel):
@@ -831,6 +894,9 @@ class InteractiveSession:
         self._chapter = 0
         self._cards: list[dict] = []
         self._draft: dict | None = None   # {draft_text, attempt, review, model?}
+        #: 草稿/卡片状态的单调版本号：前端据此**跳过无变化的快照**，避免每 2.5s 重渲染
+        #: 整章正文（用户实测的"打字卡顿/输入框像失效了"与此有关）。
+        self._draft_version = 0
         #: 本章预期字数（生成前可设；写入后回填实际生效值）——打回重写时沿用同一个目标，
         #: 否则"生成前设的 5000 字"会在第一次打回后悄悄退回默认值（用户实测的坑）。
         self._chapter_target: int | None = None
@@ -840,6 +906,9 @@ class InteractiveSession:
         self._error_hint: str = ""
         #: 本次会话实际用到的 角色→provider/model（用于把失败归因落到具体接入点）
         self._models: dict[str, str] = {}
+        #: 最近一次「删除本章工作内容并回退到出卡」的结果：{chapter, removed[], missing[]}
+        #: UI 在轮询快照里取它，把"删了哪几个文件"如实告诉用户。
+        self._last_discard: dict | None = None
         self._worker: threading.Thread | None = None
         self._runner = None                  # InteractiveRunner（重型装配，会话内缓存）
 
@@ -894,6 +963,61 @@ class InteractiveSession:
 
     def _busy(self) -> bool:
         return self._status in ("generating_cards", "writing", "committing")
+
+    def discard(self) -> dict:
+        """删除本章未定稿的工作内容与产出，回到出卡阶段（破坏性动作，UI 已二次确认）。
+
+        与 `reset()` 的区别：reset 只清 error 态、**什么都不删**。
+
+        2026-09-22 改为**同步删除 + 返回删除清单**：删除是纯文件操作（毫秒级），
+        不需要装配整条流水线，于是可以在 HTTP 响应里直接告诉用户"删了哪几个文件"，
+        而不是让 UI 靠轮询猜（用户实测：提示常驻、看不出到底删了什么）。只有"重新出卡"
+        才转后台线程。索引清理在会话已装配时一并做（未装配则没有索引条目要清）。
+        """
+        from src.memory.md_store import MdStore
+
+        with self._lock:
+            if self._busy():
+                raise RuntimeError("互动会话正在处理中，请等当前这一步跑完再删除")
+            if not self._chapter:
+                raise RuntimeError("会话尚未开始，没有可删除的工作内容")
+            chapter = self._chapter
+            self._status = "generating_cards"
+            self._cards = []
+            self._draft = None
+            self._draft_version += 1
+            self._chapter_target = None
+            self._error = None
+            self._error_source = ""
+            self._error_hint = ""
+            self._last_discard = None
+            runner = self._runner
+
+        store = MdStore(get_settings().novels_dir / self.novel_id, auto_git=True,
+                        create_repo=False)
+        index = None
+        if runner is not None:
+            try:
+                index = runner.pipe.memory.index
+            except Exception:  # noqa: BLE001 - 索引是可重建的派生物
+                index = None
+        result = discard_chapter_work(store, chapter, index=index)
+        with self._lock:
+            self._last_discard = result
+        # 删完再重新出卡（慢，走后台线程）
+        self._spawn(self._do_discard, chapter)
+        return result
+
+    def _do_discard(self, chapter: int) -> None:
+        """先删（同步、快），再重新出卡（慢，仍在后台线程里）。"""
+        runner = self._ensure_runner()
+        result = runner.discard_chapter_work(chapter)
+        with self._lock:
+            self._last_discard = result
+        cards = runner.generate_cards(chapter)
+        with self._lock:
+            self._cards = cards
+            self._status = "awaiting_choice"
 
     # -- 用户动作（均在持锁校验后转后台线程） --
 
@@ -1074,7 +1198,7 @@ class InteractiveSession:
                 from src.config.app_config import get_app_config
 
                 floor, ceiling = get_app_config().generation.length_bounds(int(target))
-            return {
+            compact = {
                 "novel_id": self.novel_id,
                 "status": self._status,
                 "chapter": self._chapter,
@@ -1089,7 +1213,21 @@ class InteractiveSession:
                 "target_words": self._chapter_target or self.target_words,
                 "length_floor": floor,
                 "length_ceiling": ceiling,
+                # 回退结果（UI 据此提示"已删除哪些文件"；无回退时为 None）
+                "last_discard": dict(self._last_discard) if self._last_discard else None,
             }
+            # 快照版本：内容没变时前端**整帧跳过**，不再每 2.5s 重渲染整章正文。
+            # 由来（用户实测）：轮询把整章草稿塞进响应、Vue 每轮都判定为"新对象"而重渲染，
+            # 草稿变长后输入框出现明显卡顿（"点不动、打不了字"）。
+            payload = json.dumps([compact["status"], compact["chapter"], self._draft_version,
+                                  [c.get("card_id") for c in compact["cards"]],
+                                  (compact["draft"] or {}).get("draft_text", "")[:4000],
+                                  compact["error"], compact["last_discard"],
+                                  compact["target_words"], approved],
+                                 ensure_ascii=False, default=str)
+            compact["version"] = hashlib.md5(payload.encode("utf-8")).hexdigest()[:12]
+            compact["draft_version"] = self._draft_version
+            return compact
 
 
 # ---------- 多书会话中枢（v2.0 P4-B）----------
@@ -1375,6 +1513,34 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
         """查看各 Agent 角色的接入点/模型绑定与接入点定义（密钥掩码）。"""
         return JSONResponse(_model_config_view(_load_models_raw()))
 
+    @app.get("/api/model-config/providers/{name}/models")
+    def model_config_provider_models(
+        name: str, type: str = "", base_url: str = "", api_key: str = ""
+    ) -> JSONResponse:
+        """获取该接入点当前可用的模型清单，供前端下拉选择目标模型（不再手抄模型名）。
+
+        type / base_url / api_key 三个可选查询参数服务于「接入点还没保存，想先看看有
+        哪些模型」：给了就以表单值为准（api_key 传掩码 **** = 沿用已存密钥）。
+
+        失败**不抛 HTTP 错误**：UI 需要的是可读原因（缺环境变量 / Key 被拒 / 网络不通 /
+        端点是没实现 /models 的兼容端点），而不是一个 500。故统一 200 + ok=false。
+        """
+        if not _PROVIDER_NAME_RE.match(name):
+            raise HTTPException(400, f"非法接入点名：{name!r}（仅限字母/数字/下划线/连字符）")
+        try:
+            provider = _provider_for_model_list(name, type, base_url, api_key)
+            models = provider.list_models()
+        except Exception as exc:  # noqa: BLE001 - 拉取失败原样透出（含 Key/网络/合约）
+            logger.warning("接入点[%s]模型列表拉取失败：%s", name, exc)
+            return JSONResponse({
+                "ok": False, "provider": name, "models": [], "count": 0,
+                "error": str(exc)[:300],
+            })
+        logger.info("接入点[%s]模型列表拉取成功：%d 个", name, len(models))
+        return JSONResponse({
+            "ok": True, "provider": name, "models": models, "count": len(models),
+        })
+
     @app.put("/api/model-config/roles/{role}")
     def model_config_update_role(role: str, body: RoleBindingBody) -> JSONResponse:
         """修改角色绑定（provider/model/temperature/max_tokens；fallback 保留）。"""
@@ -1408,9 +1574,20 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
         provider = {"type": body.type.strip(), "api_key": key}
         if body.base_url.strip():
             provider["base_url"] = body.base_url.strip()
+        # headers：显式给了就整体替换（删掉一行 = 删掉这个头）；没给就沿用已存的
+        if body.headers is not None:
+            if body.headers:
+                provider["headers"] = {
+                    str(k).strip(): str(v).strip()
+                    for k, v in body.headers.items()
+                    if str(k).strip()
+                }
+        elif old.get("headers"):
+            provider["headers"] = old["headers"]
         providers[name] = provider
         _save_models_raw(raw)
-        logger.info("接入点[%s]已%s", name, "更新" if old else "新建")
+        logger.info("接入点[%s]已%s（自定义头 %d 个）",
+                    name, "更新" if old else "新建", len(provider.get("headers") or {}))
         return JSONResponse({"ok": True, **_model_config_view(raw)})
 
     @app.delete("/api/model-config/providers/{name}")
@@ -1688,6 +1865,25 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
             raise HTTPException(409, str(exc))
         return JSONResponse({"ok": True, "state": _isess(novel).snapshot()})
 
+    @app.post("/api/interactive/discard")
+    def interactive_discard(novel: str = "") -> JSONResponse:
+        """删除本章未定稿的工作内容与产出，回退到「出卡」阶段（破坏性，UI 侧二次确认）。
+
+        删什么（存在才删，均同步进 Git 写作历史、可回滚）：
+        `interactive/ch-NNN.cards.md`、未定稿草稿章节、`reviews/ch-NNN.review.md`、
+        `summaries/ch-NNN.summary.md`；已定稿章节拒绝（400）。
+
+        **同步返回删除清单**（`removed` / `missing` / `index_purged`），前端据此弹一次性提示；
+        重新出卡在后台线程进行。快照里的 `last_discard` 仍保留供追溯。
+        """
+        try:
+            result = _isess(novel).discard()
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return JSONResponse({"ok": True, **result, "state": _isess(novel).snapshot()})
+
     @app.post("/api/interactive/choose")
     def interactive_choose(body: InteractiveChooseBody, novel: str = "") -> JSONResponse:
         """选卡（c1/c2/c3/custom）→ 后台写章 + Editor 参考审查。"""
@@ -1916,6 +2112,9 @@ def create_app(novel_id: str, target_words: int = 3000) -> FastAPI:
     # 风格工坊第三页：约束提炼（**只吃用户文本，不读任何作品内容**——隔离见 inkforge_forge 文件头）
     from src.web.inkforge_forge import register_forge_api
     register_forge_api(app, hub, novel_id)
+    # 创作功能第四项：正文改写（原文 + 要求 → 整篇改后正文；最小改动闸门见 revision_forge 文件头）
+    from src.web.inkforge_revision import register_revision_api
+    register_revision_api(app, hub, novel_id)
 
     # ────────── 访问控制（S1-4）──────────
     # 必须在所有路由注册完成后再挂中间件；token 由桌面壳经环境变量注入，

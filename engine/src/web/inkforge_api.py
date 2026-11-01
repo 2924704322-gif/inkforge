@@ -24,6 +24,7 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from src.agents.prompt_loader import has_constraints
 from src.config.settings import get_settings
 from src.memory.md_store import MdStore
 from src.utils.logger import get_logger
@@ -126,6 +127,75 @@ def _clip_context_section(label: str, text: str, quota: int) -> str:
     return f"{label}\n{text[:quota]}\n（注：本段超出配额，已截断至 {quota} 字）"
 
 
+# ---------- 约束块：对话链路的最高优先级通道（创作中途注入） ----------
+
+#: 约束来源相对路径（提升优先级时据此把它提到上下文最前）
+CONSTRAINT_SECTION_REL = "settings/custom-skills.md"
+
+#: 约束块与其余上下文之间的显式优先边界。
+#:
+#: 双重作用：① 给模型一条明确的"优先级分界线"（上方是最高指令，下方是事实源摘录）；
+#: ② 给 clip_context 一个**确定性**的定位锚，使"约束头"不依赖脆弱的字符串结束匹配。
+CONSTRAINT_HEAD_BOUNDARY = (
+    "\n\n===== 【以上为最高优先级创作约束 · 以下为作品事实源摘录；"
+    "两者冲突时一律以上方约束为准】 =====\n\n"
+)
+
+#: 事实源被预算截断时的标注（与"约束不受影响"一起说清，避免模型把截断当成设定缺失）
+_CONTEXT_TRUNCATE_NOTE = (
+    "\n\n（注：作品事实源超出本次预算，已截断；上方最高优先级约束不受影响。）"
+)
+
+
+def _constraint_context_block(label: str, text: str, quota: int) -> str:
+    """把约束段渲染成对话链路上的**最高优先级刚性块**。
+
+    由来（用户实测 2026-10-04，"创作中途注入不生效"）——两处结构性缺口：
+    ① **同级并列**：约束段此前与状态板/伏笔/文风一样，只是上下文里的一段**裸文本**，
+       没有"最高优先级 / 覆盖一切"的框架，也没有冲突裁决口径，模型自然当普通事实源读；
+    ② **可被整段切掉**：约束段排在【作品】【进度】【人物】【近期摘要】之后，而下游有
+       四处按字数硬切上下文（规划器 1500 / 路由 2200 / 汇总 2600 / 主智能体 3200）——
+       前置段落够长时，约束会被**整段截掉**，用户看到的正是"我明明绑了约束，墨师却当没看见"。
+
+    本函数负责 ①（刚性化），② 由 build_book_context 提位 + clip_context 保底共同解决。
+    与正文链路共用 `render_constraint_block`，不另写一套措辞（避免两套话术漂移）；
+    对话链路不重复执行清单（配额受字数约束，复述会成倍吃掉额度、反而少看到原文）。
+    """
+    if not has_constraints(text):
+        return _clip_context_section(label, text, quota)
+    from src.agents.prompt_loader import (
+        ORIGIN_AUTHOR_CONSTRAINTS,
+        origin_mark,
+        render_constraint_block,
+    )
+
+    body = text if len(text) <= quota else (
+        f"{text[:quota]}\n（注：本段超出配额，已截断至 {quota} 字）"
+    )
+    return (
+        f"{label}\n"
+        f"{origin_mark(ORIGIN_AUTHOR_CONSTRAINTS)}\n"
+        f"{render_constraint_block(body, include_checklist=False)}"
+    )
+
+
+def clip_context(context: str, limit: int) -> str:
+    """按预算截取书籍上下文，但**永不截掉开头的约束块**。
+
+    裸切片把所有事实源当成等价优先级，而约束是全链路唯一的最高优先级输入。
+    约束头（含边界）无论多长都整段保留；预算余量才留给作品事实源。
+    """
+    if not context or len(context) <= limit:
+        return context
+    head, sep, rest = context.partition(CONSTRAINT_HEAD_BOUNDARY)
+    if not sep:
+        return context[:limit] + _CONTEXT_TRUNCATE_NOTE
+    budget = max(limit - len(head) - len(sep), 0)
+    tail = rest[:budget]
+    note = "" if tail == rest else _CONTEXT_TRUNCATE_NOTE
+    return head + sep + tail + note
+
+
 def _is_rule_like(value: Any) -> bool:
     """是否为"规则类"结构化字段（清单/条目），需要完整保真而不是归一化截断。"""
     if isinstance(value, dict):
@@ -207,8 +277,14 @@ def build_book_context(store: MdStore, novel: str = "") -> str:
         "truncated": fixed_truncated,
     }]
     blocks = [fixed] if fixed else []
+    constraint_block = ""
     for (rel, label, text, _floor, _cap), quota in zip(entries, quotas):
-        block = _clip_context_section(label, text, quota)
+        if rel == CONSTRAINT_SECTION_REL:
+            # 约束段走刚性化通道（其余段仍是"标签 + 文本"）
+            block = _constraint_context_block(label, text, quota)
+            constraint_block = block
+        else:
+            block = _clip_context_section(label, text, quota)
         blocks.append(block)
         attribution.append({
             "origin": rel,
@@ -216,15 +292,27 @@ def build_book_context(store: MdStore, novel: str = "") -> str:
             "chars": len(block),
             "quota": quota,
             "truncated": len(text) > quota,
+            "priority": "constraint" if rel == CONSTRAINT_SECTION_REL else "fact",
         })
+    if constraint_block:
+        # 提位到最前：下游所有 `context[:N]` 截断都从尾部切，约束因此永不被切掉。
+        # 这是"创作中途注入"能生效的结构性前提——顺序即优先级。
+        blocks.remove(constraint_block)
+        blocks.insert(0, constraint_block)
+        # 约束头与事实源之间显式划界（clip_context 的确定性锚点）
+        fixed_head = constraint_block + CONSTRAINT_HEAD_BOUNDARY
+        rest = blocks[1:]
+        ordered = [fixed_head, *rest]
+    else:
+        ordered = blocks
     logger.info(
         "书籍上下文组装归因[%s] 总长 %d/%d：%s",
         novel,
-        sum(len(b) for b in blocks),
+        sum(len(b) for b in ordered),
         BOOK_CONTEXT_TOTAL_BUDGET,
         json.dumps(attribution, ensure_ascii=False),
     )
-    return "\n\n".join(blocks)
+    return "\n\n".join(ordered)
 
 
 def actions_is_write(op: str) -> bool:
@@ -654,7 +742,7 @@ def _plan_actions_with_model(registry, role: str, user_msg: str,
         f"{extra}"
         "若确实无需任何工具，输出 {\"actions\": []}。\n\n"
         f"【工具清单】\n{_summarize_action_manifest()}\n\n"
-        f"【当前上下文摘录】\n{context[:1500]}"
+        f"【当前上下文摘录】\n{clip_context(context, 1500)}"
     )
     messages = [ChatMessage(role="system", content=system), *history[-4:],
                 ChatMessage(role="user", content=user_msg)]
@@ -961,7 +1049,12 @@ from src.agents.prompt_loader import CONSTITUTION  # noqa: E402 - 集中登记�
 
 # W3 单一源（同上）：约束提炼智能体的默认提示词只在 src/services/constraint_forge.py
 # 定义一份，此处按其常量引用，避免"改了一处另一处不生效"。第零条由 agent_prompt() 运行时追加。
-from src.services import constraint_forge  # noqa: E402 - 集中登记转出
+# 同上单一源：正文改写智能体的默认提示词只在 src/services/revision_forge.py 定义一份。
+# 第零条由 agent_prompt() 运行时追加。
+from src.services import (
+    constraint_forge,  # noqa: E402 - 集中登记转出
+    revision_forge,  # noqa: E402 - 集中登记转出
+)
 
 MASTER_PROMPT = (
     "你是「墨师」，Inkforge 的主创作智能体——长篇小说的总编辑兼总控，也是与作者对接的唯一入口。\n"
@@ -1002,6 +1095,13 @@ AGENT_PRESETS = {
     constraint_forge.AGENT_KEY: {
         "label": constraint_forge.AGENT_LABEL,
         "prompt": constraint_forge.SYSTEM_PROMPT,
+    },
+    # 「正文改写」模块的专职智能体（创作功能第四项）：同上——与子智能体同级注册，
+    # 于是自带"可在智能体设置里查看/改提示词 + 运行时必带第零条"两项既有能力。
+    # 它同样不是对话/路由用的阶段智能体（不进 ROUTER_PROMPT 的委派枚举）。
+    revision_forge.AGENT_KEY: {
+        "label": revision_forge.AGENT_LABEL,
+        "prompt": revision_forge.SYSTEM_PROMPT,
     },
 }
 
@@ -1222,49 +1322,19 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
         return None
 
     def _book_context(novel: str) -> str:
-        """组装书籍上下文（设定/进度/伏笔/状态板/近期摘要，总量受控）。"""
-        store = _store(novel)
-        parts: list[str] = []
+        """组装书籍上下文（设定/进度/伏笔/状态板/近期摘要，总量受控）。
 
-        if store.exists("settings/outline.md"):
-            meta = store.read("settings/outline.md").metadata
-            volumes = meta.get("volumes") or []
-            planned = sum(len(v.get("chapters", [])) for v in volumes if isinstance(v, dict))
-            parts.append(f"【作品】《{meta.get('title', '')}》主题：{meta.get('theme', '')}；计划 {planned} 章")
-        elif store.exists("settings/story-overview.md"):
-            meta = store.read("settings/story-overview.md").metadata
-            parts.append(f"【作品】《{meta.get('book_title', '')}》{meta.get('synopsis', '')[:200]}")
+        2026-10-04 修复（用户实测"创作中途注入不生效"的**根因**）：
+        本函数此前是模块级 `build_book_context` 的**早期重复实现**，两者能力并不一致——
+        它压根不读 `settings/custom-skills.md`，于是对话链路（= 创作中途）从建库起就
+        从来没有拿到过自定义创作约束；而模块级那份（W2 分段保底 + 按需分配 + 约束段）
+        只被测试调用，成了典型的"测试绿、线上缺"死代码。
+        更糟的是它末尾还有一次 `text[:6000]` 硬切，与下游 `clip_context` 的预算叠加。
 
-        chapters = store.list_chapters()
-        if chapters:
-            approved = sum(1 for c in chapters if c.metadata.get("status") == "approved")
-            parts.append(f"【进度】已定稿 {approved}/{len(chapters)} 章")
-
-        chars = sorted((store.root / "settings" / "characters").glob("*.md")) if (store.root / "settings" / "characters").exists() else []
-        if chars:
-            lines = []
-            for p in chars[:12]:
-                doc = store.read(p.relative_to(store.root).as_posix())
-                m = doc.metadata
-                lines.append(f"- {m.get('name', p.stem)}（{m.get('role', '')}）：{str(m.get('personality', ''))[:80]}")
-            parts.append("【人物】\n" + "\n".join(lines))
-
-        for rel, label, cap in [
-            ("settings/foreshadowing.md", "【伏笔台账】", 600),
-            ("settings/state-board.md", "【实体状态板】", 500),
-            ("settings/style.md", "【文风指纹】", 500),
-        ]:
-            if store.exists(rel):
-                parts.append(f"{label}\n{store.read(rel).content[:cap]}")
-
-        summaries = sorted((store.root / "summaries").glob("*.md")) if (store.root / "summaries").exists() else []
-        if summaries:
-            recent = summaries[-2:]
-            lines = [store.read(p.relative_to(store.root).as_posix()).content[:250] for p in recent]
-            parts.append("【近期章节摘要】\n" + "\n".join(lines))
-
-        text = "\n\n".join(parts)
-        return text[:6000]
+        现在直接委托模块级实现：约束刚性化、提位、保底截断一并生效，
+        且此后只有一处需要维护（消除两份实现的漂移）。
+        """
+        return build_book_context(_store(novel), novel)
 
     def _workspace_context() -> str:
         """组装工作区上下文（P1）：书目索引 + 全局资源 + 动作铁律。"""
@@ -1332,7 +1402,9 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
         # 会话型智能体白名单：**排除约束提炼智能体** —— 它是风格工坊页面的专用智能体，
         # 数据通路只有"用户文本 → 约束条目"；一旦让它当会话智能体，就会走进带作品上下文
         # 的对话链路（那正是它承诺不看的东西）。隔离要成立，入口也得一起关。
-        allowed = (set(AGENT_PRESETS) | {"chat"}) - {constraint_forge.AGENT_KEY}
+        allowed = (set(AGENT_PRESETS) | {"chat"}) - {
+            constraint_forge.AGENT_KEY, revision_forge.AGENT_KEY,
+        }
         if body.agent not in allowed:
             raise HTTPException(400, f"未知智能体：{body.agent}")
         scope_value, book = _resolve_scope(novel)
@@ -1455,7 +1527,7 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
                     ChatMessage(
                         role="user",
                         content=(
-                            f"【作品上下文摘要】\n{context[:2200]}\n\n【用户消息】\n{user_msg}"
+                            f"【作品上下文摘要】\n{clip_context(context, 2200)}\n\n【用户消息】\n{user_msg}"
                         ),
                     ),
                 ],
@@ -1494,7 +1566,7 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
                     ChatMessage(
                         role="system",
                         content=(MASTER_SYNTH_PROMPT + "\n\n" + action_block
-                                 + "\n\n【作品上下文】\n" + context[:2600]),
+                                 + "\n\n【作品上下文】\n" + clip_context(context, 2600)),
                     ),
                     *prior,
                     ChatMessage(role="user", content=user_msg),
@@ -1510,7 +1582,7 @@ def register_inkforge_api(app: Any, hub: Any, default_novel: str) -> None:
                     ChatMessage(
                         role="system",
                         content=(MASTER_PROMPT + "\n\n" + action_block
-                                 + "\n\n【作品上下文】\n" + context[:3200]),
+                                 + "\n\n【作品上下文】\n" + clip_context(context, 3200)),
                     ),
                     *prior,
                     ChatMessage(role="user", content=user_msg),

@@ -128,6 +128,19 @@ def run(data_dir: Path, engine: EngineProcess, suite: Suite, args: argparse.Name
         suite.check("B3 探活返回连通结果",
                     probe.status == 200, json.dumps(probe.body, ensure_ascii=False)[:160])
 
+        # 「获取模型」：UI 下拉候选的来源（B1/B2 只验了读写与连通，没验这条新链路）
+        pname = ((body.get("providers") or [{}])[0]).get("name", "deepseek")
+        listed = _llm_call(
+            suite,
+            f"B4 获取模型清单（GET /api/model-config/providers/{pname}/models）",
+            lambda: http("GET", f"{base}/api/model-config/providers/{pname}/models", timeout=QUICK),
+        )
+        lb = listed.body or {}
+        suite.check("B5 模型清单非空且结构正确",
+                    listed.status == 200 and lb.get("ok") is True and lb.get("count", 0) >= 1
+                    and isinstance(lb.get("models"), list),
+                    f"ok={lb.get('ok')} count={lb.get('count')} models={lb.get('models')}")
+
     # ═══ C 书架与建书 ═══
     print("\n[C] 书架与建书", flush=True)
     books = (http("GET", f"{base}/api/books", timeout=QUICK).body or {}).get("books", [])

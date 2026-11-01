@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue'
 
 import { api } from '../api'
-import { appStore } from '../store'
+import { appStore, openRevision } from '../store'
 import type { ChapterRaw, ChapterSummary, SettingsDoc } from '../types'
 
 interface DocState {
@@ -187,6 +187,46 @@ function onInput(): void {
 function switchChapter(ch: number): void {
   appStore.selection = { kind: 'chapter', chapter: ch }
 }
+
+/**
+ * 「✎ 正文改写」入口（创作空间 → 正文改写）。
+ *
+ * 取原文的口径：**有选中就只送选中的那几段，没选中就送整章**。
+ * 选区落在哪一段，哪一段就成为锚点（1 起段号）——锚点既是"改哪里"的指令，
+ * 也是引擎判"有没有越界"的依据（见 revision_forge.build_diff）。
+ *
+ * 为什么要走 `openRevision()` 而不是直接改 store.sideWindow：侧窗会盖住对话栏，
+ * 入口必须留下来源面包屑；统一通道能保证四个入口的行为不会各写一套。
+ */
+function sendToRevision(): void {
+  if (!doc.value) return
+  if (selectionMismatch.value) {
+    window.alert('正文还没跟上你选中的文档：请在创作空间里重新点一次目标文稿，再送去改写。')
+    return
+  }
+  const full = doc.value.content
+  const picked = (window.getSelection?.()?.toString() ?? '').trim()
+  const source = picked.length >= 8 ? picked : full
+  const paras = full
+    .replace(/\r\n/g, '\n')
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0)
+  const anchorIndex = picked
+    ? paras.findIndex((p) => p.includes(picked.slice(0, 20))) + 1
+    : 0
+  const where = doc.value.kind === 'chapter'
+    ? `第 ${doc.value.key.replace('ch-', '')} 章`
+    : doc.value.title
+  openRevision({
+    source,
+    origin: `创作空间 · ${where}${picked ? '（选中段）' : '（整篇）'}`,
+    anchorIndex: anchorIndex || undefined,
+    fillBack: doc.value.kind === 'chapter'
+      ? { chapter: Number(doc.value.key.replace('ch-', '')), novelId: appStore.bookId }
+      : null,
+  })
+}
 </script>
 
 <template>
@@ -214,7 +254,7 @@ function switchChapter(ch: number): void {
         <button class="align-retry" @click="loadSelection">重新加载</button>
       </div>
 
-      <!-- 章节 Tab（DeepWrite 的横向小节标签） -->
+      <!-- 章节 Tab（横向小节标签） -->
       <div v-if="chapters.length > 0" class="chapter-tabs scroll-y">
         <button
           v-for="ch in chapters"
@@ -234,6 +274,13 @@ function switchChapter(ch: number): void {
         </div>
         <span class="toolbar-sep" />
         <span class="muted">{{ isMarkdown ? 'Markdown' : '正文' }}</span>
+        <button
+          class="ghost-btn revision-btn"
+          title="把这篇（或你选中的那几段）送进「正文改写」：只改你点名的地方，其余逐字保留"
+          @click="sendToRevision"
+        >
+          ✎ 正文改写
+        </button>
         <div class="toolbar-right">
           <button class="primary-btn" :disabled="!dirty || saving" @click="save">
             {{ saving ? '保存中…' : '保存' }}
@@ -266,12 +313,14 @@ function switchChapter(ch: number): void {
 
 <style scoped>
 .editor-pane {
-  flex: 0 0 clamp(400px, 34vw, 640px);
-  width: clamp(400px, 34vw, 640px);
+  /* 宽度由 App.vue 的栅格（--doc-w）决定；改造前这里是 flex:0 0 clamp(400px,34vw,640px)，
+     但那行其实被 App.vue 的内联 width 覆盖着，是死代码。 */
   display: flex;
   flex-direction: column;
-  background: #fff;
-  border-left: 1px solid #e9ebee;
+  min-width: 0;
+  height: 100%;
+  background: var(--bg-0);
+  border-left: 1px solid var(--line-1);
 }
 .crumb-row {
   display: flex;

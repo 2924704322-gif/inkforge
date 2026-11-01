@@ -84,3 +84,5 @@ major 问题 = 设定硬冲突 / 偏离大纲核心事件 / 明显吃书 / 违�
 
 ## 待审正文
 {{chapter_text}}
+
+{{custom_constraints_tail}}

@@ -102,8 +102,8 @@ def main() -> int:  # noqa: C901
 
             page.locator('input[placeholder="例：my-first-novel"]').fill("probe-book")
             # X1 结构化 brief 之后这里已经是 <input>（不再是单个 textarea）——选择器不限标签
-            page.locator('[placeholder*="东方玄幻"]').fill("东方玄幻，冷峻剑修主角，复仇主线。")
-            with_demo = page.locator('input[type="checkbox"]').is_checked()
+            page.locator('textarea[placeholder*="东方玄幻"]').fill("东方玄幻，冷峻剑修主角，复仇主线。")
+            with_demo = page.get_by_role("checkbox", name="先生成设定 Demo").is_checked()
             check("「先生成设定 Demo」默认勾选", with_demo)
             page.screenshot(path=str(SHOTS / "1-create-form.png"))
 
@@ -178,7 +178,7 @@ def main() -> int:  # noqa: C901
             page.get_by_role("button", name="新建作品").click()
             page.wait_for_timeout(300)
             page.locator('input[placeholder="例：my-first-novel"]').fill("probe-book")
-            page.locator('[placeholder*="东方玄幻"]').fill("测试内容")
+            page.locator('textarea[placeholder*="东方玄幻"]').fill("测试内容")
             page.get_by_role("button", name="创建").click()
             page.wait_for_selector("text=设定 Demo 审核", timeout=10_000)
             page.wait_for_timeout(500)

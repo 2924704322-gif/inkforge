@@ -355,3 +355,186 @@ class TestPlanForChapter:
 
         plans = chapter_plans(self._state())
         assert [p["chapter"] for p in plans] == [1, 2, 3]
+
+
+class TestProviderModelList:
+    """「获取模型」能力：接入点要能报出可用模型名，失败必须给出可读原因。
+
+    全部离线：直接替换 provider 的 SDK client，不发任何真实请求。
+    """
+
+    @staticmethod
+    def _provider(list_impl):
+        from types import SimpleNamespace
+
+        from src.llm.openai_compat import OpenAICompatProvider
+
+        provider = OpenAICompatProvider(
+            "t", base_url="http://127.0.0.1:9/v1", api_key="sk-x"
+        )
+        provider._client = SimpleNamespace(models=SimpleNamespace(list=list_impl))
+        return provider
+
+    @staticmethod
+    def _models(*ids):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(data=[SimpleNamespace(id=i) for i in ids])
+
+    def test_returns_sorted_unique_ids(self):
+        provider = self._provider(lambda **kw: self._models("deepseek-chat", "deepseek-reasoner", "deepseek-chat"))
+        assert provider.list_models() == ["deepseek-chat", "deepseek-reasoner"]
+
+    def test_items_without_id_are_skipped(self):
+        from types import SimpleNamespace
+
+        page = SimpleNamespace(data=[SimpleNamespace(id="a"), SimpleNamespace()])
+        assert self._provider(lambda **kw: page).list_models() == ["a"]
+
+    def test_uses_short_timeout(self):
+        """拉列表必须有界：超时沿用探活口径，不能借用正文生成的 10 分钟。"""
+        from src.llm.openai_compat import PROBE_TIMEOUT_SECONDS
+
+        seen: dict = {}
+
+        def _list(**kw):
+            seen.update(kw)
+            return self._models("m")
+
+        self._provider(_list).list_models()
+        assert seen["timeout"] == PROBE_TIMEOUT_SECONDS
+
+    def test_missing_models_route_is_explained(self):
+        from src.llm.base import ProviderError
+
+        class _NotFound(Exception):
+            status_code = 404
+
+        def _raise(**kw):
+            raise _NotFound("Not Found")
+
+        with pytest.raises(ProviderError) as err:
+            self._provider(_raise).list_models()
+        assert "/models" in str(err.value)
+
+    def test_rejected_key_is_explained(self):
+        from src.llm.base import ProviderError
+
+        class _Unauthorized(Exception):
+            status_code = 401
+
+        def _raise(**kw):
+            raise _Unauthorized("Unauthorized")
+
+        with pytest.raises(ProviderError) as err:
+            self._provider(_raise).list_models()
+        assert "API Key" in str(err.value)
+
+    def test_unsupported_provider_type_fails_loudly(self):
+        """默认实现必须抛错：返回空列表会被读成「这个接入点没有模型」。"""
+        from src.llm.base import ModelProvider, ProviderError
+
+        class _Bare(ModelProvider):
+            def chat(self, messages, model, temperature=0.7, max_tokens=None, json_mode=False):
+                raise NotImplementedError
+
+            def probe(self, model):
+                raise NotImplementedError
+
+        with pytest.raises(ProviderError):
+            _Bare("bare").list_models()
+
+
+class TestProviderCustomHeaders:
+    """接入点自定义请求头：网关要求 x-opencode-session 之类的头时，列表拿得到≠模型能用。
+
+    由来（2026-09-21 用户实测）：opencode-go 的 /models 返回 200，/chat/completions 却
+    400 MissingSessionID —— 只有能配请求头，这类网关才用得起来。
+    """
+
+    def test_openai_compat_client_carries_headers(self):
+        from src.config.settings import ProviderConfig
+        from src.llm.registry import _build_provider
+
+        provider = _build_provider(
+            "gw",
+            ProviderConfig(
+                type="openai_compat",
+                base_url="http://127.0.0.1:9/v1",
+                api_key="k",
+                headers={"x-opencode-session": "s-1", "User-Agent": "inkforge/0.1"},
+            ),
+        )
+        sent = dict(provider._client.default_headers)
+        assert sent["x-opencode-session"] == "s-1"
+        assert sent["User-Agent"] == "inkforge/0.1"
+
+    def test_no_headers_stays_none(self):
+        from src.config.settings import ProviderConfig
+
+        cfg = ProviderConfig(type="openai_compat", base_url="http://127.0.0.1:9/v1")
+        assert cfg.headers == {}
+
+    def test_anthropic_client_carries_headers(self):
+        from src.config.settings import ProviderConfig
+        from src.llm.registry import _build_provider
+
+        provider = _build_provider(
+            "gw",
+            ProviderConfig(type="anthropic", api_key="k", headers={"x-probe": "1"}),
+        )
+        assert provider._client.default_headers["x-probe"] == "1"
+
+    def test_models_config_rejects_non_string_header(self):
+        """请求头必须是字符串映射：写错的结构要在加载期就炸，而不是发请求时炸。"""
+        from pydantic import ValidationError
+
+        from src.config.settings import ModelsConfig
+
+        with pytest.raises(ValidationError):
+            ModelsConfig.model_validate(
+                {
+                    "providers": {
+                        "p": {
+                            "type": "openai_compat",
+                            "base_url": "http://127.0.0.1:9/v1",
+                            "headers": {"x": 1},
+                        }
+                    },
+                    "roles": {
+                        "architect": {"provider": "p", "model": "m"},
+                        "writer": {"provider": "p", "model": "m"},
+                        "editor": {"provider": "p", "model": "m"},
+                    },
+                }
+            )
+
+
+class TestDotenvRefresh:
+    """新增的 .env 键不必重启引擎（否则「测试」会报环境变量未设置，而文件里明明写好了）。"""
+
+    def test_new_key_is_picked_up_without_restart(self, tmp_path, monkeypatch):
+        import os
+
+        from src.config import settings as settings_mod
+
+        monkeypatch.setattr(settings_mod, "PROJECT_ROOT", tmp_path)
+        monkeypatch.delenv("INKFORGE_PROBE_REFRESH_KEY", raising=False)
+        (tmp_path / ".env").write_text(
+            "INKFORGE_PROBE_REFRESH_KEY=sk-added-later\n", encoding="utf-8"
+        )
+        settings_mod._load_dotenv()
+        assert os.environ["INKFORGE_PROBE_REFRESH_KEY"] == "sk-added-later"
+
+    def test_existing_env_var_is_not_overridden(self, tmp_path, monkeypatch):
+        import os
+
+        from src.config import settings as settings_mod
+
+        monkeypatch.setattr(settings_mod, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setenv("INKFORGE_PROBE_KEEP_KEY", "from-process")
+        (tmp_path / ".env").write_text(
+            "INKFORGE_PROBE_KEEP_KEY=from-file\n", encoding="utf-8"
+        )
+        settings_mod._load_dotenv()
+        assert os.environ["INKFORGE_PROBE_KEEP_KEY"] == "from-process"

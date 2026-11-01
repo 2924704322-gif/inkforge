@@ -7,7 +7,7 @@ import path from 'node:path'
 import type { EngineState, EngineStateEvent } from '../shared/bridge'
 
 /**
- * Python 引擎（novel_agent2.1 蒸馏版）监督器。
+ * Python 引擎 sidecar 监督器。
  *
  * 负责引擎子进程的启动、健康检查、自动重启与受代理的本地 HTTP 访问。
  * 引擎是 sidecar：Renderer 不感知进程与端口，一切经 Main 转发。
@@ -133,6 +133,14 @@ export class EngineSupervisor extends EventEmitter {
         // 这里让引擎侧直接吐 UTF-8，与 Node 的解码口径对齐。
         PYTHONIOENCODING: 'utf-8',
         PYTHONUTF8: '1',
+        // 行宽：**必须显式给足**，否则 rich 会把长日志折行。
+        // 由来（2026-09-22 实测）：引擎用 RichHandler 输出，控制台宽度在**非 TTY**（被
+        // spawn 成管道正是这种情况）时取 `COLUMNS` 环境变量、缺省 80 列。于是本轮新增的
+        // 诊断行 `[调用] role=… prompt_chars=… → N 字 / M tokens / finish=X / T s`（约 130 字）
+        // 被拆成 3 段、段尾还补空格到列宽，落盘后无法按行解析
+        // —— 而这一行正是"每种模型每次调用"的唯一精确分母，折了就等于没有。
+        // 同一原因也让 `结构化输出解析失败（第 N 次）: … | 产出 N 字 / M tokens / finish=X` 被拆断。
+        COLUMNS: '400',
       },
     })
     this.proc = proc
@@ -291,7 +299,19 @@ export class EngineSupervisor extends EventEmitter {
    */
   private timeoutMs(apiPath: string): number {
     if (apiPath === '/api/ping') return 5_000
-    const slow = /^\/api\/(interactive|converse|chats|demo|start|resume|proposals|distill)/.test(
+    // 轮询/状态类：必须短。
+    // 由来（用户实测 2026-09-22）：这些路径此前落在"慢请求"档（30 分钟）里，一旦引擎
+    // 卡住或生成在跑，UI 的等待态（遮罩 / busy）就会**跟着卡 30 分钟**，表现正是
+    // "输入框点不动、打不了字"。状态查询本身不做生成，15 秒足够。
+    if (/^\/api\/(status|interactive\/state|books|dashboard|tree|model-config)/.test(apiPath)) {
+      return 15_000
+    }
+    // 互动创作的动作端点：设计上都是"校验状态 → 起后台线程 → 立刻返回"，正常 <1 秒。
+    // 给 30 秒余量；超过说明引擎真卡住了，早点失败比让界面干等更好。
+    if (/^\/api\/interactive\/(start|choose|redraw|decision|reset|discard)/.test(apiPath)) {
+      return 30_000
+    }
+    const slow = /^\/api\/(converse|chats|demo|start|resume|proposals|distill|decision)/.test(
       apiPath,
     )
     return slow ? 1_800_000 : 60_000

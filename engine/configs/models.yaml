@@ -1,64 +1,77 @@
-# 模型接入配置（D3：自主接入）
+# 模型接入配置（可在工具页「Agent 模型配置」面板查看/修改）
 # providers 定义接入点；roles 将 Agent 角色绑定到 接入点/模型/参数。
-# api_key 使用 ${ENV_VAR} 占位符从环境变量读取，不落盘。
-# 更换厂商/模型只改本文件，代码零改动。
+# api_key 推荐使用 ${ENV_VAR} 占位符从环境变量（.env）读取，不落明文。
+#
+# ⚠ 模型名与别名的实测教训（2026-09-22 记录，2026-10-03 复核后仍然有效）：
+#   官方端点上的 `deepseek-chat` / `deepseek-reasoner` **已被改道到 `deepseek-flash`**
+#   ——实测请求 deepseek-chat 返回的 `model` 字段就是 deepseek-flash；
+#   该别名亦已被官方停用并迁移到 V4 Flash/Pro。
+#   因此**写别名 = 配置一个字没动、线上行为却变了**：09-21 那次"拒答从 0 到暴增"
+#   就是绑定切换叠加模型换代的结果（详见 docs/13 §8.1）。
+#
+# ⚠ 当前绑定（2026-10-03 全量对齐决策）：
+#   全部 12 个角色 = `deepseek / deepseek-chat`，**与原版（inkforge-test）字面一致**。
+#   决策依据：审计得出"原版防拒绝成功率与容忍度更高"的三条成因中，本次只修其中两条
+#   （重试提示词不再回写判据关键词、结构化失败不再提前收敛）；模型绑定按作者要求改回
+#   别名以保持与原版字面一致。
+#   ——**知悉风险**：由于 `deepseek-chat` 已被改道，该绑定实际仍会解析到 flash 后端，
+#   这一项**不产生行为回退**，仅恢复配置字面。真正要不要换回更强的显式模型（如
+#   `deepseek-v4-pro`）是产品决策，需另行拍板。
+#
+#   三臂实测结论（2026-09-22 三臂对照，数据见 docs/13 §8–§9，供换模型时参考）：
+#   - `official-flash`（官方 deepseek/deepseek-flash）：writer p50 62.2s、出卡 JSON p50 44.5s，稳定，无网关单点依赖。
+#   - `gateway-flash`（网关 opencode-go/deepseek-flash，同模型名）：writer p50 40.8s、出卡 p50 31.5s，更快，但多一层外部网关依赖，
+#     仅作为"想提速时的可选轮换臂"（注意网关 headers 会随请求发出，见 providers.opencode-go）。
+#   - `gateway-v4-flash`（网关 opencode-go/deepseek-v4-flash）：出卡 JSON p50 **206.1s（最长 285.6s）**，会把"变慢"放大 4~6 倍。
+#     但真实作品上下文对照里它是三臂中**唯一 2/2 稳定成功**（0 结构化失败 / 0 拒答 / 调用数最少），代价是墙钟约 2 倍；n=2 不足以拍板。
+#   改动本文件的绑定前：先 `Copy-Item models.yaml models.yaml.bak-<时间戳>`（本文件承载多批次未提交改动，
+#   **不要** `git checkout` 它），并注意"改绑定必须重启 Inkforge 才生效"。
 
 providers:
   deepseek:
     type: openai_compat
     base_url: https://api.deepseek.com/v1
     api_key: ${DEEPSEEK_API_KEY}
-  # my-claude:
-  #   type: anthropic
-  #   api_key: ${ANTHROPIC_API_KEY}
-  # local-ollama:
-  #   type: openai_compat
-  #   base_url: http://localhost:11434/v1
-  #   api_key: none
-
-# 关于 max_tokens（**长正文字数的硬上限，务必显式设置**）：
-#   不写 max_tokens 时 DeepSeek 兼容端点按自己的默认值截断（通常 4096），
-#   折算成中文正文只有约 3000-4000 字 —— 于是"要求 5000 字"从**第一次调用**就
-#   被物理截断，无论提示词怎么写都到不了目标（用户实测"实际输出远小于要求"的直接原因）。
-#   deepseek-chat 单次输出上限是 8192，故正文类角色统一给足 8000；
-#   结构化短输出（审校评分 / 约束提炼）保持默认，避免浪费。
+  opencode-go:
+    type: openai_compat
+    api_key: ${OPENCODE_API_KEY}
+    base_url: https://opencode.ai/zen/go/v1
+    headers:
+      x-opencode-session: inkforge-novel-agent-01
+      User-Agent: inkforge/0.1
+# roles 段绑定：2026-10-03 全量对齐决策后 = 官方 deepseek/deepseek-chat（与原版字面一致；见文件头"当前绑定"）。
 roles:
-  # orchestrator 角色已移除：v1.0 采用 LangGraph 固定状态图编排（graph.py），
-  # 无 LLM 意图路由需求；如未来引入自由对话入口再恢复此绑定。
-  #
-  # fallback 查因结论（W10 / E3）：全 11 个角色均未启用 fallback。
-  #   关闭原因**不是** provider 不支持、也**不是** schema 未接：FallbackBinding、
-  #   ModelRegistry.chat_as 的降级链路、probe_all 的降级探活（只告警不阻断）都已完整
-  #   实现，used_fallback 也已写入章节 frontmatter 并透出到 UI。唯一原因是本文件当前
-  #   只定义了一个可用接入点（deepseek），而 ModelsConfig._validate_bindings 要求
-  #   fallback.provider 必须已在 providers 中定义——指向未定义接入点会在加载期直接
-  #   Fail-Fast（原 architect 段下的 my-claude 示例正是这种情况：其 provider 条目同样
-  #   处于注释状态）。故本版**决定暂不启用**：不启用不会改变任何现有行为，贸然启用才会
-  #   在启动期失败。待存在第二个真实接入点时，取消 providers 段相应条目的注释并为各角色
-  #   补上 fallback 段即可，代码零改动。
-  # 附带确认（纯静态可查，不再作为待确认项）：章节审查走 `editor` 角色
-  #   （Editor.ROLE = "editor"，Summarizer 复用同一绑定）；`review` 角色只服务工作台
-  #   的「审校主编」子智能体，不参与章节审查。
   architect:
     provider: deepseek
     model: deepseek-chat
     temperature: 0.8
-    max_tokens: 8000    # 全书大纲 + 逐章字数预算：几十章的大纲一次输出，4k 会截断
-    # 可选：降级接入点（主接入点调用失败时自动切换，需在 providers 中定义该点）
-    # fallback:
-    #   provider: my-claude
-    #   model: claude-3-5-sonnet-20241022
+    # max_tokens 8000 → 16000（2026-09-22 真机报错日志排障，engine/data/runtime/logs/desktop-20260921.log）：
+    #   8000 时"出卡 / 设定"这类结构化调用会返回**空内容**——`chat_structured` 拿到空串后
+    #   `json.loads("")` 报 `Expecting value: line 1 column 1 (char 0)`（日志里 34 次），
+    #   3 次解析重试 + 4 轮保真链重试全部撞同一堵墙，最终 `Plotter 只产出了 0 张剧情卡`。
+    #   实测签名与 writer 一致：输出预算被推理吃光、content 为空（见 writer 段实测数据）。
+    #   注意：剧情卡（Plotter）复用本绑定（plotter.ROLE = "architect"），改这里即同时修出卡。
+    max_tokens: 16000
   writer:
     provider: deepseek
     model: deepseek-chat
     temperature: 0.7
-    max_tokens: 8000    # ★ 章节正文：必须给足，否则单次产出被截断在 3000-4000 字
+    # max_tokens 8000 → 16000（2026-09-22 真机冒烟实测，engine/smoke_refusal_baseline.py）：
+    #   8000 时"5000 字目标"的产出 50~67% 被截断（finish_reason=length），正文只落
+    #   242~4708 字，并偶发"输出预算被推理吃光 → 空产出"（completion_tokens=8000 而
+    #   content 为空，触发保真链重试、最坏抛 BriefFidelityError）；
+    #   16000 实测 3/3 完成（正文 5175/6482/7638 字，finish_reason=stop，0 截断 0 空产出）。
+    # 接入点实测接受 max_tokens 至 32000（api.deepseek.com/v1, deepseek-flash）。
+    # 温度**不动**：同批次 A/B 未发现温度对空产出/截断有可判定影响（见 docs 报告）。
+    max_tokens: 16000
   editor:
     provider: deepseek
     model: deepseek-chat
     temperature: 0.0
-
-  # 对话智能体（Inkforge 工作台：主智能体 + 五个子智能体 + 风格工坊约束提炼，各自可绑不同模型）
+    # 显式给足输出预算（2026-09-22）：此前**不写** max_tokens，于是走接入点默认值——
+    # 而审校/摘要同样是"长 prompt + 结构化 JSON"，与 architect 出卡同一失败机理
+    # （预算被推理吃光 → content 为空 → json.loads("") 报 char 0）。此处按同一口径给 16000。
+    max_tokens: 16000
   master:
     provider: deepseek
     model: deepseek-chat
@@ -79,46 +92,34 @@ roles:
     provider: deepseek
     model: deepseek-chat
     temperature: 0.7
-    max_tokens: 8000    # 子智能体的正文类产出：与 writer 同等上限
+    max_tokens: 8000
   review:
     provider: deepseek
     model: deepseek-chat
     temperature: 0.2
-  # 风格工坊「约束提炼」智能体：把作者口述的要求提取成自定义创作约束。
-  # 温度取低（0.4）= 要的是忠实提取，不是发挥；接入点仍可由此处改绑任意 provider。
   constraint:
     provider: deepseek
     model: deepseek-chat
     temperature: 0.4
-  # 兼容旧会话的通用对话角色
+  # 正文改写（创作功能第四项，2026-10-04 新增）：
+  #   整篇回传意味着**输出 ≈ 原文字数**——15000 字上限的原文最坏产出约 20000 字 ≈ 30000 token，
+  #   故 max_tokens 取接入点实测可接受的 32000（否则会被 length 截断，段级对齐直接失效）。
+  #   温度 0.6：比 prose(0.7) 冷静一点——这个模块的价值在"少改"，不在"文采"。
+  revision:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.6
+    max_tokens: 32000
   chat:
     provider: deepseek
     model: deepseek-chat
     temperature: 0.8
-
-  # 蒸馏角色（NDS: 小说蒸馏系统；复用 deepseek 接入点，低温度保证结构化输出一致）
   distiller:
     provider: deepseek
     model: deepseek-chat
     temperature: 0.3
-
-# Embedding 配置
-# type 可选：
-#   chroma_default —— ChromaDB 内置 ONNX 模型（零依赖，英文优；开发调试用）
-#   openai_compat  —— 任意 OpenAI 兼容 embedding API（如硅基流动 BAAI/bge-m3）
-#   local_bge      —— 本地 BGE-M3（需 pip install FlagEmbedding）
-#
-# 默认档：硅基流动 BGE-M3（中文优化，正式生产推荐）。
-# 需在 .env 配置 EMBEDDING_API_KEY=<硅基流动 API Key>。
-# 切换 embedding 模型后须执行 rebuild-index 全量重建向量索引（identity 变化）。
 embedding:
   type: openai_compat
   base_url: https://api.siliconflow.cn/v1
   api_key: ${EMBEDDING_API_KEY}
   model: BAAI/bge-m3
-  # 零依赖开发档（ChromaDB 内置 ONNX MiniLM，英文优）：
-  # type: chroma_default
-  # 本地推理档（需 pip install FlagEmbedding，首次下载约 2GB）：
-  # type: local_bge
-  # model: BAAI/bge-m3
-

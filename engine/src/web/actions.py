@@ -662,6 +662,44 @@ def _h_model_config(ctx: ActionContext, args: dict) -> ActionExec:
                       {"roles": [{"role": r} for r in roles]})
 
 
+def _h_revision_open(ctx: ActionContext, args: dict) -> ActionExec:
+    """打开「正文改写」侧窗并按墨师给的定位预填（**只读动作**）。
+
+    为什么做成只读而不是写动作：改写一次 40~120 秒，而写动作在
+    `execute(..., execute_write=True)` 里是**同步**执行的 —— 把长任务塞进去会同时踩三件事：
+    确认卡的"预览与确认必须一致"、HTTP 超时、以及"用户以为没反应"。
+
+    所以分工是：**墨师负责定位与预填，模块负责改，创作空间负责落盘与留痕**。
+    本动作零落盘、零长任务，只把 `{novel_id, chapter, requirement, mode}` 作为
+    `data.prefill` 交给前端；前端据此打开侧窗并去 `GET /api/chapters/{n}/raw` 取正文。
+    """
+    from src.services import revision_forge as rev
+
+    nid = resolve_book(ctx, args, required=True)
+    _require_book_exists(nid)
+    chapter = _arg_int(args, "chapter", required=False, default=0)
+    requirement = _arg_str(args, "requirement", required=False, default="")
+    raw_mode = _arg_str(args, "mode", required=False, default=rev.MODE_AUTO)
+    mode, reason = rev.resolve_mode(raw_mode, requirement)
+    label = rev.MODE_LABELS.get(mode, mode)
+    where = f"第 {chapter} 章" if chapter else "（未定位到章节）"
+    return ActionExec(
+        "revision_open", True, "ok",
+        f"已打开「正文改写」并预填《{nid}》{where}（模式：{label}"
+        f"{'，按要求自动判定' if reason != '用户指定' else ''}）。"
+        "改写由用户在侧窗点「开始改写」触发；本动作不写任何文件。",
+        {
+            "prefill": {
+                "novel_id": nid,
+                "chapter": chapter,
+                "requirement": requirement,
+                "mode": mode,
+                "origin": f"墨师 · 《{nid}》{where}" if chapter else f"墨师 · 《{nid}》",
+            }
+        },
+    )
+
+
 # ---------- 写动作（一律先确认） ----------
 
 #: 模型把"创作模式"写成别的词时的折算表（命中即折算，不再失败）。
@@ -1135,6 +1173,12 @@ def _bootstrap_registry() -> None:
     _register_read("skill_list", "列出蒸馏技能包", (), _h_skill_list)
     _register_read("constraint_list", "列出自定义创作约束", (), _h_constraint_list)
     _register_read("model_config", "查看各角色模型绑定", (), _h_model_config)
+    _register_read(
+        "revision_open",
+        "打开「正文改写」侧窗并按定位预填（只读：零落盘、零长任务）",
+        ("novel", "chapter", "requirement", "mode"),
+        _h_revision_open,
+    )
 
     _register_write("book_create", "新建书", ("novel_id", "mode", "mode_raw"),
                     _preview_book_create, _run_book_create)
@@ -1447,6 +1491,12 @@ ARG_CONSTRAINTS: dict[str, str] = {
     "chapter": "整数章号",
     "novel": "书目标识",
     "novel_id": "书目标识（新建时自定）",
+    # 正文改写（只读动作 revision_open）：requirement 是**用户原话里的那件事**。
+    # `mode` 参数**刻意不在这里登记**：这张表按"参数名"索引，而 `mode` 已被 book_create
+    # 占用（pipeline|interactive）——两个枚举挤同一个键会互相覆盖。
+    # 改写档位的取值写在 master_actions.md 里（模型读的是那份），
+    # 且 `revision_forge.resolve_mode` 对未知取值会回落到自动判定，不会失败。
+    "requirement": "用户要求改什么（照抄他的原话要点）",
 }
 
 

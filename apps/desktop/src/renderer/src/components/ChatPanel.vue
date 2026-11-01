@@ -3,11 +3,12 @@ import { computed, nextTick, onErrorCaptured, onMounted, onUnmounted, ref, watch
 
 import { api, withNovel } from '../api'
 import { useMessage } from 'naive-ui'
-import { appStore, inWorkspace, openBook, openWorkspace, scopeParam } from '../store'
+import { appStore, inWorkspace, openBook, openRevision, openRevisionFromSelection, openWorkspace, scopeParam } from '../store'
 import {
   type ActionReceipt,
   type ChatData,
   type ChatSummary,
+  type ModelConfigView,
   type PendingAction,
   type StatusSnapshot,
 } from '../types'
@@ -32,12 +33,113 @@ const pendingAction = ref<PendingAction | null>(null)
  *  没有「替我审批 / 自动接受」：生成或修改的内容一律先经人工审批，
  *  通过后才写入创作空间中的资料。 */
 const proposeMode = ref(false)
+
+// ── 输入框右下角的模型徽标：显示**当前真正会用到的**角色绑定，点击直达「模型配置」 ──
+// 这个位置原先是硬编码的 "deepseek-chat"：换了模型它也不会变，于是「我到底在用哪个
+// 模型」在界面上无处可查——从「模型配置」改完回来，看到的仍是那句写死的话。
+
+/** 普通对话走 master（墨师），改稿模式走 prose（正文写手）——与发送路径一致。 */
+const activeRole = computed(() => (proposeMode.value ? 'prose' : 'master'))
+
+const roleBindings = ref<Record<string, { provider: string; model: string }>>({})
+const activeBinding = computed(() => roleBindings.value[activeRole.value] ?? null)
+
+async function loadRoleBindings(): Promise<void> {
+  try {
+    const cfg = await api<ModelConfigView>('GET', '/api/model-config')
+    const map: Record<string, { provider: string; model: string }> = {}
+    for (const binding of cfg.roles) {
+      map[binding.role] = { provider: binding.provider, model: binding.model }
+    }
+    roleBindings.value = map
+  } catch {
+    // 读不到就说读不到：这里显示假模型名比留空更有害
+    roleBindings.value = {}
+  }
+}
+
+const chipTitle = computed(() => {
+  const binding = activeBinding.value
+  const who = activeRole.value === 'prose' ? '改稿（正文写手）' : '主智能体（墨师）'
+  return binding
+    ? `${who}当前绑定：${binding.provider} / ${binding.model} —— 点这里打开「模型配置」换模型`
+    : `读不到${who}的模型绑定 —— 点这里打开「模型配置」检查接入点`
+})
+/* ══════════ 正文改写（创作空间 / 墨师 两处交接） ══════════ */
+
+/**
+ * 「⇱ 送正文改写」：把改稿模式的目标文稿送进侧窗（**不自动落盘**）。
+ *
+ * 与「✎ 改稿」的分工：
+ *   · ✎ 改稿 → 走提案（对话式、带全书上下文、需审批）；
+ *   · ⇱ 送正文改写 → 走最小改动闸门（只改点名处、逐字保留、约束优先），产出仍是人工决定去哪。
+ * 两条路都保留：大面积改动用改稿，精修用正文改写。
+ */
+async function sendTargetToRevision(): Promise<void> {
+  const res = await openRevisionFromSelection('自由协作')
+  if (res.ok) message.success(res.message)
+  else message.warning(res.message)
+}
+
+/**
+ * 墨师的只读动作 `revision_open` 回执 → 打开「正文改写」并按定位预填。
+ *
+ * 为什么由前端做而不是引擎直接改：改写一次 40~120 秒，而写动作是同步执行的；
+ * 墨师只负责"定位 + 预填"，真正的改写由用户在侧窗点「开始改写」触发（零落盘、零长任务）。
+ */
+async function handleRevisionOpen(receipt: ActionReceipt): Promise<void> {
+  const prefill = (receipt.data as {
+    prefill?: {
+      novel_id?: string
+      chapter?: number
+      requirement?: string
+      mode?: string
+      origin?: string
+    }
+  } | null)?.prefill
+  if (!prefill) return
+  const novelId = prefill.novel_id || appStore.bookId
+  const chapter = Number(prefill.chapter || 0)
+  let source = ''
+  if (novelId && chapter > 0) {
+    try {
+      const raw = await api<{ content: string }>(
+        'GET',
+        withNovel(`/api/chapters/${chapter}/raw`, novelId),
+      )
+      source = raw.content || ''
+    } catch {
+      // 读不到正文就只预填要求（用户自己粘一段），不把整次交接判失败
+    }
+  }
+  openRevision({
+    source,
+    requirement: prefill.requirement || '',
+    mode: prefill.mode || 'auto',
+    origin: prefill.origin || '墨师',
+    fillBack: novelId && chapter > 0 ? { chapter, novelId } : null,
+  })
+}
+
+// 动作回执是"本轮"的：每次发送整体替换，所以按数组引用变化触发即可（不会重复打开）。
+watch(
+  () => lastActions.value,
+  (list) => {
+    for (const a of list) {
+      if (a.op === 'revision_open' && a.ok) void handleRevisionOpen(a)
+    }
+  },
+)
+
 const proposals = ref<Proposal[]>([])
 const interactive = ref<InteractiveState | null>(null)
 /** 互动创作模式开关：仅正文逐章创作使用；服务端断点始终保留。 */
 const interactiveMode = ref(false)
 /** 互动会话在服务端存在未完结断点（用于按钮上的恢复提示）。 */
 const resumeHint = ref(false)
+/** 轮询在途保护：上一次请求没回来之前不再发新的（防堆积→拖慢渲染→输入卡顿）。 */
+let statusPolling = false
+let interactivePolling = false
 
 const showInteractive = computed(() => interactiveMode.value && interactive.value !== null)
 
@@ -403,6 +505,8 @@ async function sendPropose(instruction: string): Promise<void> {
 
 async function pollStatus(): Promise<void> {
   if (inWorkspace()) return    // 工作区没有流水线会话可轮询
+  if (statusPolling) return    // 在途保护：上一次没回来就不再发（防请求堆积拖慢渲染）
+  statusPolling = true
   try {
     snapshot.value = await api<StatusSnapshot>(
       'GET',
@@ -410,20 +514,30 @@ async function pollStatus(): Promise<void> {
     )
   } catch {
     /* 静默 */
+  } finally {
+    statusPolling = false
   }
 }
 
 async function pollInteractive(): Promise<void> {
   if (inWorkspace()) return    // 互动创作是"书内"状态机
+  if (interactivePolling) return
+  interactivePolling = true
   try {
     const st = await api<InteractiveState>(
       'GET',
       withNovel('/api/interactive/state', appStore.bookId),
     )
+    // 整帧跳过：引擎给的 version 没变 → 不写回响应式状态。
+    // 由来（用户实测）：快照每次携带整章正文，Vue 每 2.5 秒都判定为"新对象"并重渲染，
+    // 草稿变长后输入框明显卡顿（"点不动、打不了字"）。
+    if (st.version && st.version === interactive.value?.version) return
     interactive.value = st
     resumeHint.value = !['idle', 'done'].includes(st.status)
   } catch {
     /* 静默 */
+  } finally {
+    interactivePolling = false
   }
 }
 
@@ -593,11 +707,21 @@ onMounted(() => {
   void loadChats()
   void pollStatus()
   void detectBookKind()
+  void loadRoleBindings()
   timer = setInterval(() => {
     void pollStatus()
     if (interactiveMode.value) void pollInteractive()
-  }, 2500)
+    // 3.5s（原 2.5s）：轮询只用于状态展示，慢一点换更稳的输入体验
+  }, 3500)
 })
+
+/** 关掉「模型配置」时刷新徽标：改完绑定立刻能在这条输入框上看到结果。 */
+watch(
+  () => appStore.dialogs.modelConfig,
+  (open) => {
+    if (!open) void loadRoleBindings()
+  },
+)
 
 /**
  * 「回到主对话」：开一个全新的空白工作区会话。
@@ -643,27 +767,6 @@ onUnmounted(() => {
     <div class="chat-head">
       <div class="agent-block">
         <span class="agent-name">{{ agentLabel }}</span>
-        <span v-if="inWorkspace()" class="chip workspace" title="未打开作品：墨师在全域工作台上工作，可建书/取资料/开写">
-          🧭 工作区
-        </span>
-        <!-- 工作区的对称入口：一句话切回最近打开的书（否则切到工作区后只能靠书架找回） -->
-        <button
-          v-if="inWorkspace() && appStore.lastBookId"
-          class="ghost-btn back-to-book"
-          title="回到你上一次打开的作品"
-          @click="openBook(appStore.lastBookId, appStore.lastBookTitle)"
-        >
-          ↩ 回到《{{ appStore.lastBookTitle || appStore.lastBookId }}》
-        </button>
-        <span v-if="appStore.bookTitle" class="muted ctx-label">
-          主上下文：{{ proposeTargetLabel === '未选择' ? appStore.bookTitle : proposeTargetLabel }}
-        </span>
-        <!-- 工作状态常驻：综合对话 / 互动创作 / 流水线 / 待审提案，
-             不再出现「智能体明明在干活却显示空闲」。 -->
-        <span class="chip" :class="workStatus.kind">{{ workStatus.text }}</span>
-        <span v-if="snapshot?.metrics" class="chip idle" title="已定稿 / 计划总章">
-          已定稿 {{ snapshot.metrics.approved }}/{{ snapshot.metrics.total_chapters }}
-        </span>
       </div>
       <div class="head-actions">
         <div class="mode-switch">
@@ -672,7 +775,7 @@ onUnmounted(() => {
             :class="{ active: !interactiveMode }"
             @click="exitInteractive"
           >
-            ✍ 自由协作
+            自由协作
           </button>
           <button
             class="mode-btn"
@@ -681,20 +784,34 @@ onUnmounted(() => {
             :title="snapshot?.started && !snapshot?.done ? '全自动流水线运行中，暂不可进入互动创作' : '仅用于正文逐章创作；进入后由剧情策划智能体出卡'"
             @click="enterInteractive"
           >
-            🎬 互动创作
+            互动创作
             <span v-if="resumeHint && !interactiveMode" class="resume-dot" />
           </button>
         </div>
+        <!-- 低频/危险操作收成图标（原先是和「自由协作」同权的文字按钮） -->
+        <button
+          v-if="snapshot?.started && !snapshot?.done"
+          class="icon-btn warn"
+          title="暂停生成：当前章写完后停在逐章确认关卡，不会自动往下写"
+          aria-label="暂停生成"
+          @click="pauseRun"
+        >
+          <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+            <path d="M6 3.4v9.2M10 3.4v9.2" />
+          </svg>
+        </button>
         <div ref="historyWrap" class="history-wrap">
           <button
-            v-if="snapshot?.started && !snapshot?.done"
-            class="ghost-btn pause-btn"
-            title="暂停生成：当前章写完后停在逐章确认关卡，不会自动往下写"
-            @click="pauseRun"
+            class="icon-btn"
+            title="历史对话"
+            aria-label="历史对话"
+            @click="showHistory = !showHistory"
           >
-            ⏸ 暂停生成
+            <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="8" cy="8" r="5.4" />
+              <path d="M8 5v3.2l2.2 1.4" />
+            </svg>
           </button>
-          <button class="ghost-btn" @click="showHistory = !showHistory">🕘 历史对话</button>
           <div v-if="showHistory" class="history-pop" @click.stop>
             <div class="history-pop-head muted">点击继续对话 · ✕ 删除</div>
             <div
@@ -715,7 +832,41 @@ onUnmounted(() => {
             </div>
           </div>
         </div>
-        <button class="ghost-btn" @click="newChat">＋ 新建对话</button>
+        <button class="icon-btn" title="新建对话" aria-label="新建对话" @click="newChat">
+          <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+            <path d="M8 3.2v9.6M3.2 8h9.6" />
+          </svg>
+        </button>
+      </div>
+
+      <!--
+        第二行：作用域 / 状态 / 上下文。
+        改造前这些和第一行挤在同一排（6 组控件），1366 屏下第一行直接溢出，
+        智能体名字被压没、「新建对话」被切掉。
+      -->
+      <div class="agent-meta">
+        <span class="chip" :class="workStatus.kind">{{ workStatus.text }}</span>
+        <span v-if="snapshot?.metrics" class="chip idle" title="已定稿 / 计划总章">
+          已定稿 {{ snapshot.metrics.approved }}/{{ snapshot.metrics.total_chapters }}
+        </span>
+        <span
+          v-if="inWorkspace()"
+          class="chip workspace"
+          title="未打开作品：墨师在全域工作台上工作，可建书/取资料/开写"
+        >
+          工作区
+        </span>
+        <button
+          v-if="inWorkspace() && appStore.lastBookId"
+          class="ghost-btn back-to-book"
+          title="回到你上一次打开的作品"
+          @click="openBook(appStore.lastBookId, appStore.lastBookTitle)"
+        >
+          ↩ 回到《{{ appStore.lastBookTitle || appStore.lastBookId }}》
+        </button>
+        <span v-if="appStore.bookTitle" class="muted ctx-label">
+          主上下文：{{ proposeTargetLabel === '未选择' ? appStore.bookTitle : proposeTargetLabel }}
+        </span>
       </div>
     </div>
 
@@ -766,7 +917,7 @@ onUnmounted(() => {
           <div class="msg-body pre-wrap">{{ m.content }}</div>
         </div>
 
-        <!-- 改稿提案卡（DeepWrite 的 proposal 语义：pending→accepting→accepted/rejected/conflict） -->
+        <!-- 改稿提案卡（proposal 语义：pending→accepting→accepted/rejected/conflict） -->
         <ProposalCard
           v-for="p in proposalsByAnchor[i] ?? []"
           :key="p.id"
@@ -822,6 +973,13 @@ onUnmounted(() => {
       </div>
     </div>
 
+    <!--
+      决策条宿主：ReviewCard 用 <Teleport> 把「审阅意见 + 通过/打回」投到这里。
+      这样一来它常驻在输入框上方，卡片再长也不会把按钮滚出视野，
+      而且它不在 .stream 的滚动容器里，永远不会压住正文预览框。
+    -->
+    <div id="decision-host" class="decision-host" />
+
     <div class="composer">
       <div v-if="proposeMode" class="propose-target">
         ✎ 改稿模式 · 目标：<b>{{ proposeTargetLabel }}</b>
@@ -846,12 +1004,26 @@ onUnmounted(() => {
           >
             ✎ 改稿
           </button>
+          <button
+            class="tool-btn"
+            title="把创作空间里选中的文稿送进「正文改写」：只改你点名的地方，其余逐字保留"
+            @click="sendTargetToRevision"
+          >
+            ⇱ 送正文改写
+          </button>
           <span class="tool-hint" title="所有生成与修改一律先出提案，由你点『通过』后才写入创作空间">
             提案需人工审批
           </span>
         </div>
         <div class="composer-right">
-          <span class="model-chip">deepseek-chat</span>
+          <button
+            class="model-chip"
+            :class="{ unknown: !activeBinding }"
+            :title="chipTitle"
+            @click="appStore.dialogs.modelConfig = true"
+          >
+            {{ activeBinding ? activeBinding.model : '模型未知' }}
+          </button>
           <button class="send-btn" :disabled="sending || !input.trim()" @click="send()">↑</button>
         </div>
       </div>
@@ -876,7 +1048,9 @@ onUnmounted(() => {
 }
 .chat-panel {
   flex: 1;
-  min-width: 340px;
+  /* 改造前是 min-width:340px：窄窗口下它撑住下限、把右侧两列顶出视口。
+     现在宽度归栅格管（App.vue 已为对话列预留 360px 预算），这里不再设下限。 */
+  min-width: 0;
   display: flex;
   flex-direction: column;
   border-right: 1px solid #e9ebee;
@@ -885,26 +1059,69 @@ onUnmounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 12px 18px 8px;
+  flex-wrap: wrap;
+  row-gap: 6px;
+  padding: 10px 18px 8px;
   gap: 8px;
+  border-bottom: 1px solid var(--line-2);
 }
 .agent-block {
   display: flex;
   align-items: center;
   gap: 10px;
   min-width: 0;
-  flex: 1;
+  flex: 0 1 auto;
   overflow: hidden;
 }
 .agent-name {
   font-weight: 600;
-  font-size: 15px;
+  font-size: var(--fs-15);
   white-space: nowrap;
 }
-.agent-block .muted {
+/* 第二行：作用域 / 工作状态 / 主上下文（原先和第一行挤在一起，1366 下直接溢出） */
+.agent-meta {
+  flex: 0 0 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.agent-meta .muted {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 0;
+}
+.icon-btn {
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: none;
+  border-radius: var(--r-1);
+  color: var(--ink-3);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+}
+.icon-btn:hover {
+  background: var(--bg-2);
+  color: var(--ink-1);
+}
+.icon-btn.warn {
+  color: #b45309;
+}
+.icon-btn.warn:hover {
+  background: var(--warn-bg);
+}
+/* 决策条宿主：只有 ReviewCard 挂载时才占高度 */
+.decision-host:not(:empty) {
+  border-top: 1px solid var(--line-1);
+}
+.decision-host {
+  flex: 0 0 auto;
+  min-width: 0;
 }
 .chip {
   font-size: 11px;
@@ -1241,8 +1458,22 @@ onUnmounted(() => {
   font-size: 11.5px;
   color: #5c6470;
   background: #f3f4f6;
+  border: none;
   border-radius: 999px;
   padding: 2px 10px;
+  cursor: pointer;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-chip:hover {
+  background: #e5e7eb;
+  color: #1f2937;
+}
+.model-chip.unknown {
+  color: #b42318;
+  background: #fef2f2;
 }
 .send-btn {
   width: 30px;

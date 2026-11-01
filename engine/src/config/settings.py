@@ -58,6 +58,11 @@ class ProviderConfig(BaseModel):
     type: Literal["openai_compat", "anthropic"]
     base_url: str | None = None
     api_key: str = "none"
+    #: 额外请求头（如 OpenCode Go 要求的 `x-opencode-session` 与自定义 User-Agent）。
+    #: 由来（2026-09-21 用户实测）：只配 base_url + api_key 时，GET /models 能过、
+    #: 但 /chat/completions 会被网关按 400 MissingSessionID 拒掉——「列表拉得到、
+    #: 模型用不了」正是因为缺这几个头，而此前没有任何地方能配。
+    headers: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _check_base_url(self) -> ProviderConfig:
@@ -143,6 +148,11 @@ def _resolve_env_placeholders(raw: object) -> object:
 
 def load_models_config(path: Path | None = None) -> ModelsConfig:
     """加载并校验 models.yaml，Fail-Fast。"""
+    # 每次加载前补读一次 .env：用户在界面上新增接入点并填 Key 时，Key 是写进 .env 的，
+    # 而引擎进程只在启动时读过一次——旧行为下必须重启引擎，否则「测试」会报
+    # 「占位符对应的环境变量未设置」，而文件里明明已经写好了（2026-09-21 实测）。
+    # override=False：只补**新增**的键，绝不覆盖已在环境里的变量。
+    _load_dotenv()
     settings = get_settings()
     yaml_path = path or settings.models_yaml
     if not yaml_path.exists():
@@ -152,12 +162,17 @@ def load_models_config(path: Path | None = None) -> ModelsConfig:
     return ModelsConfig.model_validate(resolved)
 
 
+def _load_dotenv() -> None:
+    """把 engine/.env 里的键注入 os.environ（只补缺失的键）。"""
+    from dotenv import load_dotenv
+
+    load_dotenv(PROJECT_ROOT / ".env", override=False)
+
+
 @lru_cache
 def get_settings() -> AppSettings:
     # 将 .env 中的键值注入 os.environ，使 models.yaml 的 ${ENV_VAR} 占位符
     # （如 ${DEEPSEEK_API_KEY}）可被 _resolve_env_placeholders 解析。
     # pydantic-settings 只把 .env 读入已声明字段，不会写回 os.environ，故需显式加载。
-    from dotenv import load_dotenv
-
-    load_dotenv(PROJECT_ROOT / ".env", override=False)
+    _load_dotenv()
     return AppSettings()

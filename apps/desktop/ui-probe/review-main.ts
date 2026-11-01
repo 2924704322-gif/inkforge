@@ -279,6 +279,38 @@ function route(method: string, path: string): { status: number; data: unknown } 
     }
   }
   if (p === '/api/outline') return { status: 200, data: { html: null } }
+  /*
+   * 「正文改写」侧窗的智能体名片。
+   * 不提供这条时面板会因为读不到 limits 而整块渲染失败（曾实测白屏）——
+   * 所以探针给一份最小可用数据，让侧窗能真的被量测到。
+   */
+  if (p === '/api/revision/agent') {
+    return {
+      status: 200,
+      data: {
+        key: 'revision',
+        label: '正文改写智能体',
+        role: 'revision',
+        prompt: '在你给的正文上，按你给的要求整篇重写 —— 只改你点名的地方，其余逐字保留。',
+        limits: {
+          source_max: 15000,
+          source_min: 1,
+          requirement_max: 4000,
+          constraints_max: 3000,
+          anchors_max: 99,
+          lock_max: 99,
+        },
+        modes: [
+          { value: 'auto', label: '自动判定' },
+          { value: 'expand', label: '扩写' },
+          { value: 'rewrite', label: '整篇重写' },
+        ],
+        sees: ['你粘贴的原文'],
+        never_sees: ['作品库里的任何文件（未打开「读当前书」时）'],
+        book_reads: [],
+      },
+    }
+  }
   if (p === '/api/chats' && method === 'POST') {
     chatSeq += 1
     const chat = {

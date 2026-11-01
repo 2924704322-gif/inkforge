@@ -705,6 +705,23 @@ def main() -> int:  # noqa: C901 - 线性验收脚本，刻意保持单函数可
                           evidence=str(body)[:200])
             suite10.check("返回模型回复内容", bool(body.get("reply")),
                           f"reply={body.get('reply')!r}")
+
+            cfg = http("GET", f"{engine.base}/api/model-config").body or {}
+            pname = ((cfg.get("providers") or [{}])[0]).get("name", "deepseek")
+            t_list = time.time()
+            listed = http(
+                "GET",
+                f"{engine.base}/api/model-config/providers/{pname}/models",
+                timeout=60,
+            )
+            lb = listed.body or {}
+            suite10.check(
+                "GET /api/model-config/providers/{name}/models 拉到模型清单（「获取模型」）",
+                listed.status == 200 and lb.get("ok") is True and lb.get("count", 0) >= 1,
+                f"provider={pname} ok={lb.get('ok')} count={lb.get('count')} "
+                f"models={lb.get('models')} {round(time.time() - t_list, 2)}s",
+                evidence=str(lb)[:200],
+            )
             report["suites"].append({"name": suite10.name, "passed": suite10.passed,
                                      "failed": suite10.failed, "results": suite10.results})
             print()

@@ -1,4 +1,4 @@
-"""Inkforge 扩展 API（三）：深挖自 DeepWrite 的新功能后端。
+"""Inkforge 扩展 API（三）：扩展功能后端。
 
 - 智能体设置：五阶段智能体的系统提示词覆盖（chat/propose 运行时读取）
 - 素材库：可绑定到作品的参考资料条目（合成进 custom-skills.md）

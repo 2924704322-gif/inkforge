@@ -19,6 +19,7 @@ from src.agents.schemas import (
     WorldviewOutput,
 )
 from src.llm.base import ChatMessage
+from src.llm.refusal_probe import looks_like_refusal, refusal_signal
 from src.llm.registry import ModelRegistry
 from src.llm.structured import chat_structured
 from src.memory.md_store import MdStore, slugify
@@ -81,50 +82,71 @@ GENERATE_RETRIES = 2
 GENERATE_RETRY_TEMPERATURE = 0.2
 NO_PREAMBLE_REINJECT = "只输出正文本身——从第一个字到最后一个字。"
 
-#: 元自指信号：出现即判拒答（不论长短）——真实拒答几乎总带这类自我定位语。
-_REFUSAL_META = (
-    "作为AI", "作为人工智能", "作为一个AI", "AI助手", "语言模型", "人工智能助手",
-    "as an ai", "i'm an ai", "i am an ai",
-)
-#: 拒答措辞（**只在短产出里才判**，见 _looks_like_refusal）。
-_REFUSAL_PHRASES = (
-    "抱歉", "对不起", "很抱歉", "我不能", "我无法", "无法生成", "无法提供", "无法满足",
-    "无法协助", "做不到", "超出范围", "请换一个", "恕难", "请谅解",
-    "i can't", "i cannot", "i'm sorry", "i won't",
-)
-#: 超过这个长度的产出**不因出现礼貌词判拒答**：正文里角色说"抱歉""我做不到"是常态。
-_REFUSAL_MAX_CHARS = 400
+#: 保真链总轮数（**完全对齐原版**，2026-09-22 定稿）：
+#: 原版是 `total = GENERATE_RETRIES + 2` = **4 轮**，且**末轮降温**（`temperature=0.2`）——
+#: 这两条一起构成"同一个坏产出最多重滚 4 次、最后一次用最冷静的温度覆盖最躁的那次"。
+#:
+#: 撤回的加强（记录在案，勿重犯）：
+#:   · `REFUSAL_CHAIN_ROUNDS = 2`（拒答/空产出提前收敛）——真机日志
+#:     `desktop-20260921.log` 的「保真链第 N 次尝试取得合格产出」直方图是
+#:     第 2 轮 31 / 第 3 轮 6 / 第 4 轮 4，**24.4% 的成功发生在第 3、4 轮**；
+#:     压到 2 轮等于把这部分成功率直接砍掉。
+#:   · 末轮降温条件写成 `attempt < total - 1`（`total` 恒为 4）——2 轮制下该分支
+#:     **永远不可达**，用户拿到的永远是最"热"的那一版稿子。
+#: 现口径：只有一个 `total`，降温条件按 `total` 判定，任何路径的末轮都降温。
+#:
+#: 结构化输出失败单独收敛（`STRUCTURED_FAILURE_CHAIN_ROUNDS`）：`chat_structured`
+#: 内部已经重试 3 次，走满 4 轮等于单次出卡最坏 2（Plotter 显式重试）× 4（保真链）
+#: × 3（解析重试）= 24 次调用。
+#:
+#: **2026-10-03 对齐原版：本常量已置回 `GENERATE_RETRIES + 2`（= 4 轮），提前收敛机制
+#: 当前处于中性（不生效）状态。**
+#:
+#: 为什么撤回收敛：收敛是本次审计中**唯一一处真实的"容忍度下降"**。原版对任何失败形态
+#: 一律走满 4 轮；而真机数据（A 侧日志 58 次保真链成功重试的轮次分布：第 2 轮 43 /
+#: 第 3 轮 9 / 第 4 轮 6）显示 **25.9% 的成功发生在第 3、4 轮**，把结构化失败单独压到
+#: 2 轮等于把这部分成功率直接砍掉——而结构化链路恰恰是当前最脆弱的一环
+#: （日志实测 193 次结构化解析失败、57 次 `BriefFidelityError`）。
+#:
+#: 保留机制而非删除的用意：这是一条**可单点回退**的旋钮。若将来确实需要控成本，
+#: 改回一个更小的数即可，不必重新实现；`tests/test_pipeline_closure.py` 里保留的
+#: 用例会守住"任何收敛都必须是显式决定"这条线。
+STRUCTURED_FAILURE_CHAIN_ROUNDS = GENERATE_RETRIES + 2
+
+
+def _is_structured_failure(exc: BaseException) -> bool:
+    """是否为"结构化输出解析失败"（按类名判定，避免把 llm.structured 的依赖引进本模块）。"""
+    return type(exc).__name__ == "StructuredOutputError"
+
+#: 拒答判定的**词表与口径已抽到 `src/llm/refusal_probe.py`**（2026-09-22）：
+#: 结构化 JSON 链路（`chat_structured`）解析失败时也要能分清"模型拒答"与"JSON 写坏了"，
+#: 而本模块在模块级导入 `src.llm.structured`，反过来导入会成环。
+#: 下面的 `_looks_like_refusal` / `_refusal_signal` 保留原私有名做薄封装，
+#: 历史调用点（测试 / smoke 脚本）无需改动。
 
 
 class BriefFidelityError(RuntimeError):
     """brief 保真链在重试耗尽后仍未取得合格产出（系统内部错误，不作为用户可见答复）。"""
 
 
-def _looks_like_refusal(text: str) -> bool:
-    """产出是否为"拒答"（X7 ①）。
+#: 保真链耗尽的两类**「产出质量问题」**（区别于接入点异常）——单一源，供调用方判别。
+#: 由来（2026-10-03）：`services/constraint_forge` 接入保真链后，必须能把"模型拒答/空回"
+#: 映射成可换输入重试的 422，而把"接入点异常"留给 502 归因（原版 `ProviderError`
+#: 的凭据脱敏链路依赖这条 502）。散写成魔法字符串会让两处口径悄悄漂移，故提到模块级。
+FAILURE_REFUSAL = "产出含拒绝语义"
+FAILURE_EMPTY = "产出为空"
+#: 上述两类合称：`brief 保真链 X/X 轮后仍未取得合格产出……：<last_error>` 中的 <last_error>。
+OUTPUT_QUALITY_FAILURES = (FAILURE_REFUSAL, FAILURE_EMPTY)
 
-    由来（2026-09-19 真机排查）：原实现是 `any(marker in text)`，词表只有
-    （无法生成 / 做不到 / 超出范围 / 请换一个）且**任意位置命中即判拒答**，两头都出问题：
-    · **漏判**（更严重）：真实拒答多写成「抱歉，我不能创作这类内容」——四个词一个都不含，
-      于是拒答文本被**当成正文落盘**，接着被 Editor 打 0 分、判 full_rewrite，
-      用户看到的就是"生成不出来 / 一直被打回"；
-    · **误判**：正文里角色说一句「我做不到」（或旁白出现"超出范围"）→ 整章被判拒答 →
-      重试 4 次全废 → 抛 BriefFidelityError。
 
-    现口径（两头都收）：
-    1. **元自指**（作为AI / 语言模型 …）→ 无论长短一律判拒答；
-    2. 其余拒答措辞**只在短产出（≤400 字）里判定** —— 正常章节远超此长度，
-       而拒答通常是一小段说明；长产出里出现"抱歉/做不到"不再误伤。
-    """
-    s = (text or "").strip()
-    if not s:
-        return False
-    low = s.lower()
-    if any(m.lower() in low for m in _REFUSAL_META):
-        return True
-    if len(s) > _REFUSAL_MAX_CHARS:
-        return False
-    return any(m.lower() in low for m in _REFUSAL_PHRASES)
+def _looks_like_refusal(text: str) -> bool:  # noqa: D103 - 实现与文档见 src/llm/refusal_probe.py
+    """产出是否为"拒答"（实现见 `src/llm/refusal_probe.looks_like_refusal`）。"""
+    return looks_like_refusal(text)
+
+
+def _refusal_signal(text: str) -> str:
+    """回报命中的拒答规则/关键词（实现见 `src/llm/refusal_probe.refusal_signal`）。"""
+    return refusal_signal(text)
 
 
 def _retry_note(last_error: str) -> str:
@@ -194,10 +216,26 @@ def generate_faithful(
     temperature（接入点侧切换由 ModelRegistry.chat_as 的 fallback 链路承担，配置在
     configs/models.yaml）。任何情况下不把「无法生成」作为对用户的答复：重试耗尽时
     抛 BriefFidelityError（内部错误），由调用方按异常处理，而不是伪造产出一段拒绝文字。
+
+    收敛例外（2026-09-22 真机排障 · 2026-09-27 修正为 2 轮）：`StructuredOutputError`
+    （结构化输出连续解析失败）在 `src/llm/structured.py` 内部已经重试 3 次，故本链最多再给
+    `STRUCTURED_FAILURE_CHAIN_ROUNDS` 轮，不走满 4 轮——否则单次出卡最坏 24 次调用。
+    （这一条与拒答机制无关，是结构化链路的独立处置，保留。）
+
+    轮数与降温（**完全对齐原版**，2026-09-22 定稿）：
+    `total = GENERATE_RETRIES + 2` = 4 轮，且**末轮降温**到 `GENERATE_RETRY_TEMPERATURE`。
+    原版就是这个口径；中间那版"所有拒答类失败统一压到 2 轮"已被撤回（见
+    `STRUCTURED_FAILURE_CHAIN_ROUNDS` 上方的注释）。
+
+    报错口径（2026-09-27 修正）：提前收敛时实际只跑了 1~2 轮，但旧口径的报错写死
+    `{total}`=4，用户看到的「4 次尝试后仍未取得合格产出」是假数字，排障时会误导。
+    现在报 `{实际轮数}/{total} 轮`。
     """
     work = list(messages)
     last_error = ""
     total = GENERATE_RETRIES + 2
+    rounds = total
+    attempts = 0
     for attempt in range(total):
         if attempt:
             work = [*work, ChatMessage(role="user", content=_retry_note(last_error))]
@@ -205,21 +243,40 @@ def generate_faithful(
                 "brief 保真链第 %d 次产出不合格（%s），携原因重试", attempt, last_error[:120]
             )
         temperature = (
-            None if attempt < total - 1 else GENERATE_RETRY_TEMPERATURE
+            None if attempt < rounds - 1 else GENERATE_RETRY_TEMPERATURE
         )
+        attempts = attempt + 1
         try:
             out = call(work, temperature)
         except Exception as exc:  # noqa: BLE001 - 失败原因用于下一次重试注入
             last_error = f"{type(exc).__name__}: {exc}"
+            if _is_structured_failure(exc):
+                rounds = STRUCTURED_FAILURE_CHAIN_ROUNDS
+                if attempt + 1 >= rounds:
+                    logger.warning(
+                        "brief 保真链遇结构化输出失败，提前收敛于第 %d 轮（上限 %d 轮）：%s",
+                        attempt + 1, rounds, last_error[:200],
+                    )
+                    break
             continue
         text = _output_text(out)
         if text.strip() and not _looks_like_refusal(text):
             if attempt:
                 logger.info("brief 保真链第 %d 次尝试取得合格产出", attempt + 1)
             return out
-        last_error = "产出为空" if not text.strip() else "产出含拒绝语义"
+        if text.strip():
+            # 判据关键词**只进日志、不进提示词**（2026-10-03 对齐原版口径）：
+            # `last_error` 会被 `_retry_note()` 嵌进发给模型的最后一条 user 消息，
+            # 把「命中 短产出:我不能｜273 字」原样念回给模型，等于在要求它续写的前一刻
+            # 自我暗示，而该位置 recency 权重最高。诊断价值**全部保留在 logger 里**
+            # （只记命中的通用措辞，不记正文），`last_error` 恢复原版字面量。
+            signal = _refusal_signal(text)
+            logger.warning("brief 保真链判定产出含拒绝语义（命中 %s）", signal)
+            last_error = FAILURE_REFUSAL
+        else:
+            last_error = FAILURE_EMPTY
     raise BriefFidelityError(
-        f"brief 保真链 {total} 次尝试后仍未取得合格产出（失败已在系统内消化）："
+        f"brief 保真链 {attempts}/{total} 轮后仍未取得合格产出（失败已在系统内消化）："
         f"{last_error[:300]}"
     )
 

@@ -1,7 +1,8 @@
 import { reactive } from 'vue'
 
 import type { EngineState } from '../../shared/bridge'
-import { api } from './api'
+import { api, withNovel } from './api'
+import type { RevisionPrefill } from './types'
 
 /** 当前右侧编辑器的选中文档。 */
 export type DocSelection =
@@ -13,11 +14,32 @@ export type SideWindowId =
   | 'agents'
   | 'learning'
   | 'materials'
+  | 'revision'
   | 'dashboard'
   | 'export'
   | null
 
-/** 全局轻量状态（DeepWrite 式单窗口：功能导航 / 对话 / 创作空间）。 */
+/** 读布局偏好（localStorage 不可用时返回兜底，不抛）。 */
+function readFlag(key: string, fallback: boolean): boolean {
+  try {
+    const raw = localStorage.getItem(key)
+    if (raw === null) return fallback
+    return raw === '1' || raw === 'true'
+  } catch {
+    return fallback
+  }
+}
+
+/** 写布局偏好（隐私模式 / 存储被禁用时静默，不影响界面）。 */
+function writeFlag(key: string, value: boolean): void {
+  try {
+    localStorage.setItem(key, value ? '1' : '0')
+  } catch {
+    /* 忽略：偏好丢了只是下次恢复默认 */
+  }
+}
+
+/** 全局轻量状态（单窗口：功能导航 / 对话 / 创作空间）。 */
 export const appStore = reactive({
   /** 当前打开的书；空 = 工作区模式（墨师全域总控，仍可对话与办事）。 */
   bookId: '',
@@ -63,6 +85,23 @@ export const appStore = reactive({
   lastBookTitle: '',
   /** 资源树刷新信号（章节/设定变更后自增）。 */
   treeVersion: 0,
+  /**
+   * 主导航是否折叠成图标条（176 → 56px）。
+   *
+   * 由来：改造前导航恒定 176px，而 10 个入口里高频只有 3 个；1366 笔记本上
+   * 这 176px 相当于正文列的 37%。折叠态省下的宽度直接给对话列。
+   */
+  navCollapsed: readFlag('inkforge.w.navCollapsed', false),
+  /** 创作空间是否折叠成 56px 竖条（窄屏下让位给对话/正文）。 */
+  treeCollapsed: readFlag('inkforge.w.treeCollapsed', false),
+  /**
+   * 「正文改写」侧窗的预填载荷：由创作空间 / 人审卡 / 墨师动作写入，侧窗消费后清空。
+   *
+   * 为什么要走 store 而不是 props：入口分散在四个组件里（编辑器工具栏、章节树行内、
+   * 两个平台的审阅卡、墨师动作回执），而侧窗只挂在 SideWindows 一处。
+   * 统一用「打开侧窗 + 填载荷」两个动作，避免每个入口各写一套打开逻辑而漂移。
+   */
+  revisionPrefill: null as RevisionPrefill | null,
 })
 
 /** 工作区哨兵值：无书时用它调用引擎，让墨师在工作台上工作而不是报错。 */
@@ -86,6 +125,18 @@ export function inWorkspace(): boolean {
  * `appStore.bookId` —— 结果 `lastBookId` 始终为空，工作区顶栏永远不显示"回到某本书"
  * （UI 探针断言直接抓到：按钮在代码里存在，实际从不渲染）。
  */
+/** 折叠/展开主导航（176 ⇄ 56px）。 */
+export function setNavCollapsed(v: boolean): void {
+  appStore.navCollapsed = v
+  writeFlag('inkforge.w.navCollapsed', v)
+}
+
+/** 折叠/展开创作空间（竖条 56px）。 */
+export function setTreeCollapsed(v: boolean): void {
+  appStore.treeCollapsed = v
+  writeFlag('inkforge.w.treeCollapsed', v)
+}
+
 export function rememberBook(novelId: string, title = ''): void {
   if (!novelId) return
   appStore.lastBookId = novelId
@@ -123,4 +174,61 @@ export function resetToMainChat(): void {
   }
   openWorkspace()
   appStore.chatResetToken += 1
+}
+
+/**
+ * 打开「正文改写」侧窗并预填 —— 四个入口（创作空间工具栏 / 章节树 / 人审卡 / 墨师动作）共用的唯一通道。
+ *
+ * 为什么要抽出来：侧窗（520px，`fixed left:184`）会**盖住对话栏**，
+ * 而人审卡与墨师动作恰好长在对话栏里 —— 点完那一下必须留下痕迹。
+ * 因此约定：入口一律带 `origin`，面板顶部据此显示一条来源面包屑（"来自：第 3 章人审"），
+ * 让用户一眼看出"我刚点的事去哪了"，而不是以为点空了。
+ */
+export function openRevision(prefill: RevisionPrefill): void {
+  appStore.revisionPrefill = prefill
+  appStore.sideWindow = 'revision'
+}
+
+/**
+ * 把「创作空间里当前选中的文稿」送进正文改写（正文改写面板 / 自由协作两个入口共用）。
+ *
+ * 与编辑器工具栏那个入口的区别：那个直接用编辑器里**当前加载的正文**（可能还没保存），
+ * 这里按选中态去引擎取一次最新正文。两条路都不落盘，改完去哪仍由用户决定。
+ *
+ * 对齐闸门照旧：`docAligned` 为假时拒绝（否则会把改动落到用户没在看的文稿上）。
+ */
+export async function openRevisionFromSelection(
+  originPrefix = '创作空间',
+): Promise<{ ok: boolean; message: string }> {
+  const sel = appStore.selection
+  if (!sel || !appStore.bookId) return { ok: false, message: '先在右侧创作空间里点选一篇文稿' }
+  if (!appStore.docAligned) {
+    return { ok: false, message: '正文还没跟上你选中的文档：请在创作空间里重新点一次目标文稿' }
+  }
+  try {
+    if (sel.kind === 'chapter') {
+      const res = await api<{ content: string }>(
+        'GET',
+        withNovel(`/api/chapters/${sel.chapter}/raw`, appStore.bookId),
+      )
+      openRevision({
+        source: res.content || '',
+        origin: `${originPrefix} · 第 ${sel.chapter} 章`,
+        fillBack: { chapter: sel.chapter, novelId: appStore.bookId },
+      })
+    } else {
+      const res = await api<{ content?: string }>(
+        'GET',
+        withNovel(`/api/settings/doc?rel=${encodeURIComponent(sel.rel)}`, appStore.bookId),
+      )
+      openRevision({
+        source: res.content || '',
+        origin: `${originPrefix} · ${sel.title}`,
+        fillBack: null,
+      })
+    }
+    return { ok: true, message: '已把选中的文稿送进「正文改写」' }
+  } catch (err) {
+    return { ok: false, message: err instanceof Error ? err.message : String(err) }
+  }
 }

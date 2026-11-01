@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { NInput, useMessage } from 'naive-ui'
-import { computed, ref, watch } from 'vue'
+import { NInput, NSelect, useMessage } from 'naive-ui'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 
-import { api } from '../api'
-import { appStore, openBook as openWorkspaceBook, type SideWindowId } from '../store'
+import { api, withNovel } from '../api'
+import { appStore, openBook as openWorkspaceBook, openRevisionFromSelection, type SideWindowId } from '../store'
 import {
   catSourceBook,
   defaultSpawnPicks,
@@ -14,6 +14,8 @@ import {
 import type {
   ActionAuditRecord,
   AgentPreset,
+  Bindings,
+  CustomSkill,
   DashboardData,
   LearningConflict,
   LearningItem,
@@ -21,6 +23,8 @@ import type {
   LearningSource,
   Material,
   MaterialBook,
+  RevisionAgentInfo,
+  RevisionResult,
 } from '../types'
 
 /**
@@ -33,6 +37,33 @@ const show = computed(() => appStore.sideWindow !== null)
 const message = useMessage()
 
 const which = computed<SideWindowId>(() => appStore.sideWindow)
+
+/* ── 顶部返回路径 ────────────────────────────────────────────────
+ * 改造前这层是 position:fixed 悬浮面板，直接盖住对话栏：打开「正文改写」
+ * 就没法再跟墨师说话，也没有"我点的事去哪了"的痕迹。
+ * 现在它占用正文列那一格，头部留一条「← 回到 X」+ 来源面包屑，对话栏全程可用。
+ */
+const backLabel = computed(() => {
+  const sel = appStore.selection
+  if (!sel) return '正文'
+  return sel.kind === 'chapter' ? ` 第 ${sel.chapter} 章` : ` ${sel.title || '正文'}`
+})
+const originHint = computed(() => appStore.revisionPrefill?.origin ?? '')
+
+function closeWindow(): void {
+  appStore.sideWindow = null
+}
+
+function onKeydown(e: KeyboardEvent): void {
+  if (e.key !== 'Escape') return
+  const el = e.target as HTMLElement | null
+  // 输入框里的 Esc 留给浏览器/组件自己处理（关下拉、清候选）
+  if (el && /^(INPUT|TEXTAREA)$/.test(el.tagName)) return
+  if (appStore.sideWindow) closeWindow()
+}
+
+onMounted(() => window.addEventListener('keydown', onKeydown))
+onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 
 // ── 智能体设置 ──
 const presets = ref<AgentPreset[]>([])
@@ -619,9 +650,244 @@ async function doExport(format: 'txt' | 'epub'): Promise<void> {
   }
 }
 
+/* ══════════════════ 正文改写（创作功能第四项） ══════════════════
+ *
+ * 形态：粘/送进来【原文】+ 写【要求】→ 整篇改后正文 + 改动对照 → 复制 / 写回 / 继续改。
+ * 硬性口径（引擎侧同源）：
+ *   · 只有要求点名的地方会动，其余逐字保留（越界会被引擎退回重做，不是"提示词请求"）；
+ *   · 产出必须整篇回传；拒答/空产出在引擎内消化，不会把拒绝文本当结果给用户；
+ *   · 自定义约束优先级最高（冲突时按约束执行）。
+ */
+
+const revAgent = ref<RevisionAgentInfo | null>(null)
+const revSource = ref('')
+const revRequirement = ref('')
+const revMode = ref('auto')
+const revConstraints = ref('')
+const revStyleSample = ref('')
+const revExtraLocks = ref('')
+const revAutoLock = ref(true)
+const revAnchor = ref(0)
+const revBusy = ref(false)
+const revResult = ref<RevisionResult | null>(null)
+const revView = ref<'full' | 'diff' | 'summary'>('diff')
+/** 约束库（全局自定义约束）与本次勾选项 —— 「让我勾选我已有的约束」 */
+const revSkillLibrary = ref<CustomSkill[]>([])
+const revPickedSkills = ref<string[]>([])
+/** 当前书已绑定的约束 id（只在列表里打标提示，不自动勾选 —— 用哪几条由你说了算） */
+const revBoundSkillIds = ref<string[]>([])
+/** 来源面包屑：从哪打开的这个模块（侧窗会盖住对话栏，入口必须留痕） */
+const revOrigin = ref('')
+/** 回填目标（人审卡「局部改写」用）：改完回填本章草稿，而不是让用户自己复制 */
+const revFillBack = ref<{ chapter: number; novelId: string } | null>(null)
+
+const revSourceLimit = computed(() => revAgent.value?.limits?.source_max ?? 15000)
+const revReqLimit = computed(() => revAgent.value?.limits.requirement_max ?? 4000)
+const revTooLong = computed(() => revSource.value.length > revSourceLimit.value)
+const revCanRun = computed(() =>
+  revSource.value.trim().length > 0
+  && revRequirement.value.trim().length > 0
+  && !revTooLong.value
+  && !revBusy.value,
+)
+
+/** 段落列表（与引擎同一条切分规则：空行分段）—— 锚点就是这么来的。 */
+const revParas = computed(() =>
+  revSource.value
+    .replace(/\r\n/g, '\n')
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0),
+)
+
+/** 写回/回填的目标章号：人审来源优先，其次当前选中的章节。 */
+const revTargetChapter = computed<number>(() => {
+  if (revFillBack.value) return revFillBack.value.chapter
+  const sel = appStore.selection
+  return sel && sel.kind === 'chapter' ? sel.chapter : 0
+})
+
+/**
+ * 真正发给模型的约束文本 = 手写条目 + 勾选的库条目。
+ *
+ * 两者**都**按最高优先级执行（引擎侧渲染成"逐条核对的执行清单"）。
+ * 库条目带上标题（`【约束名】`），便于产出后在正文里核对是哪一条起了作用。
+ */
+const revEffectiveConstraints = computed(() => {
+  const picked = revSkillLibrary.value.filter((s) => revPickedSkills.value.includes(s.skill_id))
+  const blocks = picked.map((s) => `【${s.title}】\n${(s.content || '').trim()}`)
+  const manual = revConstraints.value.trim()
+  return [manual, ...blocks].filter(Boolean).join('\n\n')
+})
+
+/** 载入约束库（全局自定义约束）与"当前书已绑定哪几条"。 */
+async function loadRevisionLibraries(): Promise<void> {
+  try {
+    const res = await api<{ skills: CustomSkill[] }>('GET', '/api/custom-skills')
+    revSkillLibrary.value = res.skills ?? []
+  } catch {
+    revSkillLibrary.value = []
+  }
+  try {
+    if (!appStore.bookId) {
+      revBoundSkillIds.value = []
+      return
+    }
+    const b = await api<Bindings>('GET', withNovel('/api/bindings', appStore.bookId))
+    revBoundSkillIds.value = b.bound_custom ?? []
+  } catch {
+    revBoundSkillIds.value = []
+  }
+}
+
+/** 模式下拉：auto 排第一（默认），其余按"改动幅度从大到小"排，避免误选"整体重写"。 */
+const revModeOptions = computed(() => {
+  const modes = revAgent.value?.modes ?? [
+    { value: 'auto', label: '自动判定' },
+    { value: 'expand', label: '扩写' },
+    { value: 'rewrite', label: '改写' },
+    { value: 'insert', label: '新增段落' },
+    { value: 'replace', label: '定向替换' },
+    { value: 'rewrite_all', label: '整体重写' },
+  ]
+  return modes.map((m) => ({ label: m.label, value: m.value }))
+})
+
+/** 快捷要求片：降低上手成本（点一下就填进要求框，用户仍可改）。 */
+const REV_QUICK = [
+  '扩写环境描写',
+  '加一段对白',
+  '改得更紧凑',
+  '只改错别字',
+]
+
+/** 改动对照的行首标签。 */
+const REV_KIND: Record<string, string> = {
+  keep: '未动',
+  insert: '新增',
+  edit: '改写',
+  delete: '删除',
+}
+
+const revShowPrompt = ref(false)
+
+/** 从创作空间当前选中的文稿载入原文（走 store 的共用通道，与自由协作入口同一实现）。 */
+async function loadRevisionFromSelection(): Promise<void> {
+  const res = await openRevisionFromSelection('创作空间')
+  if (res.ok) message.success('已载入原文（改完可写回同一处）')
+  else message.warning(res.message)
+}
+
+async function loadRevisionAgent(): Promise<void> {
+  try {
+    revAgent.value = await api<RevisionAgentInfo>('GET', '/api/revision/agent')
+  } catch {
+    // 读不到就说读不到：面板仍可用，只是拿不到上限/视野声明
+    revAgent.value = null
+  }
+}
+
+/** 消费四个入口写进来的预填载荷（消费后清空，避免下次打开又冒出来）。 */
+function consumeRevisionPrefill(): void {
+  const p = appStore.revisionPrefill
+  if (!p) return
+  appStore.revisionPrefill = null
+  revSource.value = p.source || ''
+  revRequirement.value = p.requirement || ''
+  revMode.value = p.mode || 'auto'
+  revAnchor.value = p.anchorIndex || 0
+  revOrigin.value = p.origin || ''
+  revFillBack.value = p.fillBack ?? null
+  revResult.value = null
+  revView.value = 'diff'
+}
+
+async function runRevision(): Promise<void> {
+  if (!revCanRun.value) return
+  revBusy.value = true
+  revResult.value = null
+  try {
+    const res = await api<RevisionResult>('POST', '/api/revision/rewrite', {
+      source_text: revSource.value,
+      requirement: revRequirement.value,
+      mode: revMode.value,
+      constraints: revEffectiveConstraints.value,
+      style_sample: revStyleSample.value,
+      lock_dialogue: revAutoLock.value,
+      lock_segments: revExtraLocks.value
+        .split('\n')
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0),
+      anchors: revAnchor.value > 0 ? [{ after_index: revAnchor.value }] : [],
+    })
+    revResult.value = res
+    revView.value = 'diff'
+    message.success(
+      `${res.mode_label}完成：${res.stats.inserted} 新增 / ${res.stats.edited} 改写 / ${res.stats.deleted} 删除（${res.model} · ${res.elapsed}s）`,
+    )
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : String(err))
+  } finally {
+    revBusy.value = false
+  }
+}
+
+async function copyRevised(): Promise<void> {
+  const text = revResult.value?.revised ?? ''
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    message.success('已复制整篇正文')
+  } catch {
+    message.warning('复制失败：请手动选中后按 Ctrl+C')
+  }
+}
+
+/**
+ * 写回/回填：**一律走既有 `PUT /api/chapters/{n}`**（人工编辑语义）。
+ *
+ * 它用 `metadata=dict(doc.metadata)` 保存，所以 status/title/chapter 全部继承 ——
+ * 草稿仍是草稿，互动创作的状态机不会因为这次回填而认不出这一章。
+ * 绝不新造第二条落盘通路。
+ */
+async function writeBackRevision(): Promise<void> {
+  const chapter = revTargetChapter.value
+  const text = revResult.value?.revised ?? ''
+  if (!chapter || !text) return
+  const where = revFillBack.value ? '本章草稿' : `第 ${chapter} 章`
+  if (!window.confirm(
+    `把改写结果写回${where}？\n\n这会覆盖该章现有正文（Git 写作历史会留痕，可回滚）。\n`
+    + '注意：这只做「人工编辑」，不会替你定稿——互动创作/人审仍需你自己点通过。',
+  )) return
+  try {
+    await api('PUT', withNovel(`/api/chapters/${chapter}`, appStore.bookId), { content: text })
+    appStore.treeVersion += 1
+    message.success(`已写回${where}（草稿，未定稿）`)
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : String(err))
+  }
+}
+
+/** 继续改这一版：把结果设为新的原文（多轮迭代不必重新粘贴）。 */
+function continueRevision(): void {
+  const text = revResult.value?.revised ?? ''
+  if (!text) return
+  revSource.value = text
+  revRequirement.value = ''
+  revAnchor.value = 0
+  revResult.value = null
+  revOrigin.value = revOrigin.value ? `${revOrigin.value} · 第 2 轮` : ''
+  message.info('已把这版设为新的原文，可以接着改')
+}
+
+const revDiffLines = computed(() => revResult.value?.segments ?? [])
+
 async function loadAll(): Promise<void> {
   try {
-    const jobs: Promise<void>[] = [loadPresets(), loadLearning(), loadMaterials()]
+    const jobs: Promise<void>[] = [
+      loadPresets(), loadLearning(), loadMaterials(), loadRevisionAgent(),
+      loadRevisionLibraries(),
+    ]
     if (appStore.bookId) jobs.push(loadDashboard())
     await Promise.all(jobs)
   } catch (err) {
@@ -639,6 +905,8 @@ watch(
       activeBookData.value = null
       spawnOpen.value = false
     }
+    // 正文改写：消费入口写下的预填载荷（原文/要求/锚点/来源/回填目标）
+    if (w === 'revision') consumeRevisionPrefill()
     void loadAll()
   },
 )
@@ -648,25 +916,36 @@ watch(
     if (appStore.sideWindow === 'dashboard') void loadDashboard()
   },
 )
+// 预填载荷是"每个入口现写现用"的一次性输入：侧窗**已经开着**时再送文稿进来，
+// sideWindow 不会发生变化，只有这条 watch 能把它消费掉（否则点了像没反应）。
+watch(
+  () => appStore.revisionPrefill,
+  () => consumeRevisionPrefill(),
+)
 </script>
 
 <template>
   <transition name="slide">
     <aside v-if="show && which" class="side-window">
       <div class="win-head">
-        <span class="win-title">
-          {{
+        <div class="win-head-left">
+          <button class="back-btn" title="关闭并回到正文（Esc）" @click="closeWindow">
+            ← 回到{{ backLabel }}
+          </button>
+          <span class="win-title">{{
             ({
               agents: '智能体设置',
               learning: '学习仿写',
               materials: '素材库',
+              revision: '正文改写',
               dashboard: '数据看板',
               export: '导出中心',
             } as Record<string, string>)[which]
-          }}
-        </span>
-        <button class="close-btn" @click="appStore.sideWindow = null">✕</button>
+          }}</span>
+        </div>
+        <button class="close-btn" title="关闭（Esc）" @click="closeWindow">✕</button>
       </div>
+      <div v-if="originHint" class="win-origin">来自：{{ originHint }}</div>
 
       <div class="win-body scroll-y">
         <!-- 智能体设置 -->
@@ -1174,6 +1453,313 @@ watch(
           </div>
         </template>
 
+        <!-- 正文改写（第四个模块 · 专职智能体：你给原文 + 你写要求 → 它改出整篇） -->
+        <template v-else-if="which === 'revision'">
+          <div v-if="revOrigin" class="rev-crumb">
+            来自：<b>{{ revOrigin }}</b>
+            <button class="ghost-btn" @click="revOrigin = ''">知道了</button>
+          </div>
+
+          <div class="rev-banner">
+            <div class="rev-banner-line">
+              <b>{{ revAgent?.label || '正文改写智能体' }}</b>
+              <span class="muted">在你给的<b>原文</b>上，按你写的<b>要求</b>改出<b>整篇</b></span>
+            </div>
+            <div class="rev-scope">
+              <span class="scope-yes">✅ 它看得到：{{
+                (revAgent?.sees || ['你在【原文】框里粘贴的正文', '你在【改写要求】框里写的要求']).join('、')
+              }}</span>
+              <span class="scope-no">🚫 它看不到：{{
+                (revAgent?.never_sees || ['你作品库里的任何文件', '你没粘贴、也没送进来的任何内容']).join('、')
+              }}</span>
+            </div>
+          </div>
+
+          <div class="rev-field">
+            <div class="rev-field-head">
+              <span>① 原文<span class="muted">（要改的正文）</span></span>
+              <span class="rev-counter" :class="{ over: revTooLong }">
+                {{ revSource.length }} / {{ revSourceLimit }}
+              </span>
+            </div>
+            <NInput
+              v-model:value="revSource"
+              type="textarea"
+              :rows="8"
+              size="small"
+              placeholder="粘贴要改的正文；也可以从右侧创作空间点选一篇文稿后按下面的按钮直接载入"
+            />
+            <div class="row-gap">
+              <button
+                class="ghost-btn"
+                :disabled="!appStore.selection"
+                :title="appStore.selection ? '载入当前选中的文稿' : '先在右侧创作空间点选文稿'"
+                @click="loadRevisionFromSelection"
+              >
+                从创作空间选中载入
+              </button>
+              <button class="ghost-btn" @click="revSource = ''; revAnchor = 0">清空</button>
+              <span class="muted">共 {{ revParas.length }} 段</span>
+            </div>
+          </div>
+
+          <div v-if="revParas.length" class="rev-field">
+            <div class="rev-field-head">
+              <span>段落锚点<span class="muted">（点一段 = 在它之后改／插；不选则由模型判断位置）</span></span>
+              <span class="rev-counter">{{ revAnchor ? `已选第 ${revAnchor} 段` : '未选' }}</span>
+            </div>
+            <div class="rev-anchors scroll-y">
+              <button
+                v-for="(p, i) in revParas"
+                :key="i"
+                class="rev-anchor"
+                :class="{ on: revAnchor === i + 1 }"
+                @click="revAnchor = revAnchor === i + 1 ? 0 : i + 1"
+              >
+                <span class="rev-idx">{{ i + 1 }}</span>
+                <span class="rev-quote">{{ p.slice(0, 26) }}{{ p.length > 26 ? '…' : '' }}</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="rev-field">
+            <div class="rev-field-head">
+              <span>② 修改 / 新增要求<span class="muted">（唯一指令来源）</span></span>
+              <span class="rev-counter">{{ revRequirement.length }} / {{ revReqLimit }}</span>
+            </div>
+            <NSelect
+              v-model:value="revMode"
+              size="small"
+              :options="revModeOptions"
+              style="width: 160px"
+            />
+            <NInput
+              v-model:value="revRequirement"
+              type="textarea"
+              :rows="4"
+              size="small"
+              placeholder="例：在第 1 段之后补一段院子里的雨与灯的环境描写，约 200 字；前面的句子一句都不要动"
+            />
+            <div class="row-gap">
+              <button
+                v-for="q in REV_QUICK"
+                :key="q"
+                class="ghost-btn"
+                @click="revRequirement = q"
+              >
+                {{ q }}
+              </button>
+            </div>
+          </div>
+
+          <div class="rev-field">
+            <div class="rev-field-head">
+              <span>③ 自定义约束<span class="muted">（优先级最高）</span></span>
+              <span class="rev-counter">
+                {{ revPickedSkills.length }} 条来自约束库 / 手写 {{ revConstraints.trim().length }} 字
+              </span>
+            </div>
+            <div v-if="revSkillLibrary.length" class="rev-skills scroll-y">
+              <label
+                v-for="s in revSkillLibrary"
+                :key="s.skill_id"
+                class="rev-skill"
+                :class="{ on: revPickedSkills.includes(s.skill_id) }"
+              >
+                <input v-model="revPickedSkills" type="checkbox" :value="s.skill_id" />
+                <span class="rev-skill-title">{{ s.title }}</span>
+                <span v-if="revBoundSkillIds.includes(s.skill_id)" class="rev-skill-tag" title="这条已经绑给了当前作品">
+                  已绑本书
+                </span>
+              </label>
+            </div>
+            <div v-else class="muted">
+              约束库还是空的 —— 可以在左侧「风格工坊 → 技能包与约束」新建，
+              或直接在下面手写（手写的同样按最高优先级执行）。
+            </div>
+            <NInput
+              v-model:value="revConstraints"
+              type="textarea"
+              :rows="3"
+              size="small"
+              placeholder="- **句式**：不连续三句用同一主语&#10;- **用词**：不使用「仿佛」「宛如」这类比喻堆砌"
+            />
+            <div class="muted">
+              勾选的库条目与手写条目会<b>一起</b>送进去，都按最高优先级执行；
+              约束与要求冲突时<b>按约束执行</b>。写成分行条目会被渲染成执行清单，逐条核对。
+            </div>
+          </div>
+
+          <details class="rev-adv">
+            <summary>④ 高级（文风样本 / 锁定片段）</summary>
+            <div class="rev-field">
+              <div class="rev-field-head"><span>文风样本<span class="muted">（可选：另给一段语感样本）</span></span></div>
+              <NInput
+                v-model:value="revStyleSample"
+                type="textarea"
+                :rows="3"
+                size="small"
+                placeholder="留空即按原文的客观文风指标（句长 / 短句占比 / 对白比例 / 段长）来改"
+              />
+            </div>
+            <div class="rev-field">
+              <div class="rev-field-head"><span>锁定片段<span class="muted">（每行一条，逐字不许动）</span></span></div>
+              <NInput
+                v-model:value="revExtraLocks"
+                type="textarea"
+                :rows="2"
+                size="small"
+                placeholder="例：「你要是回来得早，就先把火生上。」"
+              />
+              <label class="rev-check">
+                <input v-model="revAutoLock" type="checkbox" />
+                自动锁定原文里的对白（扩写时最容易被顺手改掉的就是对白）
+              </label>
+            </div>
+          </details>
+
+          <div class="rev-actions">
+            <button class="primary-btn" :disabled="!revCanRun" @click="runRevision">
+              {{ revBusy ? '改写中…' : '开始改写' }}
+            </button>
+            <span v-if="revBusy" class="muted">整篇回传是长调用，通常 40~120 秒，期间别关窗</span>
+            <span v-else-if="revTooLong" class="muted warn">原文超过上限，请分段（一次一章）</span>
+            <span v-else-if="!revSource.trim()" class="muted">① 里放入要改的正文</span>
+            <span v-else-if="!revRequirement.trim()" class="muted">② 里写下你要改什么</span>
+          </div>
+
+          <template v-if="revResult">
+            <div class="section-title">
+              结果
+              <span class="muted" style="font-weight: 400">
+                {{ revResult.mode_label }}（{{ revResult.mode_reason || '自动' }}） ·
+                作用范围：{{ revResult.scope_label }}{{
+                  revResult.scope_reason ? `（判据「${revResult.scope_reason}」）` : ''
+                }} ·
+                {{ revResult.model }} · {{ revResult.elapsed }}s
+              </span>
+            </div>
+            <div class="rev-summary">{{ revResult.summary }}</div>
+            <div class="rev-stats">
+              <span class="rev-stat">{{ revResult.stats.kept }} 未动</span>
+              <span class="rev-stat add">{{ revResult.stats.inserted }} 新增</span>
+              <span class="rev-stat edit">{{ revResult.stats.edited }} 改写</span>
+              <span v-if="revResult.stats.merged" class="rev-stat warn">
+                并段 {{ revResult.stats.merged }}
+              </span>
+              <span class="rev-stat del">{{ revResult.stats.deleted }} 删除</span>
+              <span class="rev-stat">{{ revResult.stats.before_chars }} → {{ revResult.stats.after_chars }} 字</span>
+            </div>
+            <div class="rev-checks">
+              <span :class="revResult.checks.minimal_edit.ok ? 'ok' : 'bad'">
+                {{ revResult.checks.minimal_edit.ok ? '✅' : '⛔' }} 最小改动闸门
+              </span>
+              <span :class="revResult.checks.locked.ok ? 'ok' : 'bad'">
+                {{ revResult.checks.locked.ok ? '✅' : '⛔' }} 锁定片段{{ revResult.locked ? `（${revResult.locked} 处）` : '' }}
+              </span>
+              <span :class="revResult.checks.whole_returned.ok ? 'ok' : 'bad'">
+                {{ revResult.checks.whole_returned.ok ? '✅' : '⛔' }} 整篇回传
+                （相似度 {{ revResult.checks.whole_returned.similarity }}）
+              </span>
+              <span :class="revResult.style_shift.ok ? 'ok' : 'warn'">
+                {{ revResult.style_shift.ok ? '✅' : '⚠' }} 文风偏差
+                （句长 {{ revResult.style_shift.before.avg_sentence_len }}
+                → {{ revResult.style_shift.after.avg_sentence_len }}）
+              </span>
+            </div>
+            <div v-if="revResult.checks.minimal_edit.soft" class="muted warn">
+              ⚠ 有 {{ revResult.checks.minimal_edit.out_of_scope.length }} 处改动在容差内（没被要求点名）：
+              <template v-for="(o, i) in revResult.checks.minimal_edit.out_of_scope" :key="i">
+                {{ i > 0 ? '；' : '' }}第 {{ o.index }} 段{{ o.kind === 'merged' ? '（被并进其它段，内容还在）' : '（被改写）' }}
+              </template>
+              —— 建议在「改动对照」里核一眼。
+            </div>
+            <div v-if="revResult.stats.unchanged" class="muted warn">
+              ⚠ 产出与原文完全一致：模型认为无需改动。若这不是你要的，把要求写得再具体些。
+            </div>
+            <div v-if="revResult.checks.minimal_edit.relaxed?.length" class="muted warn">
+              ⚠ 本轮为收敛放宽过：{{ revResult.checks.minimal_edit.relaxed.join('；') }}
+              —— 放宽的只有"可选"的约束，内容丢失与整篇回传的底线没有放松。
+            </div>
+
+            <div class="mode-row" style="margin-top: 8px">
+              <button class="mode-card" :class="{ on: revView === 'diff' }" @click="revView = 'diff'">改动对照</button>
+              <button class="mode-card" :class="{ on: revView === 'full' }" @click="revView = 'full'">全文</button>
+              <button class="mode-card" :class="{ on: revView === 'summary' }" @click="revView = 'summary'">改动摘要</button>
+            </div>
+
+            <div v-if="revView === 'diff'" class="rev-diff">
+              <div
+                v-for="(s, i) in revDiffLines"
+                :key="i"
+                class="rev-line"
+                :class="`is-${s.kind}`"
+              >
+                <span class="rev-kind">{{ REV_KIND[s.kind] }}</span>
+                <div class="rev-body">
+                  <div v-if="s.kind === 'edit'" class="rev-before">改前：{{ s.before }}</div>
+                  <div class="rev-text">{{ s.text }}</div>
+                </div>
+              </div>
+              <div v-if="revDiffLines.length === 0" class="muted">（无段落）</div>
+            </div>
+
+            <NInput
+              v-else-if="revView === 'full'"
+              :value="revResult.revised"
+              type="textarea"
+              :rows="14"
+              size="small"
+              readonly
+            />
+
+            <div v-else class="rev-summary-box">
+              <div>模式：{{ revResult.mode_label }}{{ revResult.mode_reason ? `（判据「${revResult.mode_reason}」）` : '' }}</div>
+              <div>
+                作用范围：{{ revResult.scope_label }}{{
+                  revResult.scope_label === '全篇'
+                    ? '（作者的要求覆盖整篇，该动的地方都动了）'
+                    : '（只准动点名处，其余逐字保留）'
+                }}
+              </div>
+              <div>输入边界：{{ revResult.isolation }}</div>
+              <div v-if="revResult.anchors.length">
+                锚点：{{ revResult.anchors.map((a) => `第 ${a.index} 段（${a.quote}…）`).join('、') }}
+              </div>
+              <div>自定义约束：{{ revResult.constraints.count }} 条{{ revResult.constraints.declared_priority ? '（已声明最高优先级）' : '' }}</div>
+              <div v-if="revResult.checks.minimal_edit.out_of_scope.length">
+                未点名的改动：
+                {{ revResult.checks.minimal_edit.out_of_scope.map((o) => `第 ${o.index} 段（${o.head}）`).join('；') }}
+              </div>
+            </div>
+
+            <div class="row-gap" style="margin-top: 10px">
+              <button class="ghost-btn" @click="copyRevised">复制全文</button>
+              <button
+                class="primary-btn"
+                :disabled="!revTargetChapter"
+                :title="revTargetChapter ? `写回第 ${revTargetChapter} 章（人工编辑，需确认）` : '未选中章节'"
+                @click="writeBackRevision"
+              >
+                {{ revFillBack ? '回填本章草稿' : `写回第 ${revTargetChapter || '—'} 章` }}
+              </button>
+              <button class="ghost-btn" @click="continueRevision">继续改这版</button>
+            </div>
+            <div class="muted">
+              写回 = <b>人工编辑</b>语义（走既有章节保存、Git 写作历史留痕、需二次确认）；
+              它<b>不会</b>替你点「定稿入库」。
+            </div>
+          </template>
+
+          <div class="rev-foot">
+            <button class="ghost-btn" @click="revShowPrompt = !revShowPrompt">
+              {{ revShowPrompt ? '收起智能体设定' : '查看智能体设定（它被要求做什么、不许做什么）' }}
+            </button>
+            <span class="muted">想改它的行为？在左侧「智能体设置」里改，下一轮立即生效。</span>
+          </div>
+          <pre v-if="revShowPrompt" class="prompt-view pre-wrap">{{ revAgent?.prompt || '（引擎未就绪，读不到智能体设定）' }}</pre>
+        </template>
+
         <!-- 数据看板（含「墨师操作」审计页：与书无关，工程级记录） -->
         <template v-else-if="which === 'dashboard'">
           <div class="dash-tabs">
@@ -1307,20 +1893,51 @@ export default { name: 'SideWindows' }
   background: #eff6ff;
   font-weight: 600;
 }
+/*
+ * 悬浮页形态（作者指定，2026-10-18 复原）。
+ *
+ * 与改造前那版的差别只有三处，都是纯收益：
+ * ① `left` 不再写死 184px —— 原来假设导航恒为 176px，导航一折叠/变宽就错位；
+ *    现在跟着栅格的 --rail-w 走，导航 56px 时浮层自动贴到左边。
+ * ② 宽度不再无条件 520px：max-width 兜住窄窗口，不会顶到创作空间上。
+ * ③ 头部多了「← 回到 X」+ 来源面包屑，Esc 也能关 —— 浮层盖住对话栏时，
+ *    "我刚点开的东西去哪了"有据可查。
+ */
 .side-window {
   position: fixed;
-  left: 184px;
+  left: calc(var(--rail-w, 176px) + 8px);
   top: 12px;
   bottom: 12px;
   width: 520px;
-  background: #fff;
-  border: 1px solid #e5e7eb;
-  border-radius: 14px;
+  /*
+   * 上限 = 对话列宽度（视口 − 导航 − 正文 − 创作空间 − 两条中线）。
+   * 浮层盖住对话列是预期的；但再往右就会把正文列左缘切掉一条
+   * （原版 1366 下切掉约 104px，正文那行字直接缺一半）。
+   * 宽屏（≥1500 左右）对话列本来就比 520 宽，这里不生效，浮层保持 520。
+   */
+  max-width: calc(
+    100vw - var(--rail-w, 176px) - var(--doc-w, 470px) - var(--tree-w, 288px) -
+      2 * var(--splitter-w, 8px)
+  );
+  min-width: 300px;
+  background: var(--bg-0);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-4);
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.14);
-  z-index: 60;
+  z-index: var(--z-drawer, 60);
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+.win-origin {
+  padding: 6px 18px;
+  font-size: var(--fs-12);
+  color: var(--ink-4);
+  background: var(--accent-soft);
+  border-bottom: 1px solid var(--line-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .slide-enter-active,
 .slide-leave-active {
@@ -1335,12 +1952,38 @@ export default { name: 'SideWindows' }
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 14px 18px;
-  border-bottom: 1px solid #eef0f2;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line-2);
+  gap: 10px;
+}
+.win-head-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.back-btn {
+  border: 1px solid var(--line-3);
+  background: var(--bg-0);
+  color: var(--ink-3);
+  border-radius: var(--r-1);
+  padding: 3px 10px;
+  font-size: var(--fs-12);
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.back-btn:hover {
+  background: var(--bg-2);
+  color: var(--ink-1);
 }
 .win-title {
   font-weight: 700;
-  font-size: 15px;
+  font-size: var(--fs-15);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .close-btn {
   background: none;
@@ -1806,5 +2449,284 @@ export default { name: 'SideWindows' }
   font-size: 13px;
   color: #3a3d44;
   margin-top: 10px;
+}
+
+/* ══════════ 正文改写（第四个模块） ══════════ */
+/* 侧窗（520px，fixed left:184）会盖住对话栏，而人审卡/墨师动作恰好长在对话栏里 ——
+   所以入口一律带来源，面板顶部用这条面包屑把"我刚点的事去哪了"讲清楚。 */
+.rev-crumb {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #1d4ed8;
+  background: #eef2ff;
+  border: 1px solid #c7d2fe;
+  border-radius: 8px;
+  padding: 6px 10px;
+  margin-bottom: 10px;
+}
+.rev-banner {
+  border: 1px solid #dbeafe;
+  background: #f5f9ff;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+.rev-banner.orange {
+  border-color: #fde68a;
+  background: #fffbeb;
+}
+.rev-banner-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13.5px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+.rev-scope {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.scope-yes { color: #116932; }
+.scope-no { color: #9a3412; }
+.scope-warn { color: #92400e; font-weight: 600; }
+
+.rev-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 12px;
+}
+.rev-field-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #3a3d44;
+}
+.rev-counter {
+  font-size: 11.5px;
+  color: #9aa0aa;
+  font-variant-numeric: tabular-nums;
+}
+.rev-counter.over { color: #b42318; font-weight: 700; }
+
+/* 约束库勾选（「让我勾选我已有的约束」）：列表只读展示标题，勾中的整条内容随请求发出 */
+.rev-skills {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 6px;
+  max-height: 148px;
+  background: #fcfcfd;
+}
+.rev-skill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  font-size: 12.5px;
+  color: #3a3d44;
+  cursor: pointer;
+}
+.rev-skill:hover { background: #eff6ff; }
+.rev-skill.on { background: #e8f0fe; color: #1d4ed8; font-weight: 600; }
+.rev-skill input { flex-shrink: 0; }
+.rev-skill-title { flex: 1; min-width: 0; }
+.rev-skill-tag {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: #116932;
+  background: #e6f6ec;
+  border-radius: 5px;
+  padding: 0 6px;
+}
+
+.rev-anchors {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  max-height: 118px;
+  background: #fcfcfd;
+}
+.rev-anchor {
+  width: 100%;
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  border: none;
+  border-bottom: 1px solid #eef0f2;
+  background: none;
+  padding: 5px 10px;
+  font-size: 12px;
+  color: #5c6470;
+  text-align: left;
+  cursor: pointer;
+}
+.rev-anchor:last-child { border-bottom: none; }
+.rev-anchor:hover { background: #eff6ff; }
+.rev-anchor.on { background: #e8f0fe; color: #1d4ed8; font-weight: 600; }
+.rev-idx {
+  color: #9aa0aa;
+  font-variant-numeric: tabular-nums;
+  width: 18px;
+  text-align: right;
+  flex-shrink: 0;
+}
+.rev-anchor.on .rev-idx { color: #1d4ed8; }
+.rev-quote { flex: 1; min-width: 0; }
+
+.rev-adv {
+  border: 1px solid #e5e7eb;
+  border-radius: 9px;
+  background: #fcfcfd;
+  padding: 2px 12px 10px;
+  margin-bottom: 12px;
+}
+.rev-adv > summary {
+  cursor: pointer;
+  padding: 7px 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #3a3d44;
+}
+.rev-check {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  color: #3a3d44;
+  margin-top: 8px;
+}
+.rev-check.dim { opacity: 0.5; }
+
+.rev-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  border-top: 1px solid #eef0f2;
+  padding-top: 12px;
+}
+.rev-summary {
+  font-size: 13px;
+  line-height: 1.7;
+  color: #26272b;
+  background: #f6f7f9;
+  border: 1px solid #eef0f2;
+  border-radius: 8px;
+  padding: 8px 11px;
+  margin-bottom: 8px;
+}
+.rev-stats {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  margin-bottom: 8px;
+}
+.rev-stat {
+  border-radius: 6px;
+  padding: 2px 8px;
+  background: #f3f4f6;
+  color: #5c6470;
+}
+.rev-stat.add { background: #e6f6ec; color: #116932; }
+.rev-stat.edit { background: #fef6e0; color: #8a5a00; }
+.rev-stat.del { background: #fdebec; color: #b42318; }
+.rev-stat.warn { background: #fffbeb; color: #92400e; }
+.rev-checks {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  margin-bottom: 8px;
+}
+.rev-checks .ok { color: #116932; }
+.rev-checks .bad { color: #b42318; font-weight: 600; }
+.rev-checks .warn { color: #92400e; }
+
+.rev-diff {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 12.5px;
+  line-height: 1.85;
+  margin-top: 8px;
+  max-width: 100%;
+}
+/* 三段式：行首标签（定宽）+ 正文列（自己吃满剩余宽度）。
+   坑（用户实测截图：正文被挤成每行一个字）：原先把「改前：…」与「改后：…」当同一行的
+   两个 flex 子项，长文本的 min-width:auto 会把另一个子项挤到 ~1 字宽。
+   正文必须是**列容器**，并显式 min-width:0 + overflow-wrap。 */
+.rev-line {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 5px 10px;
+  border-bottom: 1px solid #eef0f2;
+}
+.rev-line:last-child { border-bottom: none; }
+.rev-kind {
+  flex: 0 0 26px;
+  font-size: 11px;
+  color: #9aa0aa;
+  text-align: right;
+}
+.rev-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.rev-text,
+.rev-before {
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.rev-before {
+  color: #9a3412;
+  text-decoration: line-through;
+  font-size: 12px;
+}
+.rev-line.is-keep { background: #fff; }
+.rev-line.is-insert { background: #e6f6ec; }
+.rev-line.is-insert .rev-kind { color: #116932; }
+.rev-line.is-edit { background: #fef6e0; }
+.rev-line.is-edit .rev-kind { color: #8a5a00; }
+.rev-line.is-delete { background: #fdebec; }
+.rev-line.is-delete .rev-text { color: #b42318; text-decoration: line-through; }
+.rev-line.is-delete .rev-kind { color: #b42318; }
+.rev-summary-box {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: #3a3d44;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.rev-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  border-top: 1px solid #eef0f2;
+  margin-top: 14px;
+  padding-top: 12px;
 }
 </style>

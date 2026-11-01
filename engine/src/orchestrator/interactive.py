@@ -43,6 +43,61 @@ def cards_rel_path(chapter: int) -> str:
     return f"interactive/ch-{chapter:03d}.cards.md"
 
 
+#: 「删除本章工作内容与产出」会删的文件（存在才删；顺序即 UI 展示顺序）
+DISCARD_TARGETS = (
+    "interactive/ch-{chapter:03d}.cards.md",     # 剧情卡 + 用户的选择（出卡的事实源）
+    "chapters/vol-01/ch-{chapter:03d}.md",       # 未定稿草稿（status=draft 才删）
+    "reviews/ch-{chapter:03d}.review.md",        # 本章审查报告（旧评分）
+    "summaries/ch-{chapter:03d}.summary.md",     # 本章摘要（若已生成）
+)
+
+
+def discard_chapter_work(store, chapter: int, index=None) -> dict:
+    """删除「本章尚未定稿的工作内容与产出」，让会话回到出卡阶段（可重新出卡/选卡）。
+
+    由来（用户需求）：一轮里反复重试会把上一稿、坏卡与旧评分留在事实源里，
+    下一轮出卡/写章又被它们牵着走——需要一条"把这一章抹掉重来"的出口。
+
+    为什么做成**模块级函数**（2026-09-22）：删除是纯文件操作，不该逼调用方先装配
+    整条流水线（`build_pipeline` + 探活要好几秒，会让 HTTP 请求卡住、UI 只能靠轮询猜结果）。
+    现在 Web 层可以拿一个轻量 `MdStore` 同步删完并把清单直接回给前端。
+
+    安全网：
+    1. 已定稿章节拒绝（走章节树的删除入口，避免误伤成稿）；
+    2. 每次删除都经 `MdStore.delete()` → 同步进 Git 写作历史，**可从写作历史回滚**；
+    3. 传入 `index` 时一并删向量索引条目，否则删掉的章节仍会被 RAG 检索回来（上下文污染）。
+    """
+    chapter_rel = store.chapter_rel_path(VOLUME, chapter)
+    if store.exists(chapter_rel):
+        status = store.read(chapter_rel).metadata.get("status")
+        if status != "draft":
+            raise ValueError(
+                f"第 {chapter} 章已定稿（status={status}）：本操作只回退**未定稿**的工作内容；"
+                "如需删除成稿，请用章节列表里的删除入口。"
+            )
+
+    removed: list[str] = []
+    missing: list[str] = []
+    for tpl in DISCARD_TARGETS:
+        rel = tpl.format(chapter=chapter)
+        if store.exists(rel):
+            store.delete(
+                rel,
+                commit_message=f"ch-{chapter:03d} 回退到出卡：删除本章工作内容与产出（Inkforge）",
+            )
+            removed.append(rel)
+        else:
+            missing.append(rel)
+        if index is not None:
+            try:
+                index.delete_document(rel)
+            except Exception as exc:  # noqa: BLE001 - 索引可重建，删失败不阻断回退
+                logger.warning("索引条目删除失败（可重建，不阻断回退）：%s -> %s", rel, exc)
+    logger.info("ch-%03d 已回退到出卡阶段：删除 %d 个文件，%s", chapter, len(removed), removed)
+    return {"chapter": chapter, "removed": removed, "missing": missing,
+            "index_purged": index is not None}
+
+
 def is_interactive_book(store) -> bool:
     """互动模式书籍识别：interactive/ 目录存在即视为互动书。"""
     return (store.root / "interactive").is_dir()
@@ -417,6 +472,13 @@ class InteractiveRunner:
             "组织从属等任何既有联系；新角色与已有角色的互动只能从本章"
             "首次接触开始，不得暗示过往渊源。"
         )
+
+    # ---------- 回退：删除本章未定稿的工作内容与产出 ----------
+
+    def discard_chapter_work(self, chapter: int) -> dict:
+        """Runner 侧入口：委托给模块级 `discard_chapter_work()`（含索引清理）。"""
+        return discard_chapter_work(self.pipe.store, chapter,
+                                    index=getattr(self.pipe.memory, "index", None))
 
     # ---------- 定稿入库（人审通过后） ----------
 
